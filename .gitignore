@@ -1,0 +1,28 @@
+# --- secrets & identity (NEVER commit) ---
+.neurahash_keys/
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+wallet*.json
+connect.json
+
+# --- local state the miner/solo writes ---
+_state_*/
+_poollive/
+solo_state/
+
+# --- python build artifacts ---
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# --- editor / OS noise ---
+.DS_Store
+.idea/
+.vscode/

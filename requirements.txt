@@ -1,0 +1,19 @@
+# NeuraHash public miner — runtime dependencies.
+# Install: pip install -r requirements.txt
+# (torch is intentionally unpinned: install the build that matches your CUDA/CPU from the PyTorch
+#  site. A CPU-only torch mines on CPU; a CUDA torch uses your GPU.)
+
+# --- core (always needed to mine) ---
+numpy
+torch
+eth-account==0.13.7          # secp256k1 signing + EIP-55 addresses (pulls eth-utils)
+cryptography>=42             # keystore encryption (AES) + TLS cert handling
+
+# --- opt-in / convenience ---
+web3==7.16.0                 # optional: on-chain balance/settlement helpers (mining does not need it)
+argon2-cffi                  # optional: Argon2id keystore encryption (lazy; only for an encrypted wallet)
+dilithium-py==1.4.0          # opt-in post-quantum admission (NEURAHASH_PQC=hybrid): ML-DSA-44 / FIPS-204
+segno==1.6.6                 # optional: QR helper for the onboarding/join flow
+
+# --- only for the real-base (dense) training path, not the default toy/real-corpus miner ---
+# transformers               # uncomment ONLY if you set NEURAHASH_BASE to train a real HF base model

@@ -14,7 +14,7 @@ mining into a coordinator someone is running.
 ## 1. Install
 
 ```bash
-git clone https://github.com/OWNER/neurahash-miner
+git clone https://github.com/whitegreenstudios/neurahash-miner
 cd neurahash-miner
 pip install -r requirements.txt
 ```

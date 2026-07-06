@@ -20,7 +20,7 @@ single cell. Replace the two placeholders:
 
 ```python
 # 1) clone the PUBLIC miner repo (no token needed)
-!git clone https://github.com/OWNER/neurahash-miner
+!git clone https://github.com/whitegreenstudios/neurahash-miner
 %cd neurahash-miner
 
 # 2) install deps (Colab already ships a CUDA torch)

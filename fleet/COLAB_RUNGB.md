@@ -21,7 +21,7 @@ sha256-named blob (`content_store.py`; see the file for the ~90-line protocol). 
 **outbound** HTTPS calls, exactly like any other library install — no tunnel, no port-forward, no inbound
 firewall rule needed on your end.
 
-## The one cell (token-free)
+## The one cell (genuinely token-free — no account, no secret, no signup)
 
 Open a new Colab notebook, set **Runtime → Change runtime type → T4 GPU**, and paste this into a single
 cell. It clones this **public** repo (no GitHub token needed) and runs one training round.
@@ -34,14 +34,9 @@ cell. It clones this **public** repo (no GitHub token needed) and runs one train
 # 2) install deps (Colab already ships a CUDA torch)
 !pip install -q transformers bitsandbytes
 
-# 3) the content-store upload needs a token -- set it as a Colab SECRET (key icon in the left sidebar),
-#    NEVER paste the raw value into a cell. Ask whoever runs the coordinator for the token out of band.
-from google.colab import userdata
-import os
-os.environ["NEURAHASH_CONTENT_TOKEN"] = userdata.get("NEURAHASH_CONTENT_TOKEN")
-
-# 4) train your slice and publish it. --node/--nodes must match what the coordinator is using for THIS
-#    round (ask the coordinator operator); --load-4bit keeps this well under Colab's T4 memory.
+# 3) train your slice and publish it -- no token needed, esh_worker.py ships a public demo relay by
+#    default. --node/--nodes must match what the coordinator is using for THIS round (ask the operator
+#    if you're joining a specific run); --load-4bit keeps this well under Colab's T4 memory.
 !python fleet/esh_worker.py \
     --node 2 --nodes 3 \
     --load-4bit \
@@ -49,9 +44,18 @@ os.environ["NEURAHASH_CONTENT_TOKEN"] = userdata.get("NEURAHASH_CONTENT_TOKEN")
     --relay-name rungb-colab-latest
 ```
 
-That's it — the last line trains, saves `my_shard.pt` locally, and PUTs it to the public relay under the
-friendly name `rungb-colab-latest`, where the coordinator (running wherever the pool operator has it, not
-necessarily reachable from Colab at all) picks it up on its next poll.
+That's it — no GitHub token, no Colab Secret, no signup. The last line trains, saves `my_shard.pt`
+locally, and PUTs it to the public relay under the friendly name `rungb-colab-latest`, where the
+coordinator (running wherever the pool operator has it, not necessarily reachable from Colab at all)
+picks it up on its next poll.
+
+**Why "no token" is safe:** the relay's write auth is a public demo token (committed in
+`fleet/esh_worker.py`, same idea as the main pool's public demo PSK) — it exists to keep casual/bot
+traffic off a small shared box, not to gate who can contribute. What actually protects the model is the
+coordinator's own held-out gate: every contribution is evaluated before it's ever merged in, and anything
+that doesn't measurably help gets rejected and rolled back (see `propose_and_gate` in
+`fleet/soak_coord_5090.py` in the private repo). A garbage or malicious upload wastes relay bandwidth,
+nothing more.
 
 ## Tips
 
@@ -64,9 +68,9 @@ necessarily reachable from Colab at all) picks it up on its next poll.
 - **Kaggle** works the same way (30 h/week GPU quota): same clone + install + run cell in a Kaggle
   notebook with a GPU accelerator enabled.
 
-## Security reminder
+## Security note
 
-Never paste the content-store token (or any secret) directly into a notebook cell — use **Colab
-Secrets** (the key icon in the left sidebar) so it never ends up in the notebook file, which could be
-shared or made public. The token only grants *write* access to the relay; it is not your wallet key and
-not admin access to anything else.
+The default relay token is intentionally public (see above) — there is nothing to protect here. If you
+run your own PRIVATE coordinator + relay instead of the public default, pass `--token <yours>` (or set
+`NEURAHASH_CONTENT_TOKEN`) and, as with any real secret, use a **Colab Secret** (key icon in the left
+sidebar) rather than pasting it into a cell.

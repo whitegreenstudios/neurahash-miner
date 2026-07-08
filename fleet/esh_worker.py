@@ -15,10 +15,15 @@ no neurahash import (runs in the miner's own env). The arithmetic task is byte-i
 so the held-out set matches for its eval.
 
 Optional --relay-name: after saving the trained delta locally, ALSO PUT it to a content store (default: the
-project's public VPS relay) under that friendly name, so a coordinator anywhere on the real internet can pull
-it without a direct connection to this machine -- this is how Colab (which cannot accept inbound connections)
-and any other WAN worker publishes its contribution. Needs content_store_client.py alongside this file and a
-token in the env var named by --token-env (never pass the token on the command line).
+project's PUBLIC fleet relay, a separate instance from the main pool's private corpus store) under that
+friendly name, so a coordinator anywhere on the real internet can pull it without a direct connection to this
+machine -- this is how Colab (which cannot accept inbound connections) and any other WAN worker publishes its
+contribution. Needs content_store_client.py alongside this file. NO TOKEN REQUIRED to start: the default
+relay uses a PUBLIC demo token (committed below, same spirit as the main pool's public demo PSK) -- it does
+not secure anything and isn't meant to; what keeps a bad/garbage upload from ever reaching the trained model
+is the coordinator's OWN held-out accept/reject gate (gather-canonical + the soak's propose_and_gate), which
+rejects anything that doesn't measurably help before it's ever merged in. Pass --token to use a different,
+private relay instead.
 """
 import argparse, hashlib, math, os, random, sys, time
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -200,9 +205,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--relay-name", default=None, dest="relay_name",
                     help="if set, PUT the trained delta to --relay-url under this friendly name (WAN publish)")
-    ap.add_argument("--relay-url", default="http://47.84.93.96:8710", dest="relay_url")
-    ap.add_argument("--token-env", default="NEURAHASH_CONTENT_TOKEN", dest="token_env",
-                    help="env var holding the content-store auth token (never pass the token on the CLI)")
+    ap.add_argument("--relay-url", default="http://47.84.93.96:8711", dest="relay_url",
+                    help="PUBLIC Rung B fleet relay by default (separate from the main pool's private corpus store)")
+    ap.add_argument("--token", default="2802648a1e87b4b3c6ca6da2688b4308",
+                    help="content-store auth token. The default is a PUBLIC demo token for the public fleet "
+                         "relay -- it secures nothing (see the module docstring); pass your own to use a "
+                         "private relay instead. NEURAHASH_CONTENT_TOKEN env var overrides this if set.")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     t0 = time.time()
@@ -252,13 +260,10 @@ def main():
 
     if a.relay_name:
         import content_store_client as cs
-        token = os.environ.get(a.token_env, "")
-        if not token:
-            print("[worker] --relay-name set but %s is empty -- skipping upload" % a.token_env, flush=True)
-        else:
-            data = open(a.out, "rb").read()
-            sha = cs.put(a.relay_url, token, data, name=a.relay_name)
-            print("[worker] relayed -> %s as '%s' (sha256 %s)" % (a.relay_url, a.relay_name, sha[:16]), flush=True)
+        token = os.environ.get("NEURAHASH_CONTENT_TOKEN") or a.token
+        data = open(a.out, "rb").read()
+        sha = cs.put(a.relay_url, token, data, name=a.relay_name)
+        print("[worker] relayed -> %s as '%s' (sha256 %s)" % (a.relay_url, a.relay_name, sha[:16]), flush=True)
 
 
 if __name__ == "__main__":

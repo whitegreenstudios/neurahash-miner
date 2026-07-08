@@ -17,3 +17,7 @@ segno==1.6.6                 # optional: QR helper for the onboarding/join flow
 
 # --- only for the real-base (dense) training path, not the default toy/real-corpus miner ---
 # transformers               # uncomment ONLY if you set NEURAHASH_BASE to train a real HF base model
+
+# --- only for fleet/ (Rung B: per-expert MoE fleet training, see fleet/COLAB_RUNGB.md) ---
+# transformers==5.8.1        # uncomment to run fleet/esh_worker.py -- any version works (it auto-detects
+# bitsandbytes                #   fused vs unfused MoE experts); bitsandbytes only needed for --load-4bit

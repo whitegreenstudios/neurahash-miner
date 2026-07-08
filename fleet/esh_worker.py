@@ -15,15 +15,16 @@ no neurahash import (runs in the miner's own env). The arithmetic task is byte-i
 so the held-out set matches for its eval.
 
 Optional --relay-name: after saving the trained delta locally, ALSO PUT it to a content store (default: the
-project's PUBLIC fleet relay, a separate instance from the main pool's private corpus store) under that
-friendly name, so a coordinator anywhere on the real internet can pull it without a direct connection to this
-machine -- this is how Colab (which cannot accept inbound connections) and any other WAN worker publishes its
-contribution. Needs content_store_client.py alongside this file. NO TOKEN REQUIRED to start: the default
-relay uses a PUBLIC demo token (committed below, same spirit as the main pool's public demo PSK) -- it does
-not secure anything and isn't meant to; what keeps a bad/garbage upload from ever reaching the trained model
-is the coordinator's OWN held-out accept/reject gate (gather-canonical + the soak's propose_and_gate), which
-rejects anything that doesn't measurably help before it's ever merged in. Pass --token to use a different,
-private relay instead.
+same content store the main pool already uses for corpus distribution, one already-open port -- no new
+firewall rule needed) under that friendly name, so a coordinator anywhere on the real internet can pull it
+without a direct connection to this machine -- this is how Colab (which cannot accept inbound connections)
+and any other WAN worker publishes its contribution. Needs content_store_client.py alongside this file. NO
+TOKEN REQUIRED to start: the default uses a PUBLIC demo token (committed below, same spirit as the main
+pool's public demo PSK; the store accepts it as a second, separate credential alongside the operator's
+private one, so this doesn't touch or weaken corpus-store security). It does not secure anything and isn't
+meant to; what keeps a bad/garbage upload from ever reaching the trained model is the coordinator's OWN
+held-out accept/reject gate (gather-canonical + the soak's propose_and_gate), which rejects anything that
+doesn't measurably help before it's ever merged in. Pass --token to use a different, private relay instead.
 """
 import argparse, hashlib, math, os, random, sys, time
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -205,8 +206,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--relay-name", default=None, dest="relay_name",
                     help="if set, PUT the trained delta to --relay-url under this friendly name (WAN publish)")
-    ap.add_argument("--relay-url", default="http://47.84.93.96:8711", dest="relay_url",
-                    help="PUBLIC Rung B fleet relay by default (separate from the main pool's private corpus store)")
+    ap.add_argument("--relay-url", default="http://47.84.93.96:8710", dest="relay_url",
+                    help="the project's content store (same host as the main pool's corpus store, one "
+                         "already-open port -- your token below decides whether the write is public or private")
     ap.add_argument("--token", default="2802648a1e87b4b3c6ca6da2688b4308",
                     help="content-store auth token. The default is a PUBLIC demo token for the public fleet "
                          "relay -- it secures nothing (see the module docstring); pass your own to use a "

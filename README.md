@@ -101,3 +101,34 @@ local coordinator) therefore needs the full node package and is not usable from 
 
 See **[COLAB.md](COLAB.md)** for a token-free Google Colab cell (works with the free T4) and
 **[JOIN.md](JOIN.md)** for a step-by-step operator walkthrough.
+
+---
+
+## Rung B — fleet-wide MoE training (new, proven on 3 real machines)
+
+A second, newer contribution mode lives in **[`fleet/`](fleet/)**. Instead of mining rounds of the
+pool's toy/char model, your GPU trains **only its own disjoint slice of experts** of a real
+Mixture-of-Experts model (`allenai/OLMoE-1B-7B-0924`, 64 experts × 16 layers) — no machine, including
+yours, ever holds or trains the whole thing:
+
+```bash
+python fleet/esh_worker.py --node <0..N-1> --nodes <N> --load-4bit --relay-name my-shard
+```
+
+No account, no signup, **no token** — the default relay credential is a public demo token committed in
+the source (same safety model as the main pool's demo PSK: it secures nothing, and doesn't need to —
+the coordinator's own held-out accuracy gate is what protects the model, garbage deltas just get
+rejected). See **[fleet/COLAB_RUNGB.md](fleet/COLAB_RUNGB.md)** for a one-cell Colab/Kaggle recipe.
+
+**Status (2026-07-08):** proven live, over the real internet (not LAN), on 3 independently-owned
+machines:
+
+| Node | Machine | Result |
+|---|---|---|
+| 0 | RTX 5090 (operator's rig; also runs the coordinator) | trunk node; 10h/949-round solo soak completed clean (88.7% held-out, best 89.7%) |
+| 1 | RTX 4060 (separate box, WAN-relayed through the content store) | 76.4MB delta relayed and sha256-verified round-trip |
+| 2 | Google Colab (free T4, zero setup, fresh `git clone`) | 38.9MB delta relayed, sha256-verified, structurally validated |
+
+Each node was proven independently reachable and contributing over WAN. **Not yet done:** a single
+aligned gather combining fresh contributions from all 3 at once into one reported held-out number —
+that's next now that the solo soak has freed the 5090.

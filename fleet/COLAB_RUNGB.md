@@ -32,7 +32,7 @@ cell. It clones this **public** repo (no GitHub token needed) and runs one train
 %cd neurahash-miner
 
 # 2) install deps (Colab already ships a CUDA torch)
-!pip install -q transformers bitsandbytes
+!pip install -q transformers bitsandbytes accelerate
 
 # 3) train your slice and publish it -- no token needed, esh_worker.py ships a public demo relay by
 #    default. --node/--nodes must match what the coordinator is using for THIS round (ask the operator

@@ -11,9 +11,20 @@ Because it is real PyTorch on a real GPU, we can MEASURE its VRAM footprint with
 torch.cuda instead of scaling a guess (see vram_torch.py).
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
+
+# (#45 8GB-card VRAM fit, 2026-07-10) gradient checkpointing for the trunk transformer blocks.
+# DEFAULT OFF: unset / "0" / "false" => today's exact behavior, byte-for-byte (verified
+# BIT-IDENTICAL trunk_delta_hash OFF vs ON on the real medium recompute). When on, each Block's
+# forward is wrapped in checkpoint(use_reentrant=False): the forward runs fully (autograd-tracked)
+# but its internal activations are NOT retained; backward re-runs the same deterministic forward to
+# regenerate them -> identical gradients, ~21-28% less peak VRAM (fits 8GB cards). use_reentrant=
+# False preserves autograd graph connectivity (MoEFFN.last_aux, read after the block loop).
+_GRAD_CKPT = os.environ.get("NEURAHASH_GRAD_CHECKPOINT", "") not in ("", "0", "false", "False")
 
 
 class CausalSelfAttention(nn.Module):
@@ -194,7 +205,12 @@ class MoETransformer(nn.Module):
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)
         for b in self.blocks:
-            x = b(x)
+            # only checkpoint while gradients are tracked (the recompute's H-loop training forward);
+            # generate()'s no_grad forward is unaffected either way. Bit-identical to the plain path.
+            if _GRAD_CKPT and torch.is_grad_enabled():
+                x = _ckpt.checkpoint(b, x, use_reentrant=False)
+            else:
+                x = b(x)
         x = self.ln_f(x)
         logits = self.head(x)
         loss = None

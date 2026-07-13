@@ -9,6 +9,11 @@ torch
 eth-account==0.13.7          # secp256k1 signing + EIP-55 addresses (pulls eth-utils)
 cryptography>=42             # keystore encryption (AES) + TLS cert handling
 
+# --- all-outbound miner (tools/run_miner.py) — fetches a dense HF base, then trains it ---
+transformers                 # REQUIRED for tools/run_miner.py: make_base_from_hf.py (outbound HF base
+#                              fetch) + the NEURAHASH_CORPUS=qwen tokenizer path. (The old
+#                              run_miner_client.py toy/real-corpus path does NOT need it — see below.)
+
 # --- opt-in / convenience ---
 web3==7.16.0                 # optional: on-chain balance/settlement helpers (mining does not need it)
 argon2-cffi                  # optional: Argon2id keystore encryption (lazy; only for an encrypted wallet)

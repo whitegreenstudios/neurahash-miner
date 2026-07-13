@@ -32,6 +32,40 @@ else runs (or that you run from the full node package).
 
 ---
 
+## All-outbound miner (latest) — `tools/run_miner.py`
+
+**Status: 2026-07-13.** A newer, turnkey miner that needs **no inbound port and no live coordinator
+link** — it works behind any NAT. Each iteration fetches the base from HuggingFace (outbound), trains
+the trunk locally, and publishes a small (<10 MB) signed, compressed delta outbound. A stranger can
+`git clone` and run it with nothing else installed from the private core:
+
+```bash
+pip install -r requirements.txt
+python tools/run_miner.py --once --lr 1e-5
+```
+
+- **`--lr 1e-5` is mandatory.** The argument default (`3e-4`) destroys the base model — always pass
+  `--lr 1e-5`.
+- `--once` runs a single fetch → train → publish cycle then exits; drop it to loop forever.
+- With no publish infra configured the miner runs in **LOCAL mode**: it still trains and keeps the
+  compressed delta on disk (so you can smoke-test), and prints how to go live — it never crashes for
+  lack of infra. To PUBLISH, set `NEURAHASH_DILOCO_MERGE_URL` **and** a pinning backend (`PINATA_JWT`
+  / `PINATA_JWT_FILE`, or a local `ipfs`/kubo daemon).
+- Other flags: `--device cuda|cpu` (default `cuda`), `--base qwen3-0.6b`, `--steps N`,
+  `--wallet <name-or-keypath>`. First cold-start downloads the base weights from HuggingFace (~1.2 GB)
+  via `tools/make_base_from_hf.py`. Set `NEURAHASH_MINER_KEY=<path>` to sign your contributions (GAP1).
+
+Determinism gate for the delta codec (run after install):
+
+```bash
+python -m pytest tests/test_delta_codec_golden.py -q
+```
+
+The old networked "Rung B fleet worker" (`run_miner_client.py`, documented below) is unchanged and
+still supported — this all-outbound path is an addition, not a replacement.
+
+---
+
 ## Install
 
 ```bash

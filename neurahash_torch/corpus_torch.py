@@ -13,6 +13,7 @@ machine — cross-machine needs a content-addressed corpus (a later rung)."""
 
 import glob
 import hashlib
+import json
 import os
 
 import torch
@@ -238,6 +239,78 @@ def build_qwen_bpe_data(device, base="qwen3-1.7b", corpus_dir=None):
     return tok, train, val
 
 
+# ---------------------------------------------------------------------------
+# GSM8K-rationale corpus (P2 SFT-on-rationales): NEURAHASH_CORPUS=gsm trains the same BPE-tokenized
+# pipeline as build_qwen_bpe_data, but the token stream comes from math-reasoning rationales instead of
+# generic prose/code, so P2 can move GSM accuracy on a pre-registered held-out subset instead of loss on
+# corpus_data/*.txt. DATA HYGIENE (hard requirement): this module reads ONLY the TRAIN split file; the
+# other GSM8K split (the one with public leaderboard scores attached) is never opened anywhere below --
+# grep this file for that filename and it will not appear. The merge-gate's held-out slice is instead the
+# TAIL of the train split (env-tunable item count), so a contribution can never be graded on data that
+# also trained it.
+def _gsm_train_path():
+    """Path to the GSM8K TRAIN-split JSONL (repo root, sibling of this package's parent dir).
+    NEURAHASH_GSM_TRAIN_PATH overrides it (e.g. for tests with a tiny fixture file)."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.environ.get("NEURAHASH_GSM_TRAIN_PATH", os.path.join(repo_root, "gsm8k_train.jsonl"))
+
+
+def gsm_train_items(path=None):
+    """Read the GSM8K train-split JSONL in FILE ORDER (never shuffled) -> list of {"question","answer"}
+    dicts. File order is what makes the head/tail split in build_gsm_data reproducible across machines
+    without needing to ship a saved index."""
+    p = path or _gsm_train_path()
+    items = []
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            items.append(json.loads(line))
+    return items
+
+
+def build_gsm_data(device, base="qwen3-1.7b"):
+    """GSM8K-rationale corpus tokenized with the BASE model's own BPE tokenizer (same tokenizer
+    mechanism as build_qwen_bpe_data), so token ids line up with the imported base's embedding. Each
+    item is formatted "<question>\\nAnswer:\\n<full rationale, including the trailing '#### N' line>"
+    and items are joined by the tokenizer's EOS token (mirrors tools/draft_contributor.py's stream()
+    helper), so training never blends the end of one problem into the start of the next.
+
+    Held-out split (hygiene, hard requirement): NEURAHASH_GSM_VAL_ITEMS (default 400) items are taken
+    from the TAIL of the train split for `val`; `train` is built ONLY from the remaining head. The two
+    item sets are asserted disjoint before tokenizing (guards a future off-by-one/refactor bug, not just
+    trusting the slice)."""
+    tok = _qwen_tokenizer(base)
+    items = gsm_train_items()
+    if not items:
+        raise FileNotFoundError(f"NEURAHASH_CORPUS=gsm but no items in {_gsm_train_path()}")
+    n_val = int(os.environ.get("NEURAHASH_GSM_VAL_ITEMS", "400"))
+    n_val = max(0, min(n_val, len(items) - 1))          # always leave >=1 item for training
+    split = len(items) - n_val
+    train_items, val_items = items[:split], items[split:]
+    train_q = {it["question"] for it in train_items}
+    val_q = {it["question"] for it in val_items}
+    assert not (train_q & val_q), "build_gsm_data: train/val item overlap (data-hygiene violation)"
+
+    eos_id = getattr(tok._t, "eos_token_id", None)
+
+    def _encode(item_list):
+        ids = []
+        for ex in item_list:
+            text = ex["question"] + "\nAnswer:\n" + ex["answer"]
+            ids.extend(tok.encode(text))
+            if eos_id is not None:
+                ids.append(int(eos_id))
+        return ids
+
+    train_ids = _encode(train_items)
+    val_ids = _encode(val_items)
+    train = torch.tensor(train_ids, dtype=torch.long, device=device)
+    val = torch.tensor(val_ids, dtype=torch.long, device=device)
+    return tok, train, val
+
+
 def resolve_corpus_mode(mode=None):
     """Canonical corpus-mode STRING the pool is training on, so the coordinator can ADVERTISE it in the
     hello and a worker can compare it against its own env (issue #90 hello-dictated corpus mode). This is
@@ -273,6 +346,8 @@ def build_data(device, seed=0, mode=None):
                                     base=os.environ.get("NEURAHASH_BASE", "qwen3-1.7b"))
     if mode.lower() in ("qwen", "qwen-bpe", "bpe"):                          # base BPE tokenizer (real base)
         return build_qwen_bpe_data(device, os.environ.get("NEURAHASH_BASE", "qwen3-1.7b"))
+    if mode.lower() in ("gsm", "gsm8k", "gsm-rationales"):                   # P2 SFT-on-rationales (math)
+        return build_gsm_data(device, os.environ.get("NEURAHASH_BASE", "qwen3-1.7b"))
     if mode and mode.lower() not in ("toy", "synthetic", "0", "off", "false", "no"):
         return build_real_data(device, mode)
     text = make_text(seed=seed)

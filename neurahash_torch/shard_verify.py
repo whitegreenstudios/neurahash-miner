@@ -26,8 +26,11 @@ import hashlib
 import numpy as np
 import torch
 
-from neurahash.merkle_verify import merkle_root, merkle_proof
-from neura_l1.expert_sharding import _pad_pow2, leaf_rolls_up_to   # generic over leaf bytes
+# merkle_verify + expert_sharding are imported LAZILY inside the three checkpoint/verify functions
+# below (NOT at module level): the hot path a training node actually uses -- trunk_keys / tile_keys,
+# pure state-dict key selectors needing neither module -- must import cleanly even where the verify
+# modules are ABSENT (the public miner bundle ships trunk_keys/tile_keys but omits the verification
+# internals). Do NOT hoist these back to module scope. (M4 refactor "B".)
 
 
 def canonical_bytes(t):
@@ -81,6 +84,8 @@ def tile_index(layer, expert, n_experts):
 
 def checkpoint_root(state, n_layers, n_experts):
     """Canonical sharded checkpoint: hex Merkle root over the (pow2-padded) [trunk, tiles...]."""
+    from neurahash.merkle_verify import merkle_root            # lazy (see module-top note)
+    from neura_l1.expert_sharding import _pad_pow2
     return merkle_root(_pad_pow2(_all_leaves(state, n_layers, n_experts))).hex()
 
 
@@ -88,6 +93,8 @@ def checkpoint_proof(state, n_layers, n_experts, layer, expert):
     """Merkle proof (sibling hashes) for one tile's leaf — published in the block so a verifier
     holding only that tile rolls its own leaf up to the root. Padded to a power of two so the
     proof is valid for BOTH the pre- and post-update tile leaf (siblings unchanged)."""
+    from neurahash.merkle_verify import merkle_proof           # lazy (see module-top note)
+    from neura_l1.expert_sharding import _pad_pow2
     leaves = _pad_pow2(_all_leaves(state, n_layers, n_experts))
     idx = tile_index(layer, expert, n_experts)
     return [[sib.hex(), bool(is_left)] for sib, is_left in merkle_proof(leaves, idx)]
@@ -100,6 +107,7 @@ def verify_tile_transition(parent_root, new_root, layer, expert,
     SAME siblings. `*_tile_state` need only hold that tile's 4 keys. If ANY other tile or the
     trunk also changed, the siblings differ between the two trees and this fails — so it proves
     EXACTLY this tile changed. Returns (ok, reason)."""
+    from neura_l1.expert_sharding import leaf_rolls_up_to      # lazy (see module-top note)
     old_leaf = tile_leaf(old_tile_state, layer, expert)
     if not leaf_rolls_up_to(old_leaf, proof, parent_root):
         return False, "old tile leaf does not roll up to parent checkpoint (bad proof)"

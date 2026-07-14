@@ -9,12 +9,29 @@ which is plenty to mine. This repo is **public**, so — unlike a private setup 
 > must be reachable from the internet (a public host, or a tunnel like ngrok). Colab can only be a
 > *worker*, never the coordinator (it blocks inbound connections).
 
-## The one cell (token-free)
+## Turnkey (all-outbound) — simplest
+
+If you just want to train and (optionally) contribute without wiring up a coordinator connection, use the
+all-outbound turnkey miner — one cell, no host/port/PSK:
+
+```python
+!git clone https://github.com/whitegreenstudios/neurahash-miner
+%cd neurahash-miner
+!pip install -q -r requirements.txt
+!python tools/run_miner.py --once --lr 1e-5    # --lr 1e-5 is REQUIRED (the 3e-4 default destroys the base)
+```
+
+This trains in **LOCAL mode** (delta kept on disk). To publish, set `NEURAHASH_DILOCO_MERGE_URL` + a
+pinning backend (see the README / [BUNDLE.md](BUNDLE.md)). Note (2026-07): the shared coordinator + merge
+loop is intermittently down, so a delta published while it is down sits unmerged until it is back up.
+
+---
+
+## The one cell (token-free) — connect to a live coordinator
 
 Open a new Colab notebook, set **Runtime → Change runtime type → T4 GPU**, and paste this into a
-single cell. Replace the two placeholders:
+single cell. Replace the placeholders:
 
-- `OWNER` — the GitHub owner of this repo (set by whoever published it).
 - `<coordinator-host>` / `<port>` — your coordinator's public address.
 - `NEURAHASH_PSK` — your secret pool key (leave the demo default only for a throwaway test).
 

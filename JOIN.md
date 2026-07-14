@@ -1,7 +1,34 @@
 # Joining a NeuraHash pool — operator walkthrough
 
 This is the step-by-step version of the README. It gets one machine (yours, or a rented/cloud GPU)
-mining into a coordinator someone is running.
+mining into the pool.
+
+## Two ways to mine
+
+**1. Turnkey, all-outbound (recommended, current).** Clone and train locally — no inbound coordinator
+connection, no PSK, no port config. It fetches the base model from HuggingFace and trains outbound; to
+*publish* your work (earn credit) it pushes a small delta to a pinning backend + the merge registry.
+
+```bash
+git clone https://github.com/whitegreenstudios/neurahash-miner
+cd neurahash-miner
+pip install -r requirements.txt
+python tools/run_miner.py --once --lr 1e-5    # --lr 1e-5 is REQUIRED (the 3e-4 default destroys the base)
+```
+
+By default it runs in **LOCAL mode** (deltas trained + kept on disk). To publish, set
+`NEURAHASH_DILOCO_MERGE_URL=<merge-registry-url>` plus a pinning backend (see the README). The training
+bundle is content-addressed + **hash-verified** from interchangeable seeds (HuggingFace / VPS / IPFS) —
+see [BUNDLE.md](BUNDLE.md).
+
+> **Status (2026-07):** the shared coordinator + merge loop is intermittently **down**; a delta published
+> while it is down sits unmerged until it is back up. Local training works regardless.
+
+**2. Connect to a live coordinator (synchronous).** The round-by-round path documented below. It needs a
+coordinator's host/port (+ PSK / TLS pin) and a byte-matched corpus — use it when someone is running a
+live coordinator you are joining.
+
+---
 
 ## 0. Prerequisites
 
@@ -18,8 +45,6 @@ git clone https://github.com/whitegreenstudios/neurahash-miner
 cd neurahash-miner
 pip install -r requirements.txt
 ```
-
-(Replace `OWNER` with the actual GitHub owner once the repo is published.)
 
 ## 2. Prove your build matches the pool
 

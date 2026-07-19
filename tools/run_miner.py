@@ -233,7 +233,24 @@ def main():
     ap.add_argument("--base-source", default=None,
                     help="explicit base: a checkpoint path, IPFS CID, or tracker URL "
                          "(wins over any local/cold-start base)")
+    ap.add_argument("--no-auto-update", action="store_true",
+                    help="disable the SIGNED, fail-closed auto-updater (default ON; same as "
+                         "NEURAHASH_AUTOUPDATE=0). See tools/self_update.py + SIGNING.md.")
     args = ap.parse_args()
+
+    # SIGNED, FAIL-CLOSED AUTO-UPDATE (default ON) -- see tools/self_update.py. Verifies a release
+    # manifest against the pinned release key and, only on a verified FORWARD release, checks it out
+    # and re-execs. On ANY failure it warns and continues on the current version; never runs unsigned
+    # code. Opt out: --no-auto-update / NEURAHASH_AUTOUPDATE=0. Rate-limited (once/6h).
+    if not args.no_auto_update:
+        try:
+            from self_update import maybe_auto_update          # tools/ is on sys.path here
+        except ImportError:
+            from tools.self_update import maybe_auto_update     # imported as a package
+        try:
+            maybe_auto_update(argv=sys.argv)                   # returns unless it re-execs onto new code
+        except Exception as _e:
+            log(f"auto-update skipped ({_e}); continuing on current version")
 
     work_dir = os.path.abspath(args.work_dir)
     os.makedirs(work_dir, exist_ok=True)

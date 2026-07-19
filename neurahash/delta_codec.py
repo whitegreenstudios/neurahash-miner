@@ -14,6 +14,15 @@ SCHEME (per tensor, top-k + int8):
     mostly-zero in its high bytes, so DEFLATE squeezes it toward ~2-3 bytes/entry; with the default
     topk this lands the whole 600M-param trunk delta well under the 10 MB ceiling.
 
+INT4 (opt-in, bits=4). The kept values can instead be quantized to a 4-bit grid (scale = max(|kept|)/7,
+q in [-7, 7]) packed two-per-byte, ~halving the value bytes over ~1-5 Mbps residential uplinks. DeepMind's
+Decoupled DiLoCo (arxiv 2604.21428, Table 10) measured int4 outer-delta compression as quality-free
+(+0.09% val loss) with a hard cliff at 2-bit (+32%, broken), so <4-bit is refused. The DEFAULT is bits=8,
+whose payload is byte-identical to the pre-int4 format (manifest version 1, NO "bits" key); bits=4 sets
+manifest version 2 + top-level "bits":4 so an OLD decoder fails loudly on the value-shape mismatch instead
+of silently misdecoding. The held-out merge gate (diloco_merge.apply_delta_gated) bounds any per-delta
+quality risk, so the rollout is default-off.
+
 SAFETY. The payload is a plain-numeric npz: decompress loads it with allow_pickle=False, so a hostile
 artifact cannot execute code (same discipline as neurahash/diloco_merge.fetch_delta). Decompress
 returns {name: float32 ndarray} of the ORIGINAL shapes (zeros except the kept entries).
@@ -30,6 +39,11 @@ import numpy as np
 
 MAGIC = "NHQ8"
 VERSION = 1
+# bits=4 (int4) payloads bump the manifest to VERSION_INT4 and add a top-level "bits":4; their v{i}
+# arrays are nibble-packed uint8 (not int8). The version bump makes an OLD int8-only decoder fail loudly
+# (unsupported version) instead of misreading the packed bytes. bits=8 stays VERSION (byte-identical).
+VERSION_INT4 = 2
+_SUPPORTED_VERSIONS = (VERSION, VERSION_INT4)
 # Default top-k FRACTION used when compression is turned ON (NEURAHASH_DELTA_TOPK overrides in the
 # contributor). 0.003 keeps 0.3% of each tensor's entries: for the 600M-param Qwen trunk that is
 # ~1.8M entries at ~3 bytes each -> ~5-9 MB, under the 10 MB push-through-NAT ceiling.
@@ -95,11 +109,13 @@ def _kth_largest_abs_key(a, k):
     return T, n_above + n_above_B, kk2 - n_above_B
 
 
-def quantize_topk(arr, topk_fraction):
+def quantize_topk(arr, topk_fraction, *, bits=8):
     """Top-k-by-magnitude int8 quantization of ONE tensor's flattened values.
     Returns (sorted_flat_indices int64, int8_values, scale float). k = max(1, round(fraction*numel)),
-    capped at numel. The per-tensor scale is max(|kept|)/127 so the largest kept value maps to +/-127;
-    an all-zero delta yields scale=1.0 and zero values (never a divide-by-zero).
+    capped at numel. bits=8 (default): scale = max(|kept|)/127, q in [-127,127]. bits=4 (opt-in):
+    scale = max(|kept|)/7, q in [-7,7] (returned UNPACKED as int8 here; compress_delta packs two-per-byte).
+    bits must be 4 or 8 (<4-bit outer-delta quant is known-broken, arxiv 2604.21428 Table 10). The largest
+    kept value maps to +/-qmax; an all-zero delta yields scale=1.0 and zero values (never a divide-by-zero).
 
     Selection is a MEMORY-BOUNDED exact GLOBAL top-k (semantics identical to the original
     np.argpartition path — the same k largest-|value| entries over the whole flat array, NOT
@@ -127,6 +143,9 @@ def quantize_topk(arr, topk_fraction):
     LOWEST flat indices first. This yields the SAME |value| multiset as argpartition's top-k (the
     strictly-greater set is unique; every remaining kept entry has magnitude exactly t) — what any
     top-k selection must produce. Determinism is total: the result depends only on (a, k)."""
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits!r}; <4-bit outer-delta quantization is "
+                         "known-broken (+32% val loss vs +0.09% at int4, arxiv 2604.21428 Table 10)")
     a = _to_numpy(arr).reshape(-1)
     n = a.size
     if n == 0:
@@ -156,24 +175,58 @@ def quantize_topk(arr, topk_fraction):
     max_abs = float(np.max(np.abs(vals))) if vals.size else 0.0
     if max_abs == 0.0:
         return idx.astype(np.int64, copy=False), np.zeros(idx.size, np.int8), 1.0
-    scale = max_abs / 127.0
-    q = np.clip(np.round(vals / scale), -127, 127).astype(np.int8)
+    qmax = 127 if bits == 8 else 7                                  # int8 grid (bits==8) vs int4 grid (bits==4)
+    scale = max_abs / float(qmax)
+    q = np.clip(np.round(vals / scale), -qmax, qmax).astype(np.int8)  # UNPACKED int8; compress_delta packs int4
     return idx.astype(np.int64, copy=False), q, float(scale)
 
 
-def compress_delta(delta, topk_fraction=DEFAULT_TOPK, *, return_residual=False):
+def _pack_int4(q):
+    """Pack int8 values in [-7, 7] two-per-byte for the int4 (bits=4) codec: bias +7 -> [0, 14] (fits a
+    nibble), HIGH nibble = even flat positions, LOW nibble = odd. An odd count is padded with one 0 whose
+    only trace is the trailing nibble — the per-tensor nnz in the manifest tells the decoder to drop it.
+    Returns a uint8 array of ceil(len(q)/2). Pure integer ops (no float), so packing is bit-deterministic."""
+    b = q.astype(np.int16) + 7                                      # [-7,7] -> [0,14]
+    if b.size % 2:
+        b = np.concatenate([b, np.zeros(1, np.int16)])             # pad odd length; nnz drops the pad nibble
+    return ((b[0::2] << 4) | b[1::2]).astype(np.uint8)             # (hi<<4)|lo per byte, values <= 238
+
+
+def _unpack_int4(packed, nnz):
+    """Inverse of _pack_int4: uint8 nibble pairs -> int8 values in [-7, 7], first `nnz` (pad nibble dropped).
+    Pure integer elementwise ops -> identical bytes in, identical ints out on ANY host, which matters because
+    the committee hashes the DECOMPRESSED fp32 (diloco_committee.delta_hash_np): nondeterminism here would
+    make honest verifiers slash honest miners."""
+    p = np.asarray(packed, dtype=np.uint8).astype(np.int16)
+    out = np.empty(p.size * 2, dtype=np.int16)
+    out[0::2] = p >> 4                                              # HIGH nibble = even positions
+    out[1::2] = p & 0x0F                                            # LOW nibble = odd positions
+    return (out[:nnz] - 7).astype(np.int8)                          # de-bias [0,14] -> [-7,7]
+
+
+def compress_delta(delta, topk_fraction=DEFAULT_TOPK, *, return_residual=False, bits=8):
     """Compress a trunk-delta dict {name: tensor(numpy|torch)} to a compact bytes payload (see module
     docstring for the scheme). EVERY key in `delta` is represented (a zero delta stores nnz=0), so the
     key-set round-trips exactly. If return_residual=True, also returns {name: residual ndarray} with
-    residual = delta - decompressed (ERROR-FEEDBACK hook)."""
+    residual = delta - decompressed (ERROR-FEEDBACK hook).
+
+    bits=8 (default) emits the pre-int4 format BYTE-IDENTICALLY: manifest version 1, no "bits" key, int8
+    v{i}. bits=4 (opt-in) halves the value bytes (int4 grid, nibble-packed uint8 v{i}), stamps manifest
+    version 2 + top-level "bits":4, and must be in (4, 8) — anything else raises (see quantize_topk)."""
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits!r}; <4-bit outer-delta quantization is "
+                         "known-broken (+32% val loss vs +0.09% at int4, arxiv 2604.21428 Table 10)")
     manifest = {"magic": MAGIC, "version": VERSION, "topk": float(topk_fraction), "tensors": []}
+    if bits == 4:                                                   # bits=8 leaves the manifest UNCHANGED
+        manifest["version"] = VERSION_INT4
+        manifest["bits"] = 4
     arrays = {}
     scales = []
     residual = {} if return_residual else None
     for i, name in enumerate(delta):
         a = _to_numpy(delta[name])
         shape = list(a.shape)
-        idx, q, scale = quantize_topk(a, topk_fraction)
+        idx, q, scale = quantize_topk(a, topk_fraction, bits=bits)
         if idx.size and int(idx[-1]) >= 2 ** 31:
             raise ValueError(f"tensor {name!r} has >2^31 elements; index encoding overflows")
         gaps = np.diff(idx, prepend=np.int64(0))                    # sorted -> nonneg; cumsum inverts
@@ -181,10 +234,12 @@ def compress_delta(delta, topk_fraction=DEFAULT_TOPK, *, return_residual=False):
         # which DEFLATE squeezes further), uint32 only when a tensor has a >65535-element unselected run.
         gap_dtype = np.uint16 if (gaps.size == 0 or int(gaps.max()) < 2 ** 16) else np.uint32
         arrays[f"g{i}"] = gaps.astype(gap_dtype)
-        arrays[f"v{i}"] = q
+        arrays[f"v{i}"] = q if bits == 8 else _pack_int4(q)         # int8 (bits=8) or nibble-packed uint8 (bits=4)
         scales.append(scale)
         manifest["tensors"].append({"name": name, "shape": shape, "nnz": int(idx.size)})
         if return_residual:
+            # dequantize through the SAME grid the decoder uses (q is the UNPACKED int4/int8; packing is
+            # lossless), so residual = delta - decompressed is EXACT for error feedback across rounds.
             recon = np.zeros(a.size, dtype=np.float32)
             if idx.size:
                 recon[idx] = q.astype(np.float32) * np.float32(scale)
@@ -200,14 +255,19 @@ def compress_delta(delta, topk_fraction=DEFAULT_TOPK, *, return_residual=False):
 
 def decompress_delta(payload):
     """Inverse of compress_delta. Returns {name: float32 ndarray} of the ORIGINAL shapes (zeros except
-    the kept top-k entries, each = int8_value * scale). Loaded with allow_pickle=False so a hostile
-    artifact cannot execute code."""
+    the kept top-k entries, each = int_value * scale). Auto-detects bits from the manifest: version 1 /
+    no "bits" key -> int8 v{i} (byte-identical legacy path); version 2 + "bits":4 -> nibble-packed uint8
+    v{i} unpacked to int4. Loaded with allow_pickle=False so a hostile artifact cannot execute code."""
     with np.load(io.BytesIO(payload), allow_pickle=False) as z:
         manifest = json.loads(z[_MANIFEST_KEY].tobytes().decode("utf-8"))
         if manifest.get("magic") != MAGIC:
             raise ValueError("bad magic in compressed delta")
-        if int(manifest.get("version", 0)) != VERSION:
+        if int(manifest.get("version", 0)) not in _SUPPORTED_VERSIONS:
             raise ValueError(f"unsupported compressed-delta version {manifest.get('version')}")
+        bits = int(manifest.get("bits", 8))                         # absent -> 8 (legacy int8 payloads)
+        if bits not in (4, 8):
+            raise ValueError(f"unsupported quantization bits {bits!r}; <4-bit is known-broken "
+                             "(arxiv 2604.21428 Table 10)")
         scales = z["_scales"]
         out = {}
         for i, meta in enumerate(manifest["tensors"]):
@@ -218,14 +278,16 @@ def decompress_delta(payload):
             flat = np.zeros(n, dtype=np.float32)
             if nnz:
                 idx = np.cumsum(z[f"g{i}"].astype(np.int64))
-                flat[idx] = z[f"v{i}"].astype(np.float32) * np.float32(scales[i])
+                q = z[f"v{i}"] if bits == 8 else _unpack_int4(z[f"v{i}"], nnz)
+                flat[idx] = q.astype(np.float32) * np.float32(scales[i])
             out[name] = flat.reshape(shape)
     return out
 
 
-def save_compressed_delta(path, delta, topk_fraction=DEFAULT_TOPK):
-    """Compress `delta` and write it to `path`. Returns the payload size in bytes."""
-    payload = compress_delta(delta, topk_fraction)
+def save_compressed_delta(path, delta, topk_fraction=DEFAULT_TOPK, *, bits=8):
+    """Compress `delta` and write it to `path`. Returns the payload size in bytes. bits=4 opts into the
+    int4 value grid (see compress_delta); bits=8 (default) writes the byte-identical legacy format."""
+    payload = compress_delta(delta, topk_fraction, bits=bits)
     with open(path, "wb") as f:
         f.write(payload)
     return len(payload)

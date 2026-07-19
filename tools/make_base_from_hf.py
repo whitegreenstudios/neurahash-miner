@@ -28,7 +28,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root on path
 
-DEFAULT_OUT = "D:/aiCrypto_work/basegen/qwen06_r0.pt"
+DEFAULT_OUT = os.path.join(os.path.expanduser("~"), "neurahash_miner", "basegen", "qwen06_r0.pt")
 
 
 def main():

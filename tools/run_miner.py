@@ -127,14 +127,32 @@ def _child_env(base_name):
 
 
 def resolve_base(args, work_dir, env):
-    """Return (base_ref, description). Priority: --base-source > local base in work dir > cold-start
-    build from HuggingFace. base_ref is whatever `diloco contribute` should receive as its source
-    (its _resolve_ckpt handles a path / bare CID / tracker URL)."""
+    """Return (base_ref, description). Priority: --base-source > local base in work dir > DECENTRALIZED
+    fetch of the fleet's current base by CID (content-store tracker -> IPFS swarm/gateways) > cold-start
+    build from HuggingFace. base_ref is whatever `diloco contribute` should receive as its source (its
+    _resolve_ckpt handles a path / bare CID / tracker URL)."""
     if args.base_source:
         return args.base_source, f"base-source (given): {args.base_source}"
     local_base = os.path.join(work_dir, "base.pt")
     if os.path.exists(local_base):
         return local_base, f"local base in work dir: {local_base}"
+    # DECENTRALIZED-FIRST (owner directive: download the model over the decentralized network, HF only as a
+    # fallback). Before the HF cold-start, pull the fleet's CURRENT base checkpoint by CID -- the
+    # content-store tracker -> IPFS swarm / public gateways, CID-VERIFIED. bootstrap_checkpoint NEVER raises
+    # and returns None on any miss, so we drop through to HuggingFace only when NO decentralized base is
+    # reachable (same fetch a manual `--base-source <CID>` uses, just tracker-auto-discovered).
+    store = (os.environ.get("NEURAHASH_CONTENT_URL", "").strip()
+             or os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip())
+    if store:
+        try:
+            import ipfs_checkpoint as _ic                    # tools/ on sys.path (python tools/run_miner.py)
+        except ImportError:
+            from tools import ipfs_checkpoint as _ic         # imported as a package
+        got = _ic.bootstrap_checkpoint(local_base, store)
+        if got and os.path.exists(local_base):
+            return local_base, (f"decentralized base via {got.get('source')} "
+                                f"(round {got.get('round')}, cid {str(got.get('cid'))[:12]}..)")
+        log("no decentralized base reachable (content-store tracker/CID) -- falling back to HuggingFace")
     log("cold-start fallback: no base found -- building a round-0 base from HuggingFace "
         "(all-outbound) via make_base_from_hf.py; this downloads weights on first run")
     cmd = [sys.executable, MAKE_BASE, local_base, "--device", "cpu", "--base", args.base]
@@ -210,7 +228,7 @@ def main():
     ap.add_argument("--interval", type=int, default=30,
                     help="seconds to sleep between iterations (ignored with --once)")
     ap.add_argument("--once", action="store_true", help="run a single iteration then exit (testing)")
-    ap.add_argument("--work-dir", default="D:/aiCrypto_work/run_miner",
+    ap.add_argument("--work-dir", default=os.path.join(os.path.expanduser("~"), "neurahash_miner"),
                     help="scratch dir for the base + contribution + compressed delta")
     ap.add_argument("--base-source", default=None,
                     help="explicit base: a checkpoint path, IPFS CID, or tracker URL "

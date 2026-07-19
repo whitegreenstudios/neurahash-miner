@@ -769,6 +769,75 @@ def _cmd_balance(args):
     return 0
 
 
+# --------------------------------------------------------------------------- rotate (Phase 0 hygiene)
+def _cmd_rotate(args):
+    """
+    Rotate the miner's identity keypair.
+    Archives the old keystore (renames with a timestamp suffix) and writes a fresh
+    keypair to the original path, preserving the encryption/KDF settings.
+    Prints both the OLD and NEW addresses so the operator can update any external
+    references (pool payout configs, coordinator whitelists, etc.).
+    """
+    from datetime import datetime
+    import shutil
+
+    # Load the existing wallet (need the password if it is encrypted).
+    pw = args.password
+    w = Wallet.load(args.path, password=pw)
+    if not w.has_key:
+        raise ValueError(f"{args.path}: cannot rotate a watch-only keystore (no private key on disk)")
+
+    old_addr = w.address
+
+    # Preserve the encryption settings: infer the format from whether a password was supplied. An
+    # encrypted rotation re-encrypts the fresh key with the SAME password + KDF; a plaintext rotation is
+    # refused unless --allow-plaintext is given (re-encrypting is the recommended path). VALIDATE this
+    # BEFORE touching the old keystore so a refusal leaves the original file exactly in place (never
+    # archive-then-abort, which would strand the only keystore under the .rotated_ path).
+    was_encrypted = pw is not None
+    kdf = args.kdf
+    if not was_encrypted and not args.allow_plaintext:
+        raise ValueError(
+            "original keystore was plaintext; re-encrypting with --password is recommended. "
+            "Use --allow-plaintext to confirm, or provide --password to encrypt the new key.")
+
+    # Archive the old keystore (timestamp suffix) so the previous key is never destroyed in place.
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    archived = f"{args.path}.rotated_{ts}"
+    shutil.move(args.path, archived)
+    print(f"[rotate] archived old keystore -> {archived}")
+    print(f"[rotate] old address: {old_addr}")
+
+    # Generate a fresh keypair and write it to the ORIGINAL path, reusing the same encryption params.
+    new_account = gen_account()
+    new_addr = new_account.address
+    new_w = Wallet(new_account)
+    if was_encrypted:
+        new_w.save(args.path, password=pw, kdf=kdf)
+    else:
+        new_w.save(args.path, allow_plaintext=True)
+
+    print(f"[rotate] new address: {new_addr}")
+    print(f"[rotate] new keystore written -> {os.path.abspath(args.path)}")
+    if was_encrypted:
+        print(f"[rotate] encrypted with --password + --kdf={kdf}")
+    else:
+        print("[rotate] WARNING: written as PLAINTEXT (use --password to encrypt at rest)")
+
+    # Optional: if a ledger file is given, show the balance for both addresses. Reuses the guarded
+    # public helper (balance_from_ledger), so on a public build without the settlement core this
+    # degrades to a clear "skipped" message instead of raising AFTER the key was already rotated.
+    if args.ledger:
+        try:
+            old_bal = balance_from_ledger(old_addr, args.ledger)
+            new_bal = balance_from_ledger(new_addr, args.ledger)
+            print(f"[rotate] balances (ledger {args.ledger}): old={old_bal:.6f} NRH, new={new_bal:.6f} NRH")
+        except Exception as e:
+            print(f"[rotate] ledger balance lookup skipped: {e}")
+
+    return 0
+
+
 def build_parser():
     import argparse
     ap = argparse.ArgumentParser(
@@ -821,6 +890,18 @@ def build_parser():
                        help="persisted signed ledger: a ChainSettlement/SignedPoolLedger to_state() "
                             "JSON or a coordinator checkpoint with a 'chain'/'ledger' sub-state")
     p_bal.set_defaults(func=_cmd_balance)
+
+    p_rot = sub.add_parser("rotate", help="rotate the miner's keypair: archive the old keystore, generate a fresh one, and write it to the same path (preserving encryption/KDF)")
+    p_rot.add_argument("path", help="keystore path to rotate")
+    p_rot.add_argument("--password", default=None, help="password for an encrypted keystore (if omitted, assumes plaintext)")
+    p_rot.add_argument("--kdf", default="scrypt", choices=["scrypt", "pbkdf2", "argon2id"],
+                       help="KDF to re-encrypt with (default scrypt; argon2id needs argon2-cffi)")
+    p_rot.add_argument("--allow-plaintext", action="store_true",
+                       help="if the original was plaintext -> plaintext rotation (without this, plaintext -> plaintext is refused; re-encrypt with --password instead)")
+    p_rot.add_argument("--ledger", default=None,
+                       help="optional ledger file to show old/new balances (ChainSettlement or coordinator checkpoint JSON)")
+    p_rot.set_defaults(func=_cmd_rotate)
+
     return ap
 
 

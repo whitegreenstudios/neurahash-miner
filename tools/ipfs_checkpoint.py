@@ -23,6 +23,7 @@ import hmac
 import http.client
 import json
 import os
+import shutil
 import ssl
 import subprocess
 import time
@@ -98,12 +99,13 @@ def _put_retry(attempt_fn, *, label, retries=None):
     raise last_exc
 
 
-def publish(path, ipfs_bin=None, announce=True, pin=True, timeout=600):
+def publish(path, ipfs_bin=None, announce=True, pin=True, timeout=600, record_path=None):
     """Add `path` to the local IPFS node and return its CIDv1. The node must be running `ipfs daemon`
     for the content to be retrievable by others. `pin` runs `ipfs pin add <cid>` so the node KEEPS
     serving the checkpoint across garbage-collection (this is the self-hosted replacement for Pinata's
     pin — the "be your own Pinata" availability layer). `announce` provides the CID to the DHT so public
-    gateways can locate it promptly (best-effort; the daemon also reprovides on its own cadence)."""
+    gateways can locate it promptly (best-effort; the daemon also reprovides on its own cadence).
+    `record_path` overrides where the published CID is recorded (see _record_local_pin)."""
     ipfs_bin = ipfs_bin or IPFS_BIN
     cid = subprocess.check_output(
         [ipfs_bin, "add", "-q", "--cid-version=1", path], timeout=timeout).decode().strip().splitlines()[-1]
@@ -115,7 +117,7 @@ def publish(path, ipfs_bin=None, announce=True, pin=True, timeout=600):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             pass
-        _record_local_pin(cid)
+        _record_local_pin(cid, record_path=record_path)
     if announce:
         # fire-and-forget: a slow DHT provide must never block the coordinator's round loop
         try:
@@ -126,9 +128,13 @@ def publish(path, ipfs_bin=None, announce=True, pin=True, timeout=600):
     return cid
 
 
-# We prune LOCAL pins by a locally-written record of the CIDs *we* published, newest-last — `ipfs pin ls`
-# gives no ordering and lists every pin (deps included), so a self-kept ledger is the simple, reliable
-# source of truth for "the checkpoints this node pinned". Mirrors prune_pinata's newest-N-kept shape.
+# Durable published-CID record: every publish APPENDS the CID here (newest-last). Pruning derives its
+# unpin set from `ipfs pin ls` GROUND TRUTH intersected with this record — the record identifies which
+# pins are OURS (checkpoints, vs corpus shards / other tenants of the daemon that must never be
+# touched) and its order defines "newest N kept"; pin-ls says what is actually still pinned. The
+# record alone is NOT truth (#138: it used to be trimmed even when `ipfs pin rm` silently failed, so
+# every failed unpin escaped all future prunes — 369 pins / 125.6 GB accumulated against a keep of 3).
+# A CID now leaves the record only after its unpin is VERIFIED (or pin-ls shows it already gone).
 _LOCAL_PIN_RECORD = os.environ.get(
     "NEURAHASH_IPFS_PIN_RECORD",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ipfs_local_pins.json"))
@@ -154,11 +160,27 @@ def _record_local_pin(cid, record_path=None):
         pass
 
 
+def _ipfs_pin_ls(ipfs_bin=None, timeout=120):
+    """GROUND-TRUTH pin inventory: the recursive pins the local kubo daemon holds RIGHT NOW
+    (`ipfs pin ls --type=recursive -q`). Returns a set of CID strings. Raises on any failure —
+    callers must treat "cannot list pins" as "do not prune" rather than pruning blind."""
+    ipfs_bin = ipfs_bin or IPFS_BIN
+    p = subprocess.run([ipfs_bin, "pin", "ls", "--type=recursive", "-q"], capture_output=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(f"`ipfs pin ls` failed (rc {p.returncode}): {(p.stderr or '').strip()[:300]}")
+    return {ln.split()[0] for ln in (p.stdout or "").splitlines() if ln.strip()}
+
+
 def prune_local_pins(keep=3, ipfs_bin=None, record_path=None):
-    """Keep only the newest `keep` checkpoint CIDs this node published (per the local ledger) pinned;
-    `ipfs pin rm` the rest so the local repo doesn't grow unbounded. Mirrors prune_pinata(keep=3): the
-    ledger is written newest-last, so the tail is kept and the head dropped. Returns the unpinned CIDs.
-    Best-effort per CID — a pin that is already gone is not an error."""
+    """Keep the newest `keep` published checkpoint pins; `ipfs pin rm` every OTHER pin the durable
+    published-CID record attributes to a checkpoint publish. #138 rewrite — the unpin set is derived
+    from `ipfs pin ls` GROUND TRUTH intersected with the record (NOT from in-process history), so
+    checkpoint pins accumulated by PRIOR coordinator processes are pruned too, and a CID leaves the
+    record only once its unpin is VERIFIED (rc 0 / already unpinned). Failed unpins stay recorded and
+    are RETRIED next cycle, and every failure is LOGGED LOUDLY — silently forgetting them is how 369
+    pins / 125.6 GB piled up against a keep of 3. Pins NOT in the record (corpus shards, other
+    tenants) are never touched. Never raises; returns the CIDs actually unpinned."""
     ipfs_bin = ipfs_bin or IPFS_BIN
     record_path = record_path or _LOCAL_PIN_RECORD
     if not os.path.exists(record_path):
@@ -166,26 +188,111 @@ def prune_local_pins(keep=3, ipfs_bin=None, record_path=None):
     try:
         with open(record_path) as f:
             cids = json.load(f)
-    except (OSError, ValueError):
+        if not isinstance(cids, list):
+            raise ValueError(f"pin record holds a {type(cids).__name__}, expected a list")
+    except (OSError, ValueError) as e:
+        print(f"[ipfs_checkpoint] pin prune SKIPPED: record {record_path} unreadable ({e})", flush=True)
         return []
-    drop = cids[:-keep] if keep > 0 else list(cids)
-    dropped = []
-    for cid in drop:
+    try:
+        pinned = _ipfs_pin_ls(ipfs_bin=ipfs_bin)
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        print(f"[ipfs_checkpoint] pin prune SKIPPED: cannot read `ipfs pin ls` ground truth "
+              f"({type(e).__name__}: {e}) — refusing to prune blind", flush=True)
+        return []
+    keep_tail = set(cids[-keep:]) if keep > 0 else set()
+    dropped, failed = [], set()
+    for cid in cids:
+        if cid in keep_tail or cid not in pinned:              # keeper, or already gone from the daemon
+            continue
         try:
-            subprocess.run([ipfs_bin, "pin", "rm", cid],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        except (OSError, subprocess.SubprocessError):
-            pass
-        dropped.append(cid)
-    kept = cids[-keep:] if keep > 0 else []
-    try:                                                       # rewrite the ledger to just the kept tail
+            p = subprocess.run([ipfs_bin, "pin", "rm", cid], capture_output=True,
+                               encoding="utf-8", errors="replace", timeout=120)
+        except (OSError, subprocess.SubprocessError) as e:
+            failed.add(cid)
+            print(f"[ipfs_checkpoint] UNPIN FAILED (kept in record for retry): {cid}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            continue
+        err = (p.stderr or "").strip()
+        if p.returncode == 0 or "not pinned" in err:           # unpinned (or a racer beat us to it)
+            dropped.append(cid)
+        else:
+            failed.add(cid)
+            print(f"[ipfs_checkpoint] UNPIN FAILED (rc {p.returncode}, kept in record for retry): "
+                  f"{cid}: {err[:300]}", flush=True)
+    # rewrite the record: the keep-tail plus every FAILED unpin (order preserved, newest-last) —
+    # never drop a CID we have not verifiably unpinned; already-gone CIDs are bookkeeping catch-up.
+    kept = [c for c in cids if c in keep_tail or c in failed]
+    try:
         tmp = record_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(kept, f)
         os.replace(tmp, record_path)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"[ipfs_checkpoint] pin record rewrite FAILED ({record_path}): {e}", flush=True)
+    if dropped or failed:
+        print(f"[ipfs_checkpoint] pin prune: unpinned {len(dropped)}, failed {len(failed)} "
+              f"(keep {keep}, daemon holds {len(pinned)} recursive pins)", flush=True)
     return dropped
+
+
+def ipfs_repo_gc(ipfs_bin=None, timeout=600):
+    """Run `ipfs repo gc` to reclaim unpinned blocks. kubo NEVER garbage-collects on its own unless
+    the daemon was started with --enable-gc (#138: RepoSize hit 125.6 GB vs a 10 GB StorageMax), so
+    the publisher runs one bounded gc after each prune cycle that actually unpinned something.
+    Best-effort: failures are LOGGED loudly and swallowed (a slow or failed gc must never break
+    publishing). Returns the number of blocks removed, or -1 on failure."""
+    ipfs_bin = ipfs_bin or IPFS_BIN
+    try:
+        p = subprocess.run([ipfs_bin, "repo", "gc", "-q"], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[ipfs_checkpoint] ipfs repo gc FAILED: {type(e).__name__}: {e}", flush=True)
+        return -1
+    if p.returncode != 0:
+        print(f"[ipfs_checkpoint] ipfs repo gc FAILED (rc {p.returncode}): "
+              f"{(p.stderr or '').strip()[:300]}", flush=True)
+        return -1
+    n = sum(1 for ln in (p.stdout or "").splitlines() if ln.strip())
+    print(f"[ipfs_checkpoint] ipfs repo gc: removed {n} block(s)", flush=True)
+    return n
+
+
+# --------------------------------------------------------------------------- disk-floor preflight (#138)
+IPFS_MIN_FREE_GB = float(os.environ.get("NEURAHASH_IPFS_MIN_FREE_GB", "10"))
+
+
+def ipfs_repo_free_gb(path=None):
+    """Free GB (binary, 2**30) on the drive holding the kubo repo (env IPFS_PATH, default ~/.ipfs).
+    Walks up to the nearest EXISTING ancestor so a not-yet-initialized repo dir still resolves to its
+    drive. Returns None when free space cannot be measured — callers FAIL OPEN on None (an
+    unmeasurable disk must not stop publishing; a MEASURED low disk must)."""
+    path = path or (os.environ.get("IPFS_PATH", "") or "").strip() or os.path.expanduser("~/.ipfs")
+    probe = os.path.abspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free / (1 << 30)
+    except OSError:
+        return None
+
+
+def publish_preflight_ok(min_free_gb=None):
+    """DISK-FLOOR preflight (#138): True iff the kubo repo's drive has at least
+    NEURAHASH_IPFS_MIN_FREE_GB (default 10) GB free. Below the floor it logs ONE loud line and
+    returns False — the caller skips that publish (adding ~checkpoint-size bytes per cycle is what
+    ran D: from 41 GB to 1.5 GB overnight) and should prune+gc instead so the repo can shrink back
+    under the floor without an operator. Fails OPEN (True) when free space is unmeasurable."""
+    floor = IPFS_MIN_FREE_GB if min_free_gb is None else float(min_free_gb)
+    free = ipfs_repo_free_gb()
+    if free is None or free >= floor:
+        return True
+    print(f"[ipfs_checkpoint] publish SKIPPED by disk floor: {free:.1f} GB free on the IPFS repo "
+          f"drive < NEURAHASH_IPFS_MIN_FREE_GB={floor:g} — not adding bytes; prune+gc must catch up",
+          flush=True)
+    return False
 
 
 def _ipfs_get(cid, dest, ipfs_bin=None, timeout=600):
@@ -248,11 +355,17 @@ def fetch(cid, dest, gateways=DEFAULT_GATEWAYS, timeout=180, verify_cid=True,
 
 def _cid_matches(cid, data):
     """Verify fetched bytes reproduce `cid` by re-adding them offline (`ipfs add -n`, no network) and
-    comparing. Falls back to True only if no ipfs binary is available (HTTPS + gateway trust), and says
-    so via the env flag so an operator can require strict verification."""
+    comparing. VERSION-AWARE: a CIDv0 (base58 "Qm...") is re-added with --cid-version=0, everything else
+    (a CIDv1, e.g. base32 "bafy...") with --cid-version=1 — re-adding under the wrong version yields a
+    different CID and would hard-reject an HONEST fetch. Our own publish paths emit CIDv1 (publish() and
+    pin_file_to_pinata(cid_version=1)), but Pinata defaults to CIDv0 if a future caller unsets cidVersion,
+    so matching the version to the CID keeps verification correct for both. Falls back to True only if no
+    ipfs binary is available (HTTPS + gateway trust), and says so via the env flag so an operator can
+    require strict verification."""
     ipfs_bin = IPFS_BIN
+    cid_version = "0" if cid.startswith("Qm") else "1"        # CIDv0 multihash "Qm..."; else treat as CIDv1
     try:
-        proc = subprocess.run([ipfs_bin, "add", "-qn", "--cid-version=1"],
+        proc = subprocess.run([ipfs_bin, "add", "-qn", f"--cid-version={cid_version}"],
                               input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
         got = proc.stdout.decode().strip().splitlines()[-1] if proc.stdout else ""
         return got == cid
@@ -638,7 +751,7 @@ def pin_file_via_s3(path, bucket, key=None, creds=None, timeout=1800, amz_date=N
 
 # --------------------------------------------------------------------------- one-call publisher
 def publish_checkpoint(ckpt_path, round_no, tracker_path, *, prefer="auto", pin_keep=3,
-                       ipfs_bin=None, peers=None, ts=0, backstop="auto"):
+                       ipfs_bin=None, peers=None, ts=0, backstop="auto", pin_record=None):
     """Publish `ckpt_path` and (re)write the tiny tracker doc — the single call the coordinator makes.
     `prefer`: 'pinata' (upload to Pinata, always-on host), 'ipfs' (local daemon hosts), or 'auto'
     (Pinata if a JWT is configured, else local IPFS). `backstop` = off-machine durability copy: 's3'
@@ -647,7 +760,8 @@ def publish_checkpoint(ckpt_path, round_no, tracker_path, *, prefer="auto", pin_
     + creds are set, else the pin-service iff a token is set, else nothing). Prunes old pins to
     `pin_keep`. Returns the published CID. Designed to run in a BACKGROUND thread — it does network I/O
     and must never block the coordinator's round loop; the caller swallows exceptions so a publish hiccup
-    can't kill the pool."""
+    can't kill the pool. `pin_record` = durable published-CID record for the local-daemon path (#138):
+    appended on every publish, consulted by the pin-ls-ground-truth prune, survives restarts."""
     name = f"neurahash-ckpt-r{round_no}"
     jwt = _pinata_jwt()
     use_pinata = prefer == "pinata" or (prefer == "auto" and jwt)
@@ -655,14 +769,18 @@ def publish_checkpoint(ckpt_path, round_no, tracker_path, *, prefer="auto", pin_
         cid = pin_file_to_pinata(ckpt_path, jwt=jwt, name=name)
         try:
             prune_pinata(keep=pin_keep, jwt=jwt)
-        except Exception:                                      # noqa: BLE001 — pruning is best-effort
-            pass
+        except Exception as e:                                 # noqa: BLE001 — must not block publish, but LOUD (#138)
+            print(f"[ipfs_checkpoint] Pinata pin prune FAILED (pins will accumulate): "
+                  f"{type(e).__name__}: {e}", flush=True)
     else:
-        cid = publish(ckpt_path, ipfs_bin=ipfs_bin)
+        cid = publish(ckpt_path, ipfs_bin=ipfs_bin, record_path=pin_record)
         try:                                                   # keep the local repo lean, same as Pinata prune
-            prune_local_pins(keep=pin_keep, ipfs_bin=ipfs_bin)
-        except Exception:                                      # noqa: BLE001 — pruning is best-effort
-            pass
+            if prune_local_pins(keep=pin_keep, ipfs_bin=ipfs_bin, record_path=pin_record):
+                # kubo never GCs on its own — reclaim the just-unpinned blocks (bounded, logged, no raise)
+                ipfs_repo_gc(ipfs_bin=ipfs_bin)
+        except Exception as e:                                 # noqa: BLE001 — must not block publish, but LOUD (#138)
+            print(f"[ipfs_checkpoint] pin prune FAILED (repo will grow until this is fixed): "
+                  f"{type(e).__name__}: {e}", flush=True)
     # OFF-MACHINE DURABILITY BACKSTOP: keep a copy of the checkpoint off this machine so a remote fetch /
     # a coordinator resume still succeeds when the home node is offline. Best-effort — a backstop hiccup
     # must never block the round loop (the caller also swallows; this is defence-in-depth). OFF unless
@@ -681,8 +799,9 @@ def publish_checkpoint(ckpt_path, round_no, tracker_path, *, prefer="auto", pin_
         try:
             pin_cid_to_service(cid, name=name)
             prune_service(keep=pin_keep, name_prefix="neurahash-ckpt")
-        except Exception:                                      # noqa: BLE001 — the backstop is best-effort
-            pass
+        except Exception as e:                                 # noqa: BLE001 — the backstop is best-effort, but LOUD (#138)
+            print(f"[ipfs_checkpoint] pin-service backstop pin/prune FAILED: "
+                  f"{type(e).__name__}: {e}", flush=True)
     write_tracker(tracker_path, round_no, cid, peers=peers, extra=extra)
     return cid
 

@@ -28,7 +28,7 @@ import torch
 
 from neurahash.base_checkpoint import load_checkpoint, save_checkpoint, checkpoint_path
 from neurahash_torch.shard_verify import trunk_keys
-from neurahash_torch.corpus_torch import build_data, get_batch, resolve_corpus_mode
+from neurahash_torch.corpus_torch import build_data, get_batch, resolve_corpus_mode, corpus_sha
 
 # reuse the shipped IPFS helpers (fetch by CID, publish, tracker) without importing sharded_pool_node
 _IC_SPEC = importlib.util.spec_from_file_location(
@@ -131,6 +131,15 @@ def train_contribution(ckpt_path, out_path, *, steps=200, lr=3e-4, batch=32, dev
     _mem_probe("after load_checkpoint (global_trunk dropped)")
     block = int(arch0.get("block_size", 128))
     corpus_mode = resolve_corpus_mode()
+    # (corpus-declaration gate) DECLARE the corpus this contribution is trained under so the coordinator can
+    # reject a delta trained on a DIFFERENT corpus BEFORE merging/rewarding it (defense-in-depth over the
+    # noisy held-out eval). corpus_sha(corpus_mode) matches the coordinator's own corpus_sha() when the two
+    # boxes read the same corpus_data/*.txt under the same mode. Best-effort: on any failure the record
+    # simply omits the field (back-compat), so an honest contributor is never blocked by a sha-compute hiccup.
+    try:
+        corpus_declared_sha = corpus_sha(corpus_mode)
+    except Exception:                                        # noqa: BLE001 — declaration is additive/best-effort
+        corpus_declared_sha = None
     # `seed` (CLI --seed, default 0): threaded into build_data so a non-default seed also diversifies
     # the toy-corpus text (build_data's seed only matters for that fallback branch -- build_qwen_bpe_data
     # / build_real_data / build_grounding_data ignore it). Default 0 reproduces the prior hardcoded
@@ -240,16 +249,22 @@ def train_contribution(ckpt_path, out_path, *, steps=200, lr=3e-4, batch=32, dev
         if compress_on:
             from neurahash import delta_codec
             topk = float(os.environ.get("NEURAHASH_DELTA_TOPK", "") or delta_codec.DEFAULT_TOPK)
+            # NEURAHASH_DELTA_QBITS (env): 8 (default) = int8 value grid, byte-identical to before; 4 opts
+            # into the int4 value grid (~halves the value bytes over a residential uplink). Parsed as int at
+            # startup like NEURAHASH_DELTA_TOPK -> a malformed value raises here; a numeric-but-unsupported
+            # value (e.g. 2) raises inside delta_codec (<4-bit is known-broken).
+            qbits = int(os.environ.get("NEURAHASH_DELTA_QBITS", "") or 8)
             compressed_delta_path = out_path + ".delta.q8k.bin"
             compressed_delta_bytes = delta_codec.save_compressed_delta(
-                compressed_delta_path, delta_dict, topk)
+                compressed_delta_path, delta_dict, topk, bits=qbits)
     else:
         delta_path = None
     return {"round": rnd, "steps": steps, "train_loss": last,
             "val_before": val_before, "val_after": val_after,
             "improved": val_after < val_before, "delta_path": delta_path,
             "compressed_delta_path": compressed_delta_path,
-            "compressed_delta_bytes": compressed_delta_bytes}
+            "compressed_delta_bytes": compressed_delta_bytes,
+            "corpus_sha": corpus_declared_sha}
 
 
 def _miner_account():
@@ -281,10 +296,16 @@ def _miner_account():
 
 
 def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_after=None,
-                  registry_url=None, registry_token=None):
+                  registry_url=None, registry_token=None, corpus_sha=None, steps=None):
     """Pin the trunk-delta .npz to IPFS/Pinata and REGISTER a tiny record under the stable content-store
     name 'contrib-<contributor>' so the coordinator's merge poller finds it. Returns the delta CID.
-    `registry_url`/`registry_token` default to NEURAHASH_DILOCO_MERGE_URL / NEURAHASH_CONTENT_TOKEN."""
+    `registry_url`/`registry_token` default to NEURAHASH_DILOCO_MERGE_URL / NEURAHASH_CONTENT_TOKEN.
+    `corpus_sha` (additive, optional): the content-address of the corpus this delta was trained on. When
+    given it is recorded so the coordinator can reject a mismatched-corpus delta before merging/rewarding it;
+    when None the record OMITS the field, byte-identical to before. `steps` (additive, optional): the number
+    of local inner steps that produced this delta -- ADVISORY TELEMETRY ONLY. The coordinator NEVER reads it
+    for merge weighting (merge weights come from the coordinator's OWN verified held-out gain, never a miner
+    self-report -- this is an adversarial fleet). None -> the record OMITS the field, byte-identical."""
     import json as _json
     import urllib.request as _url
     cid = ic.publish(delta_path) if not ic._pinata_jwt() else ic.pin_file_to_pinata(
@@ -295,6 +316,17 @@ def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_a
         base_round_i = int(base_round)
         rec = {"contributor": contributor, "delta_cid": cid, "base_round": base_round_i,
                "val_before": val_before, "val_after": val_after}
+        # (corpus-declaration gate) ADDITIVE, UNSIGNED field: declare the corpus this delta was trained on so
+        # the coordinator can drop a mismatched-corpus contribution before it merges/pays. Deliberately NOT
+        # in contrib_canonical_message (would invalidate every existing signature); the coordinator's gate is
+        # defense-in-depth over the held-out eval, not a trust root. None -> omit the key (back-compat).
+        if corpus_sha is not None:
+            rec["corpus_sha"] = str(corpus_sha)
+        # (telemetry) ADDITIVE, UNSIGNED advisory field. Same optional-field pattern as corpus_sha:
+        # deliberately NOT part of contrib_canonical_message. PURE telemetry -- the coordinator derives
+        # merge weights from its own verified held-out gain, never from this value.
+        if steps is not None:
+            rec["steps"] = int(steps)
         # GAP1 (docs/GO_PUBLIC_DESIGN.md): when a wallet key is configured, SIGN the record so the
         # coordinator can VERIFY who produced this delta (and, in GAP2, pay that verified address). The
         # canonical bytes are built by the ONE shared builder poll_contrib_records also uses, so signer
@@ -390,7 +422,7 @@ def merge_delta(base_ckpt, delta_source, out_path, *, outer=OUTER, device="cpu",
     delta_path = delta_source
     if not os.path.exists(delta_source):
         dest = os.path.join(os.path.dirname(os.path.abspath(out_path)) or ".", "fetched_delta.q8k.bin")
-        gw = ic.fetch(delta_source, dest, verify_cid=False)
+        gw = ic.fetch(delta_source, dest, verify_cid=True)   # trust the CID: reject substituted delta bytes
         print(f"[diloco] fetched compressed delta {delta_source[:16]}... via {gw}")
         delta_path = dest
 
@@ -418,7 +450,7 @@ def _resolve_ckpt(arg, work_dir, device):
     else:
         cid = arg                                                  # treat as a bare CID
     dest = os.path.join(work_dir, "fetched_ckpt.pt")
-    gw = ic.fetch(cid, dest, verify_cid=False)
+    gw = ic.fetch(cid, dest, verify_cid=True)   # trust the CID: reject a substituted checkpoint body
     print(f"[diloco] fetched checkpoint {cid[:16]}... via {gw}")
     return dest
 
@@ -477,7 +509,8 @@ def main():
                       if (a.publish_compressed_delta and r.get("compressed_delta_path"))
                       else r["delta_path"])
             cid = publish_delta(to_pub, a.name, r["round"],
-                                val_before=r["val_before"], val_after=r["val_after"])
+                                val_before=r["val_before"], val_after=r["val_after"],
+                                corpus_sha=r.get("corpus_sha"), steps=r.get("steps"))
             print(f"[diloco] published + registered trunk delta CID: {cid} (slot contrib-{a.name})")
     elif a.cmd == "merge-delta":
         v = merge_delta(a.base, a.delta, a.out, outer=a.outer, device=a.device)

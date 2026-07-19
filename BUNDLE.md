@@ -21,7 +21,7 @@ nobody can edit it. Integrity is verified by the **consumer** against a hash, so
 |---|---|
 | **IPFS** | by CID — the decentralized backbone (grows as miners self-pin) |
 | **VPS content-store** | `http://47.84.93.96:8710/o/<sha256>` |
-| **HuggingFace** | `https://huggingface.co/datasets/whitegreenstudios888/neurahash-miner/resolve/main/bundle_<sha256>.zip` |
+| **HuggingFace** | `https://huggingface.co/datasets/whitegreenstudios888/neurahash-data/resolve/main/bundle_<sha256>.zip` |
 
 Removing any one seed only reduces availability, never correctness. HuggingFace / the VPS are convenience
 seeds, **not** the decentralization — that comes from content-addressing + the signed (eventually
@@ -57,6 +57,6 @@ If you already trust the pointer's source, `resolve_bundle` alone gives you hash
 ## The current public bundle
 
 The clean public miner bundle is mirrored on HuggingFace at
-[`whitegreenstudios888/neurahash-miner`](https://huggingface.co/datasets/whitegreenstudios888/neurahash-miner):
+[`whitegreenstudios888/neurahash-data`](https://huggingface.co/datasets/whitegreenstudios888/neurahash-data):
 `bundle_70837a999eec951c1b6442003c573fde84edbf56c274f3641c5f1d5d55922b54.zip` — a content-addressed mirror
 of this repo. It is a drop-in seed; the same bytes are fetchable by hash from any seed above.

@@ -69,6 +69,24 @@ MAX_MSG_BYTES = int(os.environ.get("NEURAHASH_MAX_MSG_MB", "512")) * 1024 * 1024
 # Every timeout is env-tunable. WORKER-side sends are intentionally left unbounded (a worker that stalls
 # its own send only hurts itself, and it drives no shared loop).
 SEND_TIMEOUT = float(os.environ.get("NEURAHASH_SEND_TIMEOUT", "60.0"))          # per coordinator->worker send
+
+# ----------------------------- progress-based chunked send (P2, default-OFF) -----------------------------
+# SECONDARY RESILIENCE (fleet-stability doc §5(a)): SEND_TIMEOUT above is a TOTAL wall-clock deadline
+# (sendall's timeout has been total since py3.5). An HONEST slow-but-DRAINING link (a 25 Mbps Colab relay =
+# the 0x3070 straggler) that is still making progress on a big int8 trunk+expert payload gets killed at the
+# total deadline EXACTLY like a dead zombie — the measured `drop 0x3070: task send failed (TimeoutError)`.
+# When NEURAHASH_SEND_PROGRESS_TIMEOUT > 0, send_msg_bounded switches to a loop over ~1 MiB memoryview
+# slices and bounds the send by PER-SLICE PROGRESS instead of total time: a slice is aborted only if it
+# makes ZERO bytes of progress within the window, so a moving link is never killed while a genuinely stalled
+# one still dies within one window (the #92 anti-zombie property is preserved). NEURAHASH_SEND_MAX_S is a
+# generous overall ceiling so even a progressing send cannot run unbounded. DEFAULT 0 = OFF = today's exact
+# single-`sendall`-under-total-deadline path, byte-for-byte. Framing (8-byte length prefix + body) is
+# UNCHANGED, so the receiver (`_recv_exact`, cumulative-deadline exact reads) is completely unaffected —
+# RECEIVER-INVISIBLE.
+SEND_PROGRESS_TIMEOUT = float(os.environ.get("NEURAHASH_SEND_PROGRESS_TIMEOUT", "0"))  # 0 = OFF (single sendall)
+SEND_MAX_S = float(os.environ.get("NEURAHASH_SEND_MAX_S", "600"))                       # overall ceiling when ON
+SEND_SLICE_BYTES = 1024 * 1024                                                          # ~1 MiB per progress slice
+
 TLS_ACCEPT_TIMEOUT = float(os.environ.get("NEURAHASH_TLS_ACCEPT_TIMEOUT", "8.0"))  # server-side TLS handshake
 # Whole-admission wall-clock budget per joiner (hello + auth + payload). Bounds `poll_new_workers` even
 # against a peer that drains SLOWLY (not fully stalled) — such a peer can't hold the round thread past
@@ -84,19 +102,60 @@ def send_msg(sock, obj, key=None):
     sock.sendall(struct.pack("!Q", len(data)) + data)
 
 
+def _send_all_progress(sock, buf, progress_timeout, max_s):
+    """(P2 §5(a)) Send the whole framed buffer `buf` (an 8-byte length prefix + body, already built by
+    the caller — framing is UNCHANGED) over ~1 MiB `memoryview` slices, bounding by PER-SLICE PROGRESS
+    rather than a total wall-clock deadline. For each slice, one `send()` is attempted under a socket
+    timeout of `progress_timeout`; if it returns 0 bytes or times out (zero progress within the window)
+    the send is aborted with socket.timeout — the #92 anti-zombie kill, unchanged. As long as ANY bytes
+    move the timer is effectively reset (the next slice/send gets a fresh window), so an honest slow-but-
+    draining link is never killed for being slow. `max_s` is a generous overall ceiling (raises
+    socket.timeout when exceeded) so even a progressing send cannot run unbounded. Caller sets/restores
+    the socket's timeout around this (send_msg_bounded), same contract as the single-sendall path."""
+    mv = memoryview(buf)
+    total = len(mv)
+    sent = 0
+    sock.settimeout(progress_timeout)
+    overall_deadline = time.time() + max_s
+    while sent < total:
+        if time.time() >= overall_deadline:
+            raise socket.timeout(f"send exceeded NEURAHASH_SEND_MAX_S ({max_s}s) at {sent}/{total} bytes")
+        end = min(sent + SEND_SLICE_BYTES, total)
+        # sock.send() writes SOME of the slice (kernel send-buffer worth) and returns the count; a stalled
+        # peer whose window is full blocks until `progress_timeout` then raises socket.timeout (an OSError
+        # subclass) — the genuinely-dead-pipe kill. A returned 0 is the same signal (no progress).
+        n = sock.send(mv[sent:end])
+        if n == 0:
+            raise socket.timeout("send made zero progress")
+        sent += n
+
+
 def send_msg_bounded(sock, obj, key=None, timeout=None):
     """Coordinator-side send with a WALL-CLOCK timeout so a peer that stops draining its socket cannot
     park the single-threaded round loop inside `send` forever (#92). Sets the socket's send timeout,
     sends, and RESTORES the socket's prior timeout (admission + the selector recv path both rely on the
     timeout state they set themselves, so we must not leak ours). Raises socket.timeout when the send
     can't complete within `timeout` (default NEURAHASH_SEND_TIMEOUT); callers drop the connection on
-    socket.timeout/OSError exactly like the existing dead-peer path — the worker simply reconnects."""
+    socket.timeout/OSError exactly like the existing dead-peer path — the worker simply reconnects.
+
+    (P2 §5(a)) When NEURAHASH_SEND_PROGRESS_TIMEOUT > 0 the bound becomes PER-SLICE PROGRESS instead of
+    the total `timeout`: a big honest slow-drain payload is bounded by whether each ~1 MiB slice keeps
+    moving, not by a total deadline that would kill a still-draining 25 Mbps relay. DEFAULT 0 = OFF =
+    the EXACT single-`sendall`-under-total-`timeout` path below, byte-for-byte. Framing is unchanged
+    either way, so the receiver is unaffected."""
     if timeout is None:
         timeout = SEND_TIMEOUT
     prev = sock.gettimeout()
-    sock.settimeout(timeout)
     try:
-        send_msg(sock, obj, key=key)
+        if SEND_PROGRESS_TIMEOUT > 0:
+            # PROGRESS-BOUNDED path: same frame bytes, sent in slices, bounded per-slice.
+            data = safe_codec.encode_msg(obj, key=key)
+            _send_all_progress(sock, struct.pack("!Q", len(data)) + data,
+                               progress_timeout=SEND_PROGRESS_TIMEOUT, max_s=SEND_MAX_S)
+        else:
+            # OFF: today's exact single sendall under a total wall-clock deadline.
+            sock.settimeout(timeout)
+            send_msg(sock, obj, key=key)
     finally:
         try:
             sock.settimeout(prev)
@@ -261,7 +320,7 @@ class TCPCoordinator:
             return None
 
     def _admit(self, conn, model=None, hello_timeout=10, hello_payload=None, hello_payload_fn=None,
-               auth_fn=None):
+               auth_fn=None, pushing=None):
         """Handshake one freshly-accepted connection: read its hello, optionally prove its identity
         (`auth_fn`), register it, and send the post-hello payload (the numpy model by default; an
         arbitrary `hello_payload`; or, for per-worker assignment like sharded expert hosting,
@@ -325,10 +384,17 @@ class TCPCoordinator:
             old = self.conns.pop(addr, None)
             self.worker_meta.pop(addr, None)
             if old is not None and old is not conn:
-                try:
-                    old.close()
-                except OSError:
+                if pushing and addr in pushing:
+                    # (ASYNC RE-PARTITION) `old` is owned by an off-round-loop trunk+experts push daemon; a
+                    # close here would race that daemon's in-flight send on the same socket (undefined
+                    # concurrent close). Leave it — the coordinator's push reaper closes `old` once the daemon
+                    # has exited, and it will NOT close this fresh conn (it checks socket identity).
                     pass
+                else:
+                    try:
+                        old.close()
+                    except OSError:
+                        pass
             print(f"[net] admission: {addr} reconnected (auth ok) -> replaced stale conn", flush=True)
         join_index = len(self.conns)                       # 0-based order this worker joined
         self.conns[addr] = conn
@@ -366,13 +432,16 @@ class TCPCoordinator:
         return addr
 
     def poll_new_workers(self, model=None, budget=0.05, hello_timeout=10, hello_payload=None,
-                         hello_payload_fn=None, auth_fn=None):
+                         hello_payload_fn=None, auth_fn=None, pushing=None):
         """Non-blocking dynamic join: admit any workers that are *currently* waiting to
         connect (up to `budget` seconds of accepting), then return. Call it at the top of
         every round so new miners (a 2nd Colab, the 5090/4060 later) join live without a
         restart. `hello_payload_fn(addr, join_index)` enables per-worker assignment (sharding);
-        `auth_fn(addr, conn)` enables a per-node-signed admission handshake (#44). Returns the
-        list of newly-admitted addresses."""
+        `auth_fn(addr, conn)` enables a per-node-signed admission handshake (#44). `pushing` is an
+        optional set/dict of addresses whose OLD socket is currently owned by an off-round-loop push
+        thread — on a reconnect for such an address `_admit` leaves the stale socket for the push
+        reaper to close instead of closing it under the daemon. Returns the list of newly-admitted
+        addresses."""
         new = []
         deadline = time.time() + budget
         while True:
@@ -385,7 +454,7 @@ class TCPCoordinator:
             if conn is None:                          # handshake failed -> drop, keep accepting
                 continue
             addr = self._admit(conn, model, hello_timeout, hello_payload, hello_payload_fn,
-                               auth_fn=auth_fn)
+                               auth_fn=auth_fn, pushing=pushing)
             if addr is not None:
                 new.append(addr)
             if time.time() >= deadline:
@@ -402,14 +471,21 @@ class TCPCoordinator:
         except (TypeError, ValueError):
             return 0.0
 
-    def heartbeat(self):
+    def heartbeat(self, skip=None):
         """Send a no-op ping to every connection to keep it warm while no task is in flight.
         Workers ignore unknown message types, so this is safe with existing worker clients.
         Drops (and removes) any connection that errors on send. (#92) Each ping is send-bounded
         (NEURAHASH_SEND_TIMEOUT) so a peer that stopped draining its socket can't park the heartbeat
         loop — a heartbeat runs on the round thread too (e.g. while waiting for the first miner / during
-        a guardian halt), so an unbounded ping to a stalled zombie would wedge the pool just like a task."""
+        a guardian halt), so an unbounded ping to a stalled zombie would wedge the pool just like a task.
+
+        (ASYNC RE-PARTITION) `skip` is an optional set/dict of addresses whose socket is currently owned by
+        an OFF-round-loop push thread; pinging one here would be a SECOND writer racing that thread on one
+        socket. Any addr in `skip` is left untouched. `skip=None`/empty (the default, and the only state
+        when the async-repush lane is off) pings every conn exactly as before (byte-identical)."""
         for addr, sock in list(self.conns.items()):
+            if skip and addr in skip:                      # socket owned by an off-loop push thread -> don't race it
+                continue
             try:
                 send_msg_bounded(sock, {"type": "ping"}, key=self.psk)
             except OSError as _he:                         # includes socket.timeout (stalled drain)

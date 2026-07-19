@@ -486,6 +486,12 @@ def build_parser():
     ap.add_argument("--doctor", action="store_true",
                     help="run a preflight checklist (torch/CUDA, coordinator reachability, TLS pin, "
                          "local corpus hash) and exit; nonzero exit on any failure")
+    ap.add_argument("--no-auto-update", action="store_true",
+                    help="disable the SIGNED, fail-closed auto-updater (default: ON; same as "
+                         "NEURAHASH_AUTOUPDATE=0). The updater only ever checks out code cryptographically "
+                         "SIGNED by the project release key, never downgrades, and on ANY failure stays on "
+                         "the current version -- it never runs unsigned code. See tools/self_update.py + "
+                         "SIGNING.md.")
     return ap
 
 
@@ -637,6 +643,21 @@ def run_solo_coordinator(port, device, experts, state_dir, block_time=12.0):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # SIGNED, FAIL-CLOSED AUTO-UPDATE (default ON). Before doing any work, check for a release
+    # manifest SIGNED by the project's pinned release key; if a verified, forward (never downgrade)
+    # release exists it is checked out and the miner re-execs onto it. On ANY failure (bad signature,
+    # unreachable/tampered manifest, commit mismatch, downgrade) it logs a warning and continues on
+    # the CURRENT already-verified code -- it never runs unsigned code and never crashes the miner.
+    # Opt out with --no-auto-update or NEURAHASH_AUTOUPDATE=0. Skipped for the one-shot --doctor
+    # preflight so a diagnostic never silently re-execs into a new version. Rate-limited (once/6h).
+    if not args.no_auto_update and not args.doctor:
+        try:
+            from tools.self_update import maybe_auto_update
+            maybe_auto_update(argv=sys.argv)                # returns unless it re-execs onto new code
+        except Exception as _e:                             # a launcher must never crash on the updater
+            print(f"[self_update] WARN: auto-update skipped ({_e}); continuing on current version",
+                  flush=True)
 
     if args.connect:                                        # auto-discover the live coordinator
         args.host, args.port = resolve_connect(args.connect, args.host, args.port)

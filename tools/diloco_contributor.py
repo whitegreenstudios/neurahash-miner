@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import torch
 
-from neurahash.base_checkpoint import load_checkpoint, save_checkpoint, checkpoint_path
+from neurahash.coord_checkpoint import load_checkpoint, save_checkpoint, checkpoint_path
 from neurahash_torch.shard_verify import trunk_keys
 from neurahash_torch.corpus_torch import build_data, get_batch, resolve_corpus_mode, corpus_sha
 
@@ -133,9 +133,10 @@ def train_contribution(ckpt_path, out_path, *, steps=200, lr=3e-4, batch=32, dev
     corpus_mode = resolve_corpus_mode()
     # (corpus-declaration gate) DECLARE the corpus this contribution is trained under so the coordinator can
     # reject a delta trained on a DIFFERENT corpus BEFORE merging/rewarding it (defense-in-depth over the
-    # noisy held-out eval). corpus_sha(corpus_mode) matches the coordinator's own corpus_sha() when the two
-    # boxes read the same corpus_data/*.txt under the same mode. Best-effort: on any failure the record
-    # simply omits the field (back-compat), so an honest contributor is never blocked by a sha-compute hiccup.
+    # noisy held-out eval; neurahash/diloco_merge.corpus_sha_ok). corpus_sha(corpus_mode) matches the
+    # coordinator's own corpus_sha() when the two boxes read the same corpus_data/*.txt under the same mode.
+    # Best-effort: on any failure the record simply omits the field (back-compat), so an honest contributor
+    # is never blocked by a sha-compute hiccup -- the coordinator's default posture does not require it.
     try:
         corpus_declared_sha = corpus_sha(corpus_mode)
     except Exception:                                        # noqa: BLE001 — declaration is additive/best-effort
@@ -250,9 +251,9 @@ def train_contribution(ckpt_path, out_path, *, steps=200, lr=3e-4, batch=32, dev
             from neurahash import delta_codec
             topk = float(os.environ.get("NEURAHASH_DELTA_TOPK", "") or delta_codec.DEFAULT_TOPK)
             # NEURAHASH_DELTA_QBITS (env): 8 (default) = int8 value grid, byte-identical to before; 4 opts
-            # into the int4 value grid (~halves the value bytes over a residential uplink). Parsed as int at
-            # startup like NEURAHASH_DELTA_TOPK -> a malformed value raises here; a numeric-but-unsupported
-            # value (e.g. 2) raises inside delta_codec (<4-bit is known-broken).
+            # into the int4 value grid (~halves the value bytes over a residential uplink, arxiv 2604.21428
+            # Table 10). Parsed as int at startup like NEURAHASH_DELTA_TOPK -> a malformed value raises here;
+            # a numeric-but-unsupported value (e.g. 2) raises inside delta_codec (<4-bit is known-broken).
             qbits = int(os.environ.get("NEURAHASH_DELTA_QBITS", "") or 8)
             compressed_delta_path = out_path + ".delta.q8k.bin"
             compressed_delta_bytes = delta_codec.save_compressed_delta(
@@ -301,18 +302,28 @@ def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_a
     name 'contrib-<contributor>' so the coordinator's merge poller finds it. Returns the delta CID.
     `registry_url`/`registry_token` default to NEURAHASH_DILOCO_MERGE_URL / NEURAHASH_CONTENT_TOKEN.
     `corpus_sha` (additive, optional): the content-address of the corpus this delta was trained on. When
-    given it is recorded so the coordinator can reject a mismatched-corpus delta before merging/rewarding it;
-    when None the record OMITS the field, byte-identical to before. `steps` (additive, optional): the number
-    of local inner steps that produced this delta -- ADVISORY TELEMETRY ONLY. The coordinator NEVER reads it
-    for merge weighting (merge weights come from the coordinator's OWN verified held-out gain, never a miner
-    self-report -- this is an adversarial fleet). None -> the record OMITS the field, byte-identical."""
+    given it is recorded so the coordinator can reject a mismatched-corpus delta before merging/rewarding it
+    (neurahash/diloco_merge.corpus_sha_ok); when None the record OMITS the field, byte-identical to before.
+    `steps` (additive, optional): the number of local inner steps that produced this delta -- ADVISORY
+    TELEMETRY ONLY. The coordinator NEVER reads it for merge weighting (batch-merge weights come from the
+    coordinator's OWN verified held-out gain, never a miner self-report — this is an adversarial fleet).
+    None -> the record OMITS the field, byte-identical to before."""
     import json as _json
     import urllib.request as _url
     cid = ic.publish(delta_path) if not ic._pinata_jwt() else ic.pin_file_to_pinata(
         delta_path, name=f"neurahash-contrib-{contributor}")
     registry_url = (registry_url or os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "")).rstrip("/")
     registry_token = registry_token or os.environ.get("NEURAHASH_CONTENT_TOKEN", "")
-    if registry_url:
+    # D2 registry replication (docs/DECENTRALIZE_D_SERIES.md D2): the SAME signed record is PUT to EVERY
+    # store in the replicated registry -- the primary (registry_url) PLUS the NEURAHASH_DILOCO_MERGE_URLS
+    # replica stores when the D2 gate NEURAHASH_DILOCO_REGISTRY is on. registry_store_urls (neurahash.
+    # diloco_merge) is the ONE place that flag is parsed; with the gate off it returns [registry_url] alone
+    # so the single-store PUT below is byte-identical to before (same URL, body, headers, retry). Identical
+    # body -> identical sha256 -> identical /o/<h> key on every store, so the coordinator's
+    # dedup-by-delta_cid keeps exactly one copy and the signed record still wins across stores.
+    from neurahash.diloco_merge import registry_store_urls
+    store_urls = registry_store_urls(registry_url)
+    if store_urls:
         base_round_i = int(base_round)
         rec = {"contributor": contributor, "delta_cid": cid, "base_round": base_round_i,
                "val_before": val_before, "val_after": val_after}
@@ -322,32 +333,56 @@ def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_a
         # defense-in-depth over the held-out eval, not a trust root. None -> omit the key (back-compat).
         if corpus_sha is not None:
             rec["corpus_sha"] = str(corpus_sha)
-        # (telemetry) ADDITIVE, UNSIGNED advisory field. Same optional-field pattern as corpus_sha:
-        # deliberately NOT part of contrib_canonical_message. PURE telemetry -- the coordinator derives
-        # merge weights from its own verified held-out gain, never from this value.
+        # (BATCH-MERGE telemetry) ADDITIVE, UNSIGNED advisory field. Same optional-field pattern as
+        # corpus_sha: deliberately NOT part of contrib_canonical_message (adding it would force a
+        # CONTRIB_SIG_VERSION bump that invalidates every deployed miner's signature). PURE telemetry -- the
+        # coordinator derives batch-merge weights from its own verified held-out gain, never from this value.
         if steps is not None:
             rec["steps"] = int(steps)
         # GAP1 (docs/GO_PUBLIC_DESIGN.md): when a wallet key is configured, SIGN the record so the
         # coordinator can VERIFY who produced this delta (and, in GAP2, pay that verified address). The
         # canonical bytes are built by the ONE shared builder poll_contrib_records also uses, so signer
-        # and verifier can never drift. No key -> the record stays unsigned (pre-GAP1, back-compat).
+        # and verifier can never drift. No key -> the record stays unsigned (pre-GAP1, back-compat). The
+        # record is signed ONCE here; the identical signed bytes are replicated to every store below.
         _acct = _miner_account()
         if _acct is not None:
             from neura_l1.signing import sign_bytes
-            from neurahash.contrib_message import contrib_canonical_message
+            from neurahash.diloco_merge import contrib_canonical_message
             _msg = contrib_canonical_message(cid, base_round_i, contributor, val_before, val_after)
             rec["address"] = _acct.address
             rec["sig"] = sign_bytes(_acct, _msg)
         body = _json.dumps(rec).encode()
         import hashlib as _hl
         h = _hl.sha256(body).hexdigest()
-        req = _url.Request(f"{registry_url}/o/{h}", data=body, method="PUT",
-                           headers={"X-Auth": registry_token, "X-Name": f"contrib-{contributor}"})
         # WAN-robust PUT: explicit timeout + bounded retries w/ backoff (was a bare urlopen(timeout=30),
         # zero retries -- see ic._put_retry's docstring for the 2026-07-10 incident this closes: a
         # contributor's ~38 MB delta publish died on one silent timeout and stayed stuck for 19+ hours).
-        ic._put_retry(lambda: _url.urlopen(req, timeout=ic.PUT_TIMEOUT).read(),
-                      label=f"{registry_url}/o/{h} (contrib-{contributor})")
+        multi = len(store_urls) > 1
+        n_ok = 0
+        for _store in store_urls:
+            _req = _url.Request(f"{_store}/o/{h}", data=body, method="PUT",
+                                headers={"X-Auth": registry_token, "X-Name": f"contrib-{contributor}"})
+            _label = f"{_store}/o/{h} (contrib-{contributor})"
+
+            def _put_once(req=_req):
+                return _url.urlopen(req, timeout=ic.PUT_TIMEOUT).read()
+
+            if not multi:
+                # single store (D2 gate off): propagate a PUT failure EXACTLY as before (retry-then-raise).
+                ic._put_retry(_put_once, label=_label)
+                n_ok = 1
+            else:
+                # replicated: best-effort per store so one down replica cannot block the others; the
+                # coordinator merges whatever stores DID accept the record (partial replication is fine).
+                try:
+                    ic._put_retry(_put_once, label=_label)
+                    n_ok += 1
+                except Exception as _e:                      # noqa: BLE001 -- replica down; keep replicating
+                    print(f"[diloco_contributor] registry replica PUT failed ({_store}): {_e!r}",
+                          file=sys.stderr)
+        if multi:
+            print(f"[diloco_contributor] registry PUT: {n_ok}/{len(store_urls)} stores OK for cid {cid}",
+                  file=sys.stderr)
     return cid
 
 
@@ -522,6 +557,180 @@ def main():
         print(f"[diloco] merge held-out {v['val_base']:.4f} -> {v['val_merged']:.4f} "
               f"(delta_norm {v['delta_norm']:.3f}, outer {v['outer']}): "
               f"{'ACCEPTED -> ' + v['out'] if v['accepted'] else 'REJECTED (base stands)'}")
+
+
+# ============================================================ shardDiLoCo Phase-2 (per-expert DiLoCo)
+# CONTRIBUTOR side of shardDiLoCo (docs/research/SHARDDILOCO_DESIGN.md sec 12). The #133 contributor
+# above trains the WHOLE-MODEL trunk with experts FROZEN (see the module docstring, "experts FROZEN").
+# shardDiLoCo instead has a contributor OWN one expert and train {trunk + that expert} for H DiLoCo inner
+# steps on its OWN domain shard (D4 offline routing -- a domain/cluster pre-shard, NO learned global
+# router), then publish a PER-EXPERT pseudo-gradient (+ a trunk pseudo-grad) over the content-addressed +
+# signed lane (D1). It is numpy-only (the repo's own neurahash.model.MoELM), and fully DEFAULT-OFF:
+# nothing above calls it, shard_diloco_on() gates any future CLI wiring, so the torch #133 path above is
+# byte-identical with the flag unset. The coordinator side (per-expert gate + secret rotated probe + FLOP
+# meter) lives in neurahash/diloco_merge.py (shard_merge_round / SecretRotatedProbe / FlopMeter).
+import hashlib as _hashlib
+import hmac as _hmac
+
+import numpy as np
+
+from neurahash.diloco_merge import (shard_diloco_on, contrib_canonical_message,  # noqa: F401 (re-exported)
+                                    stream_publish_trunk)
+
+# trunk keys TRAINED under offline routing: embedding + output head (the router Wr/br is unused -- the
+# pre-shard, not a learned gate, decides the expert). Matches neurahash.model.forward_offline.
+SHARD_TRUNK_KEYS = ["Emb", "Wo", "bo"]
+
+
+def moelm_sparse_fwd_flops(model):
+    """Forward FLOPs for ONE example on MoELM's sparse (hard, 1-expert) offline path: expert FFN
+    (Din*H + H*Do) + output head (Do*V), x2 for multiply+add. Feeds neurahash.diloco_merge.FlopMeter
+    (D3). Reads only the model's dims so proposer and coordinator meter identically."""
+    from neurahash.model import V
+    return 2.0 * (model.Din * model.H + model.H * model.Do + model.Do * V)
+
+
+class _ShardAdamW:
+    """Minimal AdamW over named numpy params -- the contributor's DiLoCo INNER optimizer. Kept local so
+    the shardDiLoCo inner loop can use the SAME optimizer as the synchronous-MoE baseline, making the
+    decoupled per-expert sync the ONLY variable under test (not the optimizer)."""
+
+    def __init__(self, keys, lr=2e-3, betas=(0.9, 0.999), eps=1e-8, wd=0.0):
+        self.lr, self.b1, self.b2, self.eps, self.wd = lr, betas[0], betas[1], eps, wd
+        self.m = {k: None for k in keys}
+        self.v = {k: None for k in keys}
+        self.t = 0
+
+    def step(self, params, grads):
+        self.t += 1
+        for k, g in grads.items():
+            if self.m[k] is None:
+                self.m[k] = np.zeros_like(g)
+                self.v[k] = np.zeros_like(g)
+            self.m[k] = self.b1 * self.m[k] + (1 - self.b1) * g
+            self.v[k] = self.b2 * self.v[k] + (1 - self.b2) * (g * g)
+            mhat = self.m[k] / (1 - self.b1 ** self.t)
+            vhat = self.v[k] / (1 - self.b2 ** self.t)
+            if self.wd:
+                params[k] -= self.lr * self.wd * params[k]
+            params[k] -= self.lr * mhat / (np.sqrt(vhat) + self.eps)
+
+
+# --- D1 content-addressed + signed lane (in-process; the live lane is IPFS via tools/ipfs_checkpoint.py).
+def _shard_fp16_roundtrip(delta):
+    """BORROW from OpenDiLoCo (review D1): transfer pseudo-gradients as FP16 (lossless enough for DiLoCo).
+    Simulates the wire by casting each array to float16 and back."""
+    return {k: v.astype(np.float16).astype(np.float64) for k, v in delta.items()}
+
+
+def _shard_cid(delta):
+    """sha256 content address over the fp16 WIRE payload (sorted keys) -- the same key tools/content_store
+    distributes by; a tampered payload cannot reproduce it."""
+    h = _hashlib.sha256()
+    for k in sorted(delta.keys()):
+        a = np.ascontiguousarray(delta[k], dtype=np.float16)
+        h.update(k.encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
+
+
+class ShardDeltaLane:
+    """Hand-rolled content-addressed + signed lane (D1) for shardDiLoCo pseudo-gradients, in-process for
+    LOCAL testing (the live lane is IPFS). put() stores the fp16 wire payload keyed by its sha256 CID (no
+    DELETE); get() RE-VERIFIES the CID (a tampered payload raises, like diloco_merge._cid_matches).
+    sign()/verify() are the GAP1 signed-identity stand-in: HMAC-SHA256 over the SAME canonical message the
+    real secp256k1 record signs (diloco_merge.contrib_canonical_message), so the format cannot drift."""
+
+    def __init__(self):
+        self._store = {}
+
+    def put(self, delta):
+        cid = _shard_cid(delta)
+        self._store[cid] = _shard_fp16_roundtrip(delta)
+        return cid
+
+    def get(self, cid):
+        payload = self._store[cid]
+        if not _hmac.compare_digest(_shard_cid(payload), cid):
+            raise ValueError("CID mismatch -- payload tampered")
+        return payload
+
+    @staticmethod
+    def sign(secret_key, cid, base_round, name, val_before=None, val_after=None):
+        msg = contrib_canonical_message(cid, base_round, name, val_before, val_after)
+        return _hmac.new(secret_key, msg, _hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def verify(secret_key, sig, cid, base_round, name, val_before=None, val_after=None):
+        good = ShardDeltaLane.sign(secret_key, cid, base_round, name, val_before, val_after)
+        return _hmac.compare_digest(sig, good)
+
+
+def train_expert_contribution(model, trunk, expert_e, e, domain_train, *, H=25, lr=2e-3, wd=0.0,
+                              batch=64, seed=0, meter=None):
+    """CONTRIBUTOR local step of shardDiLoCo: a miner OWNS expert `e` and trains {trunk replica + expert e}
+    for H local inner steps on its OWN domain-e shard (offline routing -- every local example routes to
+    expert e), with ZERO cross-miner comm during the H steps (the anti-flap core). Reuses the real model's
+    offline path (MoELM.forward_offline / backward_offline). Returns a PER-EXPERT pseudo-gradient (delta vs
+    the synced expert) AND a trunk pseudo-gradient (delta vs the synced trunk), plus the training FLOPs.
+
+      model        : a MoELM -- supplies dims + the FROZEN other experts for a complete param dict (only
+                     expert e is ever activated by offline routing; model.p is NEVER mutated).
+      trunk        : {k in SHARD_TRUNK_KEYS: ndarray}  synced canonical trunk (COPIED, not mutated).
+      expert_e     : {k in expert_keys(e): ndarray}    synced canonical expert e (COPIED, not mutated).
+      domain_train : (X, y) the miner's domain-e training shard. meter: optional FlopMeter (add_train).
+    Returns {trunk_delta, expert_delta, train_flops, n_steps, n_examples}."""
+    from neurahash.model import expert_keys
+    rng = np.random.default_rng(seed)
+    lt = {k: trunk[k].copy() for k in SHARD_TRUNK_KEYS}          # local replicas (miner mutates ONLY these)
+    le = {k: expert_e[k].copy() for k in expert_keys(e)}
+    lp = dict(model.p)                       # frozen other experts + router (unused) => complete param dict
+    lp.update(lt)
+    lp.update(le)
+    train_keys = list(SHARD_TRUNK_KEYS) + expert_keys(e)
+    opt = _ShardAdamW(train_keys, lr=lr, wd=wd)                  # inner AdamW RESET each outer round (DiLoCo)
+    X, y = domain_train
+    fwd = moelm_sparse_fwd_flops(model)
+    n_ex = 0
+    for _ in range(H):
+        if len(X) <= batch:
+            bx, by = X, y
+        else:
+            idx = rng.integers(0, len(X), size=batch)
+            bx, by = X[idx], y[idx]
+        ea = np.full(len(bx), e, dtype=np.int64)
+        loss, cache = model.forward_offline(bx, by, ea, params=lp)
+        grads = model.backward_offline(cache, by, train_keys, params=lp)
+        opt.step(lp, grads)                  # in-place on lp (aliases lt + le); canonical state untouched
+        n_ex += len(bx)
+        if meter is not None:
+            meter.add_train(len(bx))
+    train_flops = 3.0 * fwd * n_ex
+    trunk_delta = {k: lp[k] - trunk[k] for k in SHARD_TRUNK_KEYS}
+    expert_delta = {k: lp[k] - expert_e[k] for k in expert_keys(e)}
+    return dict(trunk_delta=trunk_delta, expert_delta=expert_delta,
+                train_flops=train_flops, n_steps=H, n_examples=n_ex)
+
+
+def publish_expert_contribution(lane, secret_key, contribution, e, base_round, name):
+    """Publish one shardDiLoCo contribution over the content-addressed + signed lane (D1/D2): the EXPERT
+    pseudo-grad goes to `lane` (content-addressed by CID), the TRUNK pseudo-grad rides the same fp16 wire,
+    and the record is HMAC-signed over the canonical GAP1 message. Returns the record the coordinator
+    consumes: {miner, expert, base_round, cid, sig, trunk_delta, train_flops}. The coordinator re-fetches
+    the expert delta by CID (tamper -> raises) and re-verifies `sig` before shard_merge_round touches any
+    weights.
+
+    STREAMING-SUBSET (#126): when NEURAHASH_SHARDDILOCO_STREAM_FRAC is in (0,1) the TRUNK pseudo-grad is
+    reduced to the rolling fragment for outer round `base_round` (stream_publish_trunk) so the wire carries
+    ~ frac * the full trunk delta; the coordinator's shard_merge_round reconstructs it. Flag off -> the
+    full trunk delta rides the wire, byte-identical to before. `base_round` is carried so the coordinator
+    can apply the #126 max-staleness age-out."""
+    cid = lane.put(contribution["expert_delta"])
+    sig = lane.sign(secret_key, cid, base_round, name)
+    trunk_wire = stream_publish_trunk(contribution["trunk_delta"], base_round)
+    return dict(miner=name, expert=int(e), base_round=int(base_round), cid=cid, sig=sig,
+                trunk_delta=_shard_fp16_roundtrip(trunk_wire),
+                train_flops=contribution["train_flops"])
 
 
 if __name__ == "__main__":

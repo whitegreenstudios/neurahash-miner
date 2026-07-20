@@ -225,6 +225,76 @@ class MoELM:
         grads[f"b1_{e}"] = dpre.sum(0)
         return grads
 
+    # ================= offline (D4) hard-routed path: trains the TRUNK too =================
+    # shardDiLoCo (docs/research/SHARDDILOCO_DESIGN.md sec 12) uses OFFLINE routing: each example is
+    # routed to its EXTERNALLY-ASSIGNED expert (a domain/cluster pre-shard, DiPaCo / Branch-Train-MiX),
+    # NOT the learned router. Unlike forward_expert (which FREEZES the shared trunk), this path TRAINS
+    # {Emb, Wo, bo}, so a contributor can locally improve {trunk + its own expert} for H DiLoCo inner
+    # steps. Nothing on the SYNCHRONOUS pool path calls these; they are the per-expert DiLoCo local-
+    # training kernel. Gate weight is hard (=1): o = expert_{e_assign[i]}(x0_i). Gradient-checked
+    # against finite differences in tests/test_sharddiloco_phase2.py.
+    def forward_offline(self, X, y, e_assign, params=None):
+        """OFFLINE-ROUTED forward. e_assign:(n,) the assigned expert index per example. Returns
+        (loss, cache); pass y=None to get (probs, cache) only. Router (Wr, br) is UNUSED here."""
+        p = self.p if params is None else params
+        n = X.shape[0]
+        x0 = p["Emb"][X].reshape(n, self.Din)
+        o = np.zeros((n, self.Do))
+        per_e = {}
+        for e in np.unique(e_assign):
+            e = int(e)
+            m = (e_assign == e)
+            xe = x0[m]
+            pre = xe @ p[f"W1_{e}"] + p[f"b1_{e}"]
+            h = np.maximum(pre, 0.0)
+            o[m] = h @ p[f"W2_{e}"] + p[f"b2_{e}"]
+            per_e[e] = (m, xe, pre, h)
+        logits = o @ p["Wo"] + p["bo"]
+        probs = _softmax(logits, axis=1)
+        cache = dict(X=X, x0=x0, o=o, probs=probs, per_e=per_e)
+        if y is None:
+            return probs, cache
+        loss = float(-np.mean(np.log(probs[np.arange(n), y] + 1e-12)))
+        return loss, cache
+
+    def backward_offline(self, cache, y, train_keys, params=None):
+        """Gradients for the requested train_keys under offline routing: any of the trunk subset
+        {Emb, Wo, bo} and/or expert keys {W1_e,b1_e,W2_e,b2_e}. Pairs with forward_offline. The router
+        (Wr, br) is never touched (unused under offline routing)."""
+        p = self.p if params is None else params
+        X, x0, o, probs, per_e = cache["X"], cache["x0"], cache["o"], cache["probs"], cache["per_e"]
+        n = X.shape[0]
+        tk = set(train_keys)
+        dlogits = probs.copy()
+        dlogits[np.arange(n), y] -= 1.0
+        dlogits /= n
+        grads = {}
+        if "Wo" in tk:
+            grads["Wo"] = o.T @ dlogits
+        if "bo" in tk:
+            grads["bo"] = dlogits.sum(0)
+        do = dlogits @ p["Wo"].T                       # (n, Do)
+        dx0 = np.zeros_like(x0)
+        for e, (m, xe, pre, h) in per_e.items():
+            doe = do[m]                                # (ne, Do)
+            if f"W2_{e}" in tk:
+                grads[f"W2_{e}"] = h.T @ doe
+            if f"b2_{e}" in tk:
+                grads[f"b2_{e}"] = doe.sum(0)
+            dh = doe @ p[f"W2_{e}"].T
+            dpre = dh * (pre > 0)
+            if f"W1_{e}" in tk:
+                grads[f"W1_{e}"] = xe.T @ dpre
+            if f"b1_{e}" in tk:
+                grads[f"b1_{e}"] = dpre.sum(0)
+            dx0[m] = dpre @ p[f"W1_{e}"].T
+        if "Emb" in tk:
+            demb = dx0.reshape(n, self.C, self.Demb)
+            gEmb = np.zeros_like(p["Emb"])
+            np.add.at(gEmb, X, demb)
+            grads["Emb"] = gEmb
+        return grads
+
     # ---------------------------- backward ----------------------------
     def backward(self, cache, y, params=None):
         p = self.p if params is None else params

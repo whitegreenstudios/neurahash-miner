@@ -166,3 +166,29 @@ machines:
 Each node was proven independently reachable and contributing over WAN. **Not yet done:** a single
 aligned gather combining fresh contributions from all 3 at once into one reported held-out number —
 that's next now that the solo soak has freed the 5090.
+
+---
+
+## shardDiLoCo — training a model no single miner holds (proven over real WAN)
+
+**Status (2026-07-20).** shardDiLoCo is the per-expert, async-DiLoCo training mode: each miner trains
+only its own expert-shard, the model is *composed* and never fully resident on any one machine — the
+mechanism behind the north-star goal of a consumer-GPU fleet training a model too big for a single
+card. It completed a **full multi-round run over the real internet**: a coordinator and two per-expert
+contributors, running as independent processes on **separate machines** (an RTX 5090 and an RTX 4060),
+coordinating only over a remote content lane. Result: **both experts credited every round, zero
+stalls, held-out cross-entropy fell 4.54 → 2.94, and the sharded-vs-synchronous compute ratio stayed
+≈ 1.03** (the redundancy tax stays small). *(The coordinator/merge side lives in the full node package,
+not this client repo.)*
+
+## Trustless coordinator — the pool no longer runs on trust
+
+**Status (2026-07-20).** The coordinator used to be a single trusted signer. It isn't any more: an
+independent replayer now accepts a block **only if a genuine M-of-N quorum of staked validators signed
+its exact mint** — a coordinator that tries to inflate, strip, or forge a payout is rejected. And a
+second coordinator can take over on failure via a **signed, majority-agreed view-change**: proven live
+across **three physically separate machines** (a 5090, a 4060, and a cloud datacenter node) — when the
+elected leader was crashed, the two survivors formed a real 2-of-3 quorum and one took over with **no
+chain fork**. This means the operator running the pool cannot silently cheat miners on payouts. Full
+production activation (a real on-chain validator set + an external audit) is still gated on the
+operator; the mechanism is proven and ships **default-off** until then.

@@ -25,10 +25,15 @@ never runs a shell command or a URL taken from the manifest; the only actions ar
 The crypto is the repo's own signing library (`neura_l1.signing`, real secp256k1 via
 `eth-account`) — no hand-rolled cryptography anywhere in the update path.
 
-> **The pinned key shipped in this branch is a TEST key** (address
-> `0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A`, derived from the obviously-fake private key
-> `0x1111…11`). It guards nothing. Before this protects a real fleet you MUST generate a real
-> release keypair and swap the pinned constant (steps below).
+> **The pinned key is REAL and LIVE** (since 2026-07-19, PR #2): `PINNED_RELEASE_PUBKEY =
+> 0x5168F6cc4cc05bfd6d4714906d68e083c02dDC66` in `tools/self_update.py`. The matching private key was
+> generated offline and is held off-machine by the operator. **Sections 1 and 2 below are already done —
+> do NOT regenerate the keypair or re-pin the constant**; doing either would orphan every miner running
+> today. Go straight to section 3 to cut a release. Section 1/2 remain documented only for the initial
+> setup and for a rotation (section 5).
+>
+> The test suite deliberately signs with a separate test key (`functools.partial(..., pubkey=TEST_PUBKEY)`),
+> so the real key stays pinned in the client while the suite stays green.
 
 ---
 

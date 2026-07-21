@@ -12,8 +12,11 @@ NO real network, git, pip, or process replacement -- every side effect is an inj
     (VERSION file) BYTE-UNCHANGED and no checkout attempted;
   * NEURAHASH_AUTOUPDATE=0 (or enabled=False) makes it do nothing (no fetch, no git).
 
-The pinned release key in tools/self_update.py is a TEST key derived from the obviously-fake private
-key 0x1111...11; this suite is the only place that private key is used.
+Most cases here verify against a TEST key derived from the obviously-fake private key 0x1111...11
+(this suite is the only place that private key is used), INDEPENDENT of the real pinned release key.
+The LIVE-MANIFEST section at the bottom is the exception: it uses the REAL pinned key, because its
+job is to prove that the v2 optional fields (`config`, `min_client_version`) did not change the
+canonical bytes of the already-signed v1 manifest.
 """
 import json
 
@@ -298,7 +301,84 @@ def test_rate_limit_skips_second_check(tmp_path):
     check_and_update(repo, argv=["m"], enabled=True, honor_rate_limit=True, rate_limit_s=6 * 3600,
                      state_path=state, now=t0, fetch_fn=_count, git_fn=FakeGit(),
                      pip_fn=FakePip(), reexec_fn=FakeReexec())
+    after_first = calls["n"]
     res = check_and_update(repo, argv=["m"], enabled=True, honor_rate_limit=True, rate_limit_s=6 * 3600,
                            state_path=state, now=t0 + 60, fetch_fn=_count, git_fn=FakeGit(),
                            pip_fn=FakePip(), reexec_fn=FakeReexec())
-    assert calls["n"] == 1 and res.action == "rate-limited"
+    # the first check DID reach the network (once per configured mirror); the second did not fetch
+    # at all. Asserting the DELTA rather than a fixed total keeps this exact even though a check now
+    # queries every mirror (docs/MINER_MANIFEST_DESIGN.md sec.1) instead of a single url.
+    assert after_first == len(su.MIRRORS) >= 1
+    assert calls["n"] == after_first and res.action == "rate-limited"
+
+
+def test_single_manifest_url_still_supported(tmp_path):
+    """The legacy single-url form keeps working: exactly ONE fetch, of exactly that url."""
+    repo = _make_repo(tmp_path, version="0.1.0")
+    seen = []
+
+    def _one(url):
+        seen.append(url)
+        return json.dumps(_sign("0.1.0"))
+
+    res = check_and_update(repo, argv=["m"], enabled=True, honor_rate_limit=False,
+                           state_path=str(tmp_path / "s.json"), manifest_url=su.MANIFEST_URL,
+                           fetch_fn=_one, git_fn=FakeGit(), pip_fn=FakePip(), reexec_fn=FakeReexec())
+    assert seen == [su.MANIFEST_URL] and res.action == "no-op-not-forward"
+
+
+# ============================================================ THE LIVE v1 MANIFEST MUST NOT BREAK
+# This is the manifest published at MANIFEST_URL on 2026-07-19, signed by the REAL pinned release
+# key, with NO `config` and NO `min_client_version`. Adding those optional fields to the schema is
+# only safe if a manifest that LACKS them canonicalises to byte-identical bytes -- otherwise every
+# already-signed manifest in the world stops verifying and the whole fleet is cut off from updates.
+# These tests are the guard on exactly that, and they use the REAL pinned key (not TEST_PUBKEY).
+LIVE_V1_MANIFEST = {
+    "version": "0.1.0",
+    "git_commit": "608b0dd46c55239d24915eaf0f649ca1a004fda9",
+    "published_ts": 1784444362,
+    "signature": ("08b57b4daf0737e924e72c927490e289f50805a0688b828b365ed51261b2d1d1"
+                  "15f8bb51845b16874abf21dc2e811e7a40130e486ae39ba3b84a15621fdf6141" "1c"),
+    "signer": "0x5168F6cc4cc05bfd6d4714906d68e083c02dDC66",
+}
+
+
+def test_live_v1_manifest_canonical_bytes_are_byte_identical():
+    # the pre-v2 algorithm, spelled out literally: the 4 fields, sorted keys, no separators padding.
+    expected = (b'{"git_commit":"608b0dd46c55239d24915eaf0f649ca1a004fda9",'
+                b'"kind":"neurahash-miner-release",'
+                b'"published_ts":1784444362,'
+                b'"version":"0.1.0"}')
+    assert canonical_manifest_bytes(LIVE_V1_MANIFEST) == expected
+
+
+def test_live_v1_manifest_still_verifies_against_the_real_pinned_key():
+    ok, who = su.verify_manifest(LIVE_V1_MANIFEST)          # NOT the test key -- the real pinned one
+    assert ok is True
+    assert who.lower() == su.PINNED_RELEASE_PUBKEY.lower()
+
+
+def test_live_v1_manifest_behaves_identically_no_op_update(tmp_path):
+    """v0.1.0 against a v0.1.1 client is a NO-OP: no checkout, no re-exec, tree byte-unchanged."""
+    repo = _make_repo(tmp_path, version="0.1.1")
+    before = (tmp_path / "VERSION").read_bytes()
+    git, rex = FakeGit(), FakeReexec()
+    res = su.check_and_update(repo, argv=["tools/run_miner.py"], enabled=True,
+                              honor_rate_limit=False, state_path=str(tmp_path / "state.json"),
+                              fetch_fn=lambda u: json.dumps(LIVE_V1_MANIFEST),
+                              git_fn=git, pip_fn=FakePip(), reexec_fn=rex)
+    assert res.action == "no-op-not-forward" and res.applied is False
+    assert git.checkouts() == [] and rex.called is False
+    assert (tmp_path / "VERSION").read_bytes() == before
+
+
+def test_repo_release_json_verifies_against_the_pinned_key():
+    """Whatever release.json this checkout ships must itself verify -- catches a hand-edited or
+    re-signed manifest before it is ever published."""
+    import os
+    path = os.path.join(su.REPO, "release.json")
+    if not os.path.exists(path):
+        return                                   # not every checkout ships one; nothing to assert
+    with open(path, "r", encoding="utf-8") as f:
+        ok, info = su.verify_manifest(json.load(f))
+    assert ok is True, f"repo release.json does not verify: {info}"

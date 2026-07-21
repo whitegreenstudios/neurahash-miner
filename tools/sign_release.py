@@ -46,6 +46,28 @@ def _load_privkey(key_path, key_env):
     return val
 
 
+def _load_config(spec):
+    """Return the v2 `config` object from a file path or a literal JSON string, or None if unset.
+
+    Kept strict on purpose: this object is SIGNED and then applied by every miner as its network
+    defaults, so a typo here propagates to the whole fleet with a valid signature on it. A non-object
+    (list, string, number) is rejected rather than silently signed.
+    """
+    if spec is None:
+        return None
+    text = spec
+    if os.path.exists(spec):
+        with open(spec, "r", encoding="utf-8") as f:
+            text = f.read()
+    try:
+        cfg = json.loads(text)
+    except Exception as e:
+        raise SystemExit(f"ERROR: --config is neither a readable JSON file nor valid JSON ({e})")
+    if not isinstance(cfg, dict):
+        raise SystemExit("ERROR: --config must be a JSON OBJECT (got %s)" % type(cfg).__name__)
+    return cfg
+
+
 def _default_commit():
     try:
         out = subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"],
@@ -70,9 +92,21 @@ def main(argv=None):
                     help="read the release private key from this environment variable instead of a file")
     ap.add_argument("--out", default=os.path.join(REPO, "release.json"),
                     help="output path for the signed manifest (default: repo-root release.json)")
+    # ---- v2 optional fields. Omit BOTH and the output is byte-identical to a v1 manifest, so an
+    # ordinary release keeps working exactly as before and every already-signed manifest stays valid.
+    ap.add_argument("--min-client-version", default=None, metavar="VER",
+                    help="v2: clients older than this REFUSE TO PUBLISH (they still train) and say so "
+                         "by name. Use it when a release changes something the network requires, so an "
+                         "out-of-date miner fails loudly instead of submitting work that gets rejected.")
+    ap.add_argument("--config", default=None, metavar="FILE_OR_JSON",
+                    help="v2: path to a JSON file, or a literal JSON object, carrying the signed "
+                         "network config (merge_url / content_url / corpus_sha / protocol). Clients "
+                         "apply it as DEFAULTS -- an explicitly set environment variable still wins.")
     args = ap.parse_args(argv)
 
     parse_version(args.version)                       # fail fast on a bad version string
+    if args.min_client_version is not None:
+        parse_version(args.min_client_version)        # same fail-fast: a malformed gate would brick publishing
     commit = args.commit or _default_commit()
     if not commit:
         raise SystemExit("ERROR: could not determine --commit (pass it explicitly)")
@@ -80,6 +114,11 @@ def main(argv=None):
 
     acct = account_from_key(_load_privkey(args.key, args.key_env))
     manifest_body = {"version": str(args.version), "git_commit": str(commit), "published_ts": int(ts)}
+    if args.min_client_version is not None:
+        manifest_body["min_client_version"] = str(args.min_client_version)
+    cfg = _load_config(args.config)
+    if cfg is not None:
+        manifest_body["config"] = cfg
     data = canonical_manifest_bytes(manifest_body)
     signature = sign_bytes(acct, data)
 
@@ -98,6 +137,13 @@ def main(argv=None):
     print(f"  version      : {args.version}", flush=True)
     print(f"  git_commit   : {commit}", flush=True)
     print(f"  published_ts : {ts}", flush=True)
+    if "min_client_version" in manifest_body:
+        print(f"  min_client   : {manifest_body['min_client_version']} "
+              f"(older clients will refuse to publish)", flush=True)
+    if "config" in manifest_body:
+        print(f"  config keys  : {', '.join(sorted(manifest_body['config']))}", flush=True)
+    print(f"  manifest ver : {'v2' if len(manifest_body) > 3 else 'v1 (byte-identical to before)'}",
+          flush=True)
     print(f"  signer       : {acct.address}", flush=True)
     if acct.address.lower() == PINNED_RELEASE_PUBKEY.lower():
         print("  pinned match : YES -- clients pinning the current key will accept this manifest",

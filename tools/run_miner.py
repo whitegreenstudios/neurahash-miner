@@ -35,10 +35,28 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DILOCO = os.path.join(REPO, "tools", "diloco_contributor.py")
 MAKE_BASE = os.path.join(REPO, "tools", "make_base_from_hf.py")
+
+# The SIGNED NETWORK MANIFEST (docs/MINER_MANIFEST_DESIGN.md). One signed artifact carries the code
+# version, the network's `config` and its `min_client_version`, so code/config/expectations can no
+# longer silently disagree (issue #71). Imported defensively: a miner must never fail to start
+# because the updater module is unavailable.
+try:
+    import self_update as _su                          # tools/ on sys.path (python tools/run_miner.py)
+except ImportError:                                    # imported as a package
+    try:
+        from tools import self_update as _su
+    except ImportError:
+        _su = None
+
+# Set by manifest_sync() when the signed manifest's `min_client_version` is ABOVE this client's
+# VERSION: the miner must keep TRAINING but must not PUBLISH. publish_mode() reports it by name so
+# it lands in the same LIVE/LOCAL banner line as every other publish-mode reason.
+PUBLISH_BLOCK_REASON = None
 
 # The PROVEN 8GB-safe fit (memory hf-piece-streaming-training / RunPod 2026-07-10). These are pushed
 # into the child's environment on every iteration; the child (diloco_contributor / make_base) reads
@@ -87,7 +105,13 @@ def publish_mode():
     defaults its `--token` to the demo value: baking a shared write credential into the turnkey client
     makes every miner write with one secret, so rotating it breaks the whole fleet at once. Requiring
     it explicitly keeps per-joiner tokens possible. (Verified 2026-07-21: the store gates PUT on a
-    single `CONTENT_TOKEN` -- `tools/content_store.py:184` -- so an unset token is a hard 401.)"""
+    single `CONTENT_TOKEN` -- `tools/content_store.py:184` -- so an unset token is a hard 401.)
+
+    A `min_client_version` block from the SIGNED network manifest is checked FIRST and is reported
+    the same way: this client is too old for what the network accepts, so it trains but publishes
+    nothing (docs/MINER_MANIFEST_DESIGN.md sec.3 step 4)."""
+    if PUBLISH_BLOCK_REASON:
+        return False, PUBLISH_BLOCK_REASON
     merge_url = os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip()
     if not merge_url:
         return False, "NEURAHASH_DILOCO_MERGE_URL not set"
@@ -232,6 +256,166 @@ def run_iteration(args, work_dir, name, seed, is_live):
             "(PINATA_JWT / PINATA_JWT_FILE or a local kubo `ipfs`); delta saved locally")
 
 
+def apply_manifest_config(cfg):
+    """Apply a VERIFIED manifest's `config` as DEFAULTS ONLY; returns ["NAME=value", ...] for what
+    this call actually set. Deliberately a SEPARATE function from any hard-coded zero-config
+    defaults so the two compose in one direction: explicit env > signed manifest `config` >
+    hard-coded fallback. Delegates the allowlist + validation to self_update so there is exactly
+    ONE definition of what the network is allowed to set.
+
+    WARNING FOR FUTURE CALLERS: this takes a bare dict and performs NO signature check. The only
+    legitimate source of `cfg` is `SyncResult.manifest["config"]` from a manifest that already
+    recovered the pinned release key (which is why the startup path calls sync_from_manifest, not
+    this). Never wire this to a CLI flag, a config file, or a coordinator response."""
+    if _su is None or not cfg:
+        return []
+    applied, _ignored = _su.apply_manifest_config(cfg)
+    return applied
+
+
+def manifest_sync(argv=None, startup=True):
+    """Step 1-4 of docs/MINER_MANIFEST_DESIGN.md sec.3, run BEFORE any env is read: fetch + verify
+    the signed manifest across all mirrors, self-update if it names a forward version (this
+    re-execs and does not return), apply `config` as defaults, and arm the `min_client_version`
+    publish block. Returns the SyncResult (or None if the updater module is unavailable).
+
+    NEVER raises and never blocks for long: unreachable mirrors are a non-event, a bad signature
+    means we keep the code and config we already have. That is this client's core promise -- a
+    miner must never fail to start for lack of infra."""
+    global PUBLISH_BLOCK_REASON
+    if _su is None:
+        return None
+    sync = _su.sync_from_manifest(REPO, argv=argv, startup=startup)
+    PUBLISH_BLOCK_REASON = sync.publish_block
+    return sync
+
+
+# ------------------------------------------------------------------------------- --doctor preflight
+def _check(name, ok, detail, remedy=""):
+    return {"name": name, "ok": bool(ok), "detail": detail, "remedy": remedy}
+
+
+def _doctor_registry_reachable(url, timeout=4):
+    """HTTP HEAD the registry. ANY answer (including 404) proves reachability; only a transport
+    failure/timeout is a FAIL. Short timeout so --doctor can never hang."""
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "neurahash-miner-doctor"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310 (operator url)
+            return True, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return True, f"HTTP {e.code} (reachable)"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def doctor(work_dir, device="cuda", sync=None, head_fn=None):
+    """The preflight table of docs/MINER_MANIFEST_DESIGN.md sec.4. One PASS/FAIL line per check
+    plus a one-line remedy on failure. Returns (exit_code, checks) so it is usable from CI and a
+    pod bootstrap. All network checks use short timeouts; nothing here can hang."""
+    head_fn = head_fn or _doctor_registry_reachable
+    checks = []
+
+    # 1) client version vs the signed manifest's min_client_version -------------------------------
+    local_v = None
+    if _su is not None:
+        try:
+            local_v = _su.read_local_version(REPO)
+        except Exception:
+            local_v = None
+    block = sync.publish_block if sync is not None else PUBLISH_BLOCK_REASON
+    need = (sync.manifest or {}).get("min_client_version") if sync is not None else None
+    checks.append(_check(
+        "client version", not block,
+        f"local v{local_v or '?'}; manifest min_client_version {need or '(none declared)'}",
+        "run again to auto-update, or `git pull`"))
+
+    # 2) manifest reachable + signature valid ------------------------------------------------------
+    if sync is None:
+        checks.append(_check("signed manifest", False, "updater module unavailable",
+                             "reinstall the client (`git pull` + pip install -r requirements.txt)"))
+    else:
+        mirrors = sync.mirrors_summary()
+        checks.append(_check(
+            "signed manifest", sync.manifest is not None,
+            (f"v{sync.manifest_version} from {sync.fetch.source}" if sync.manifest is not None
+             else "no mirror served a manifest signed by the pinned release key"),
+            f"mirrors tried -- {mirrors}"))
+
+    # 3) signing key present / creatable ----------------------------------------------------------
+    key_path = os.environ.get("NEURAHASH_MINER_KEY", "").strip()
+    # the zero-config default the client would create on first publish
+    default_key = os.path.join(work_dir, "miner_key.hex")
+    probe = key_path or default_key
+    if key_path and os.path.exists(key_path):
+        checks.append(_check("signing key", True, f"present: {key_path}"))
+    else:
+        parent = os.path.dirname(os.path.abspath(probe)) or "."
+        creatable = os.path.isdir(parent) and os.access(parent, os.W_OK)
+        checks.append(_check("signing key", creatable,
+                             f"not yet created; will be created at {probe}",
+                             f"make {parent} writable, or set NEURAHASH_MINER_KEY to a writable path"))
+
+    # 4) registry reachable ------------------------------------------------------------------------
+    merge_url = os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip()
+    if not merge_url:
+        checks.append(_check("registry reachable", False, "NEURAHASH_DILOCO_MERGE_URL not set",
+                             "set NEURAHASH_DILOCO_MERGE_URL, or let the signed manifest supply it"))
+    else:
+        ok, detail = head_fn(merge_url)
+        checks.append(_check("registry reachable", ok, f"{merge_url} -- {detail}",
+                             f"check network access to {merge_url}"))
+
+    # 5) publish credential / auth path usable -----------------------------------------------------
+    signed_put = os.environ.get("NEURAHASH_SIGNED_PUT", "").strip() in ("1", "true", "yes", "on")
+    if signed_put:
+        checks.append(_check("publish auth", True,
+                             "signed-PUT path (per-miner key, no shared secret)"))
+    else:
+        has_token = bool(os.environ.get("NEURAHASH_CONTENT_TOKEN", "").strip())
+        checks.append(_check("publish auth", has_token,
+                             "token path: NEURAHASH_CONTENT_TOKEN " +
+                             ("set (sent as X-Auth)" if has_token else "NOT set"),
+                             "set NEURAHASH_CONTENT_TOKEN (the registry PUT sends it as X-Auth; "
+                             "without it the store answers HTTP 401)"))
+
+    # 6) pinning backend ---------------------------------------------------------------------------
+    if _pinata_configured():
+        checks.append(_check("pinning backend", True, "Pinata JWT configured"))
+    elif _kubo_available():
+        checks.append(_check("pinning backend", True, "local kubo `ipfs` on PATH"))
+    else:
+        checks.append(_check("pinning backend", False, "neither Pinata nor kubo found",
+                             "install kubo, or set PINATA_JWT"))
+
+    # 7) CUDA / device ------------------------------------------------------------------------------
+    try:
+        import torch
+        if torch.cuda.is_available():
+            checks.append(_check("device", True, f"CUDA available: {torch.cuda.get_device_name(0)}"))
+        else:
+            checks.append(_check("device", True,
+                                 f"no CUDA -- requested device {device!r} falls back to CPU "
+                                 f"(slow but correct)"))
+    except Exception as e:
+        checks.append(_check("device", False, f"torch unavailable ({type(e).__name__})",
+                             "pip install -r requirements.txt"))
+
+    print("=" * 70, flush=True)
+    print("  NeuraHash miner -- preflight doctor", flush=True)
+    print("=" * 70, flush=True)
+    failed = 0
+    for c in checks:
+        print(f"  {'PASS' if c['ok'] else 'FAIL'}  {c['name']:<18} {c['detail']}", flush=True)
+        if not c["ok"]:
+            failed += 1
+            if c["remedy"]:
+                print(f"        remedy: {c['remedy']}", flush=True)
+    print("=" * 70, flush=True)
+    print(f"  {len(checks) - failed}/{len(checks)} checks passed", flush=True)
+    return (1 if failed else 0), checks
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Turnkey run-forever ALL-OUTBOUND NeuraHash miner (thin wrapper over "
@@ -251,10 +435,35 @@ def main():
     ap.add_argument("--base-source", default=None,
                     help="explicit base: a checkpoint path, IPFS CID, or tracker URL "
                          "(wins over any local/cold-start base)")
+    ap.add_argument("--no-auto-update", action="store_true",
+                    help="disable the signed self-update + network-manifest sync "
+                         "(same as NEURAHASH_AUTOUPDATE=0)")
+    ap.add_argument("--doctor", action="store_true",
+                    help="run the preflight checks (PASS/FAIL + a remedy each) and exit non-zero "
+                         "if any fail; makes no changes and starts no training")
     args = ap.parse_args()
+
+    if args.no_auto_update:
+        os.environ["NEURAHASH_AUTOUPDATE"] = "0"
 
     work_dir = os.path.abspath(args.work_dir)
     os.makedirs(work_dir, exist_ok=True)
+
+    # STEP 1-4 (docs/MINER_MANIFEST_DESIGN.md sec.3), BEFORE any env is read: fetch + verify the
+    # signed manifest on every mirror, self-update onto the signed commit if it is forward (that
+    # re-execs), apply `config` as DEFAULTS, arm the min_client_version publish block.
+    sync = manifest_sync(argv=sys.argv, startup=True)
+    defaulted = list(sync.config_applied) if sync is not None else []
+    # MERGE POINT: any hard-coded zero-config fallback (apply_zero_config_defaults) belongs HERE --
+    # AFTER the signed manifest, so the precedence chain is explicit env > signed manifest config >
+    # hard-coded fallback. Guarded so this file works with or without that function present.
+    if "apply_zero_config_defaults" in globals():
+        defaulted += globals()["apply_zero_config_defaults"](work_dir)
+
+    if args.doctor:
+        code, _checks = doctor(work_dir, device=args.device, sync=sync)
+        return code
+
     name = _identity(args.wallet)
     is_live, reason = publish_mode()
     base_desc = args.base_source or f"(local/cold-start in {work_dir})"
@@ -276,6 +485,14 @@ def main():
     print(f"  publish mode : {'LIVE (' + reason + ')' if is_live else 'LOCAL (' + reason + ')'}", flush=True)
     print(f"  work dir     : {work_dir}", flush=True)
     print(f"  mode         : {'single iteration (--once)' if args.once else 'run forever'}", flush=True)
+    if sync is not None:
+        if sync.manifest is not None:
+            print(f"  manifest     : signed v{sync.manifest_version} from {sync.fetch.source}",
+                  flush=True)
+        else:
+            print(f"  manifest     : NONE verified -- {sync.mirrors_summary()}", flush=True)
+    for line in defaulted:
+        print(f"  defaulted    : {line}", flush=True)
     print("=" * 70, flush=True)
     if not is_live:
         log("LOCAL mode: deltas are trained + kept on disk, not published. "

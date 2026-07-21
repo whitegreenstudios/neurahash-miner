@@ -1,0 +1,7 @@
+[
+  {"name": "tiny",     "min_miners": 1},
+  {"name": "small",    "min_miners": 2},
+  {"name": "medium",   "min_miners": 3},
+  {"name": "large",    "min_miners": 3},
+  {"name": "qwen-bpe", "min_miners": 3, "propose_only": true, "arch_rung": "large", "corpus": "qwen"}
+]

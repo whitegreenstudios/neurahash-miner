@@ -49,8 +49,11 @@ python tools/run_miner.py --once --lr 1e-5
 - `--once` runs a single fetch → train → publish cycle then exits; drop it to loop forever.
 - With no publish infra configured the miner runs in **LOCAL mode**: it still trains and keeps the
   compressed delta on disk (so you can smoke-test), and prints how to go live — it never crashes for
-  lack of infra. To PUBLISH, set `NEURAHASH_DILOCO_MERGE_URL` **and** a pinning backend (`PINATA_JWT`
-  / `PINATA_JWT_FILE`, or a local `ipfs`/kubo daemon).
+  lack of infra. To PUBLISH you need **all three**: `NEURAHASH_DILOCO_MERGE_URL`,
+  `NEURAHASH_CONTENT_TOKEN` (the registry write token, sent as the `X-Auth` header — without it the
+  registry PUT returns HTTP 401 even though the pin succeeds; ask a maintainer for one), **and** a
+  pinning backend (`PINATA_JWT` / `PINATA_JWT_FILE`, or a local `ipfs`/kubo daemon). The miner reports
+  which one is missing instead of claiming LIVE and failing on publish.
 - Other flags: `--device cuda|cpu` (default `cuda`), `--base qwen3-0.6b`, `--steps N`,
   `--wallet <name-or-keypath>`. First cold-start downloads the base weights from HuggingFace (~1.2 GB)
   via `tools/make_base_from_hf.py`. Set `NEURAHASH_MINER_KEY=<path>` to sign your contributions (GAP1).

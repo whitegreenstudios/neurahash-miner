@@ -16,8 +16,10 @@ pip install -r requirements.txt
 python tools/run_miner.py --once --lr 1e-5    # --lr 1e-5 is REQUIRED (the 3e-4 default destroys the base)
 ```
 
-By default it runs in **LOCAL mode** (deltas trained + kept on disk). To publish, set
-`NEURAHASH_DILOCO_MERGE_URL=<merge-registry-url>` plus a pinning backend (see the README). The training
+By default it runs in **LOCAL mode** (deltas trained + kept on disk). To publish you need **all three**:
+`NEURAHASH_DILOCO_MERGE_URL=<merge-registry-url>`, `NEURAHASH_CONTENT_TOKEN=<registry write token>` (sent
+as the `X-Auth` header — without it the registry PUT returns HTTP 401; ask a maintainer for one), and a
+pinning backend (see the README). `run_miner.py` names whichever one is missing. The training
 bundle is content-addressed + **hash-verified** from interchangeable seeds (HuggingFace / VPS / IPFS) —
 see [BUNDLE.md](BUNDLE.md).
 

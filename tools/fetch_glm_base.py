@@ -98,6 +98,11 @@ def main():
     ap.add_argument("--dest", required=True, help="shard dir to populate (holds pieces/ + manifests)")
     ap.add_argument("--pieces", default="0", help="comma-separated expert piece indices to fetch")
     ap.add_argument("--skip-trunk", action="store_true", help="trunk already present and verified")
+    ap.add_argument("--config-cid", default=os.environ.get("NEURAHASH_GLM_CONFIG_CID"),
+                    help="content-address of the model config.json; fetched from the lane into "
+                         "<dest>/config so ONE fetch leaves a LOADABLE shard dir")
+    ap.add_argument("--lane", default=os.environ.get("NEURAHASH_CONTENT_URL",
+                                                     "http://47.84.93.96:8710"))
     args = ap.parse_args()
 
     _force_ipv4()
@@ -129,8 +134,31 @@ def main():
         p = fetch(api, "%s/pieces/%s" % (PREFIX, name), args.dest,
                   expect_sha=sha_for(name), local="pieces/%s" % name)
         total += os.path.getsize(p)
+    # config.json: WITHOUT it piece_loader raises FileNotFoundError *after* a multi-GB download --
+    # the worst possible place to discover a missing 1 KB file. Measured on a real second node.
+    # It rides the content lane rather than this dataset repo because it is a third-party model's
+    # config, not our artefact; the CID is the integrity guarantee either way.
+    if args.config_cid:
+        import urllib.request
+        cdir = os.path.join(args.dest, "config")
+        os.makedirs(cdir, exist_ok=True)
+        with urllib.request.urlopen("%s/o/%s" % (args.lane.rstrip("/"), args.config_cid),
+                                    timeout=120) as r:
+            cb = r.read()
+        got = hashlib.sha256(cb).hexdigest()
+        if got != args.config_cid:
+            raise SystemExit("config CID MISMATCH: %s != %s" % (got[:16], args.config_cid[:16]))
+        with open(os.path.join(cdir, "config.json"), "wb") as f:
+            f.write(cb)
+        print("  [ok  ] config/config.json  %d bytes  sha OK" % len(cb))
+    else:
+        print("\nNOTE: no --config-cid given, so <dest>/config/config.json is MISSING and the "
+              "loader will fail after this download completes. Pass --config-cid (or "
+              "NEURAHASH_GLM_CONFIG_CID) unless you already have a config dir.")
+
     print("\nDONE: %d file(s), %.2f GB under %s" % (len(want), total / 2 ** 30, args.dest))
-    print("Point the contributor at it with --shard-dir %s" % args.dest)
+    print("Point the contributor at it with --shard-dir %s%s"
+          % (args.dest, " --config-dir %s/config" % args.dest if args.config_cid else ""))
     return 0
 
 

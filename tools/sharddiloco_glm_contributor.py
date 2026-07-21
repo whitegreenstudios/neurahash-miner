@@ -372,6 +372,12 @@ def apply_accepted(host, lane, record, log=None):
         slot = int(item["slot"])
         outer = float(item.get("outer", 0.7))
         d = lane.get_delta(item["cid"])
+        # Same wire-agnostic materialisation the coordinator does. This replay MUST reproduce the
+        # coordinator's merge bit-for-bit or replicas silently diverge (that is what model_root
+        # catches), so both sides have to reconstruct the dense delta from the identical bytes the
+        # same way -- fetched by CID, never recomputed from local factors.
+        if _G().is_lora_payload(d):
+            d = _G().materialize_from_lora(d)
         cur = host.read_slot(slot)
         host.write_slot(slot, {k: cur[k] + outer * d[k] for k in cur if k in d})
         n += 1
@@ -425,6 +431,11 @@ def main(argv=None):
     ap.add_argument("--lr", type=float, default=float(os.environ.get("NEURAHASH_GLM_LR", "3e-3")))
     ap.add_argument("--batch", type=int, default=int(os.environ.get("NEURAHASH_GLM_BATCH", "16")),
                     help="B=4 on the 4060 (plan sec 1: vocab 154880 log_softmax is ~1.2 GiB at B=48)")
+    ap.add_argument("--wire", default=os.environ.get("NEURAHASH_GLM_WIRE", "lora"),
+                    choices=("lora", "dense"),
+                    help="lora (default) ships the LoRA factors -- 67.7x smaller than the dense "
+                         "delta they materialise to, and the only wire the shared lane accepts; "
+                         "dense ships the materialised weight delta (18.87 MB/round, LAN only)")
     ap.add_argument("--garbage", action="store_true",
                     help="ADVERSARIAL control: publish a correctly-SIGNED but harmful random delta "
                          "(sharddiloco_glm_expert.garbage_delta) that the secret-probe gate must REJECT")
@@ -505,19 +516,30 @@ def main(argv=None):
 
         # ---- train H local LoRA steps on my slot, with ZERO cross-miner comm ----
         t_tr = time.time()
+        payload = None                    # what actually goes on the wire (dense delta or factors)
         if args.garbage:
             delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rnd)
             train_flops, best_val = 1.0, float("nan")
+            payload = delta               # adversarial control stays dense: it has no factors
         else:
             c = G.train_glm_expert_contribution(
                 model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
                 batch=args.batch, seed=rnd * 100 + i)
             delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
+            # WIRE: ship the LoRA FACTORS, not their materialised product. The dense delta IS
+            # scale*(B@A), so the factors carry identical information in 67.7x fewer bytes
+            # (18,874,493 -> 278,731 measured at real GLM dims). This is not an optimisation we can
+            # skip: the shared VPS lane is a ~894 MB box that RESET THE CONNECTION on 18.87 MB
+            # bodies, so dense-over-WAN does not work at all. fp16 transport of the factors
+            # reproduces the product as faithfully as fp16 transport of the product itself
+            # (relative error ratio 0.65x-1.49x across B magnitudes 1e-4..1e-2 -- both are simply
+            # fp16 precision), so the gate cannot decide differently because of the wire.
+            payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
 
         # ---- publish the fp16 content-addressed delta + a signed record (D1/D2), trunk FROZEN ----
-        ecid = lane.put_delta(delta)
+        ecid = lane.put_delta(payload)
         sig = H.sign(key, ecid, rnd, miner)
-        delta_bytes = int(len(H.pack_arrays(delta, np.float16)))
+        delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
         record = dict(miner=miner, expert=int(i), layer=int(L), glm_expert=int(E), base_round=int(rnd),
                       expert_cid=ecid, trunk_cid=None, sig=sig, train_flops=float(train_flops),
                       trunk_bytes=0, delta_bytes=delta_bytes, base_root=root)

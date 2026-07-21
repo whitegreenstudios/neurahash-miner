@@ -162,6 +162,75 @@ def _materialize_canonical(le, E):
                 "down": dn.cpu().numpy().astype(np.float32)}
 
 
+LORA_KEYS = ("lora_A_gu", "lora_B_gu", "lora_A_d", "lora_B_d", "lora_scale")
+
+
+def garbage_lora(shape_ref, r=16, scale=3.0, seed=0):
+    """An adversarial contribution ON THE REAL WIRE: random LoRA factors, not a random dense delta.
+
+    The dense `garbage_delta` was an 18,874,493 B body, which the shared lane refuses outright --
+    so it tested the store's size limit, not the gate. It also modelled the wrong attacker: nobody
+    hostile pays 68x the bandwidth to be rejected. Sizing the attack exactly like an honest
+    contribution (278,731 B) means the ONLY thing that can stop it is the secret-probe held-out
+    gate, which is the property actually worth proving.
+
+    `shape_ref` is a dense {gate:[I,H], up:[I,H], down:[H,I]} used purely for dimensions.
+    """
+    rng = np.random.default_rng(seed)
+    I, Hd = shape_ref["gate"].shape
+    return {"lora_A_gu": (rng.standard_normal((r, Hd)) * scale).astype(np.float32),
+            "lora_B_gu": (rng.standard_normal((2 * I, r)) * scale).astype(np.float32),
+            "lora_A_d": (rng.standard_normal((r, I)) * scale).astype(np.float32),
+            "lora_B_d": (rng.standard_normal((Hd, r)) * scale).astype(np.float32),
+            "lora_scale": np.asarray([1.0], dtype=np.float32)}
+
+
+def is_lora_payload(d):
+    """True iff `d` carries LoRA FACTORS rather than a dense {gate,up,down} weight delta."""
+    return bool(d) and "lora_B_gu" in d
+
+
+def lora_factors_payload(le, E):
+    """The contribution as LoRA FACTORS instead of their materialised product.
+
+    WHY: the dense delta is gate[I,H] + up[I,H] + down[H,I] = 9,437,184 numbers = 18,874,568 B on
+    the wire. The factors that GENERATED it are A_gu[r,H] + B_gu[2I,r] + A_d[r,I] + B_d[H,r] =
+    139,264 numbers = 278,528 B at fp16 -- a 68x cut for information-identical content, because the
+    dense delta is exactly scale*(B@A) and nothing else. Measured consequence: the shared VPS lane
+    is a ~894 MB box that reset the connection on 18.87 MB bodies, so this is what makes real-GLM
+    shardDiLoCo possible over WAN at all, not merely cheaper.
+
+    Scale rides along as a 1-element array so the coordinator reproduces the product exactly rather
+    than assuming alpha/r.
+    """
+    import torch
+    with torch.no_grad():
+        return {"lora_A_gu": le.A_gu[str(E)].detach().float().cpu().numpy(),
+                "lora_B_gu": le.B_gu[str(E)].detach().float().cpu().numpy(),
+                "lora_A_d": le.A_d[str(E)].detach().float().cpu().numpy(),
+                "lora_B_d": le.B_d[str(E)].detach().float().cpu().numpy(),
+                "lora_scale": np.asarray([float(le.scale)], dtype=np.float32)}
+
+
+def materialize_from_lora(payload):
+    """Inverse of lora_factors_payload: rebuild the dense {gate,up,down} the gate/merge path expects.
+
+    Deliberately numpy-only (no torch): the coordinator runs this on every contribution and must not
+    depend on the contributor's framework state. Computed in float64 then cast to float32 -- the
+    factors arrive fp16-rounded, and doing the outer product in low precision compounds that error
+    across the r-dimension sum for no saving (the product is transient, never transmitted).
+    """
+    sc = float(np.asarray(payload["lora_scale"]).reshape(-1)[0])
+    gu = sc * (np.asarray(payload["lora_B_gu"], dtype=np.float64)
+               @ np.asarray(payload["lora_A_gu"], dtype=np.float64))         # [2I, H]
+    dn = sc * (np.asarray(payload["lora_B_d"], dtype=np.float64)
+               @ np.asarray(payload["lora_A_d"], dtype=np.float64))          # [H, I]
+    I = gu.shape[0] // 2
+    return {"gate": gu[:I].astype(np.float32),
+            "up": gu[I:].astype(np.float32),
+            "down": dn.astype(np.float32)}
+
+
 # =========================================================================== tiny REAL GLM builder
 def build_tiny_glm(seed=1, vocab=24, hidden=64, inter=128, moe_inter=48, layers=3,
                    n_experts=2, topk=1):
@@ -390,7 +459,10 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     delta = _materialize_canonical(le, E)
     layer.mlp.experts = base                     # detach LoRA -> plain fused model for the coordinator
     train_flops = 3.0 * fwd * n_ex               # forward + backward (D3 convention)
-    return {"delta": delta, "train_flops": train_flops, "n_examples": n_ex, "best_val_ce": best_val}
+    # `lora` is the SAME contribution as `delta`, 68x smaller: delta == materialize_from_lora(lora).
+    # Returned alongside rather than instead so callers choose the wire without changing this kernel.
+    return {"delta": delta, "lora": lora_factors_payload(le, E),
+            "train_flops": train_flops, "n_examples": n_ex, "best_val_ce": best_val}
 
 
 def garbage_delta(shape_ref, scale=3.0, seed=123):

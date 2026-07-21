@@ -115,3 +115,38 @@ def stream_publish_trunk(trunk_delta, base_round, stream_frac=None):
         return trunk_delta
     nfrag = stream_num_fragments(frac)
     return extract_trunk_fragment(trunk_delta, nfrag, int(base_round) % nfrag)
+
+# ---- D3 FLOP economics ----------------------------------------------------------------
+# Ported verbatim from the coordinator tree so a public contributor can book its own FLOPs:
+# contributions are gated and priced on (held-out gain / FLOP spent), so a miner that cannot
+# count its FLOPs cannot reason about what it will be paid. Pure accounting -- no merge, no
+# gate, no secret probe (those stay coordinator-side).
+class FlopMeter:
+    """D3 FLOP-economics meter. DiPaCo wins wall-clock but is LESS FLOP-efficient per perplexity, and a
+    PAID fleet is billed for every redundant FLOP (SHARDDILOCO_DESIGN.md sec 10 D3): the coordinator must
+    pay / gate per (held-out gain / FLOP spent), NOT per raw contribution. Records TRAIN FLOPs (the
+    contributor inner loop) and VERIFY FLOPs (the coordinator held-out probe) separately. Convention: an
+    (n x a)@(a x b) matmul = 2*n*a*b FLOPs; backward ~= 2x forward, so one trained example ~= 3x its
+    forward cost. `fwd_flops_per_example` is the model's forward cost for ONE example (model-agnostic --
+    the caller computes it, e.g. moelm_sparse_fwd_flops in tools/diloco_contributor.py)."""
+
+    def __init__(self, fwd_flops_per_example):
+        self.fwd = float(fwd_flops_per_example)
+        self.train = 0.0
+        self.verify = 0.0
+
+    def add_train(self, n_examples):
+        self.train += 3.0 * self.fwd * float(n_examples)   # forward + backward
+
+    def add_verify(self, n_examples):
+        self.verify += self.fwd * float(n_examples)        # forward-only eval
+
+    @property
+    def total(self):
+        return self.train + self.verify
+
+    def gain_per_flop(self, gain, flops=None):
+        """Held-out gain per FLOP. `flops` defaults to self.total (whole run); pass a per-contribution
+        FLOP count for the per-contribution economics gate. Returns 0.0 when no FLOPs are recorded."""
+        f = self.total if flops is None else float(flops)
+        return (float(gain) / f) if f else 0.0

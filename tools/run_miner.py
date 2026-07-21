@@ -15,7 +15,8 @@ NOT reimplement training or the delta codec -- each iteration just shells out:
 Publish infra = ALL THREE of: NEURAHASH_DILOCO_MERGE_URL (the coordinator's merge registry),
 NEURAHASH_CONTENT_TOKEN (the registry write token -- sent as the `X-Auth` header on the registry
 PUT; without it the store answers HTTP 401), and a pinning backend (PINATA_JWT / PINATA_JWT_FILE,
-or a local kubo `ipfs` binary). If ANY is missing the miner runs in LOCAL mode: it still trains and
+or a local kubo `ipfs` binary -- which this client will SAFELY auto-install into the work dir when
+absent, see tools/install_kubo.py). If ANY is missing the miner runs in LOCAL mode: it still trains and
 KEEPS the compressed delta on disk (so a stranger can smoke-test), and prints exactly which one is
 missing -- it never crashes for lack of infra.
 
@@ -53,6 +54,22 @@ except ImportError:                                    # imported as a package
     except ImportError:
         _su = None
 
+# The SAFE pinned auto-installer for kubo (tools/install_kubo.py): on a bare machine neither Pinata
+# nor a kubo binary exists, so the pinning backend -- the last non-credential blocker to a
+# zero-config join -- is missing. Imported exactly as defensively as the updater: a miner must never
+# fail to start because this module is unavailable, it just stays in LOCAL mode.
+try:
+    import install_kubo as _ik
+except ImportError:
+    try:
+        from tools import install_kubo as _ik
+    except ImportError:
+        _ik = None
+
+# Set by ensure_pinning_backend(): the one-line outcome of the auto-install attempt, so --doctor and
+# the LOCAL-mode banner can report what actually happened instead of a bare "not found".
+KUBO_AUTO_REASON = None
+
 # Set by manifest_sync() when the signed manifest's `min_client_version` is ABOVE this client's
 # VERSION: the miner must keep TRAINING but must not PUBLISH. publish_mode() reports it by name so
 # it lands in the same LIVE/LOCAL banner line as every other publish-mode reason.
@@ -88,12 +105,45 @@ def _pinata_configured():
     return bool(f and os.path.exists(f))
 
 
-def _kubo_available():
-    """True if a local kubo/ipfs binary is on PATH (a hosting node that can pin outbound)."""
-    return shutil.which(os.environ.get("NEURAHASH_IPFS_BIN", "ipfs")) is not None
+def _kubo_available(work_dir=None):
+    """Path to a usable kubo/ipfs binary (a hosting node that can pin outbound), else None.
+
+    A machine-provided binary on PATH wins; `work_dir` additionally makes a previous SAFE
+    auto-install under `<work_dir>/kubo/` count, so a miner that installed kubo once never
+    downloads it again. Truthy/falsey either way, so every existing call site is unchanged."""
+    if _ik is not None:
+        return _ik.find_kubo(work_dir)
+    return shutil.which(os.environ.get("NEURAHASH_IPFS_BIN", "ipfs"))
 
 
-def publish_mode():
+def ensure_pinning_backend(work_dir):
+    """Try ONCE per process to make a pinning backend exist, by auto-installing the pinned kubo
+    build into `<work_dir>/kubo/` (tools/install_kubo.py: compiled-in URL, published SHA-512
+    verified BEFORE extraction, one member extracted, no shell, no PATH change, opt-out via
+    NEURAHASH_AUTO_INSTALL_KUBO=0).
+
+    Skipped entirely when a backend already exists -- Pinata configured, or a kubo already on PATH
+    or already installed here -- so the 41MB download happens at most once, on a machine that
+    genuinely has no way to pin. NEVER raises: on any failure the miner simply stays in LOCAL mode,
+    and the reason is recorded for --doctor. Returns the binary path or None."""
+    global KUBO_AUTO_REASON
+    if _ik is None:
+        KUBO_AUTO_REASON = "installer module unavailable"
+        return None
+    if _pinata_configured():
+        return None
+    path = _ik.find_kubo(work_dir)
+    if path is None:
+        path, KUBO_AUTO_REASON = _ik.ensure_kubo(work_dir)   # points IPFS_BIN_ENV at it on success
+    elif not os.environ.get(_ik.IPFS_BIN_ENV, "").strip():
+        # A kubo installed by an EARLIER run of this client lives in the work dir, not on PATH.
+        # Name it explicitly so both this process's checks and the publish child (which reads
+        # NEURAHASH_IPFS_BIN at import time) use it -- still without touching PATH.
+        os.environ[_ik.IPFS_BIN_ENV] = path
+    return path
+
+
+def publish_mode(work_dir=None):
     """Return (is_live, reason). LIVE needs THREE things: the merge registry URL, the registry WRITE
     TOKEN, and a pinning backend.
 
@@ -120,9 +170,12 @@ def publish_mode():
                        "header; without it the content store rejects the publish with HTTP 401")
     if _pinata_configured():
         return True, "Pinata pinning"
-    if _kubo_available():
+    if _kubo_available(work_dir):
         return True, "local kubo pinning"
-    return False, "no pinning backend (PINATA_JWT / local kubo)"
+    reason = "no pinning backend (PINATA_JWT / local kubo)"
+    if KUBO_AUTO_REASON:
+        reason += " -- kubo auto-install: %s" % KUBO_AUTO_REASON
+    return False, reason
 
 
 def _identity(wallet):
@@ -250,7 +303,7 @@ def run_iteration(args, work_dir, name, seed, is_live):
         log("iter done: " + summary)
     else:
         log("iter done: " + summary)
-        log("publish infra not configured -- %s" % publish_mode()[1])
+        log("publish infra not configured -- %s" % publish_mode(work_dir)[1])
         log("to go live set ALL THREE: NEURAHASH_DILOCO_MERGE_URL (merge registry), "
             "NEURAHASH_CONTENT_TOKEN (registry write token, sent as X-Auth), and a pinning backend "
             "(PINATA_JWT / PINATA_JWT_FILE or a local kubo `ipfs`); delta saved locally")
@@ -382,11 +435,23 @@ def doctor(work_dir, device="cuda", sync=None, head_fn=None):
     # 6) pinning backend ---------------------------------------------------------------------------
     if _pinata_configured():
         checks.append(_check("pinning backend", True, "Pinata JWT configured"))
-    elif _kubo_available():
-        checks.append(_check("pinning backend", True, "local kubo `ipfs` on PATH"))
     else:
-        checks.append(_check("pinning backend", False, "neither Pinata nor kubo found",
-                             "install kubo, or set PINATA_JWT"))
+        # Reflect REALITY, including a kubo this client auto-installed into the work dir: main()
+        # runs ensure_pinning_backend() BEFORE this, and that points NEURAHASH_IPFS_BIN at the
+        # local install, so the same no-arg probe sees it. The doctor's job is to answer "can this
+        # machine pin?", not "is there one on PATH?".
+        kubo = _kubo_available()
+        if kubo:
+            checks.append(_check("pinning backend", True, "local kubo `ipfs`: %s" % kubo))
+        else:
+            detail = "neither Pinata nor kubo found"
+            if KUBO_AUTO_REASON:
+                detail += " -- kubo auto-install: %s" % KUBO_AUTO_REASON
+            checks.append(_check("pinning backend", False, detail,
+                                 "install kubo, or set PINATA_JWT -- or let this client auto-install "
+                                 "a pinned, digest-verified kubo into the work dir (it is on by "
+                                 "default; disabled here only by --no-auto-install-kubo / "
+                                 "NEURAHASH_AUTO_INSTALL_KUBO=0)"))
 
     # 7) CUDA / device ------------------------------------------------------------------------------
     try:
@@ -438,6 +503,9 @@ def main():
     ap.add_argument("--no-auto-update", action="store_true",
                     help="disable the signed self-update + network-manifest sync "
                          "(same as NEURAHASH_AUTOUPDATE=0)")
+    ap.add_argument("--no-auto-install-kubo", action="store_true",
+                    help="disable the pinned, digest-verified kubo auto-install into the work dir "
+                         "(same as NEURAHASH_AUTO_INSTALL_KUBO=0)")
     ap.add_argument("--doctor", action="store_true",
                     help="run the preflight checks (PASS/FAIL + a remedy each) and exit non-zero "
                          "if any fail; makes no changes and starts no training")
@@ -445,6 +513,8 @@ def main():
 
     if args.no_auto_update:
         os.environ["NEURAHASH_AUTOUPDATE"] = "0"
+    if args.no_auto_install_kubo:
+        os.environ["NEURAHASH_AUTO_INSTALL_KUBO"] = "0"
 
     work_dir = os.path.abspath(args.work_dir)
     os.makedirs(work_dir, exist_ok=True)
@@ -460,12 +530,17 @@ def main():
     if "apply_zero_config_defaults" in globals():
         defaulted += globals()["apply_zero_config_defaults"](work_dir)
 
+    # ZERO-CONFIG PINNING: AFTER the signed manifest has had its say (it may supply publish config)
+    # and BEFORE anything reads the publish mode, so --doctor and the banner both see the result of
+    # this attempt rather than a stale "not found". No-ops when a backend already exists.
+    ensure_pinning_backend(work_dir)
+
     if args.doctor:
         code, _checks = doctor(work_dir, device=args.device, sync=sync)
         return code
 
     name = _identity(args.wallet)
-    is_live, reason = publish_mode()
+    is_live, reason = publish_mode(work_dir)
     base_desc = args.base_source or f"(local/cold-start in {work_dir})"
 
     signer = _signer_address()

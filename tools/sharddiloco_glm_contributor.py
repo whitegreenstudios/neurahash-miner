@@ -299,10 +299,21 @@ def build_node_model(args, log=None, need_gib=None):
     # ---- real GLM: one piece resident, trunk frozen (plan sec 1: 1 MoE layer x 1.125 GiB slab) ----
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    loader_dir = os.path.join("D:/glm_loader/repo", "tools")
-    if loader_dir not in sys.path:
-        sys.path.insert(0, loader_dir)
-    import piece_loader                                          # noqa: E402 (no neurahash import)
+    # piece_loader now ships BESIDE this file, so a normal import works anywhere. It used to be
+    # imported from a hardcoded "D:/glm_loader/repo/tools" -- a path that exists only on one
+    # developer machine, which meant NO stranger could run GLM shardDiLoCo at all. That went
+    # unnoticed because every prior GLM run happened on the box where the path existed; a second
+    # physical node surfaced it instantly as ModuleNotFoundError. NEURAHASH_GLM_LOADER_DIR remains
+    # as an escape hatch for an out-of-tree loader.
+    extra = os.environ.get("NEURAHASH_GLM_LOADER_DIR")
+    if extra and extra not in sys.path:
+        sys.path.insert(0, extra)
+    try:
+        import piece_loader                                      # noqa: E402 (no neurahash import)
+    except ImportError as ex:                                    # pragma: no cover - env problem
+        raise SystemExit(
+            "cannot import piece_loader (%s). It should ship next to this file in tools/; if you "
+            "keep it elsewhere, point NEURAHASH_GLM_LOADER_DIR at that directory." % ex)
     model, summ = piece_loader.build_partial_model(
         args.shard_dir, [int(args.piece)], device=args.device, dtype=torch.bfloat16,
         config_dir=args.config_dir, strip_mtp=True)

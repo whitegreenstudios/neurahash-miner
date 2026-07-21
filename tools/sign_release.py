@@ -68,6 +68,27 @@ def _load_config(spec):
     return cfg
 
 
+def _full_commit(ref):
+    """Resolve `ref` to a FULL 40-hex commit id via git, or exit.
+
+    MEASURED 2026-07-21 against a real published release: signing a SHORT hash produces a manifest
+    that is dead on arrival. The signature verifies and `git checkout <short>` succeeds, but the
+    client then compares the resulting 40-char HEAD against the manifest's 7-char string, sees a
+    mismatch, refuses to re-exec and rolls back -- every miner, silently, forever. The updater's
+    commit regex accepts 7-64 hex, so nothing upstream catches it. Resolving here means an operator
+    can still type a short hash and get a correct manifest.
+    """
+    try:
+        out = subprocess.check_output(["git", "-C", REPO, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                                      encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        raise SystemExit(f"ERROR: could not resolve --commit {ref!r} to a full hash via git ({e}). "
+                         f"Is it pushed and fetched in this clone?")
+    if len(out) != 40 or any(c not in "0123456789abcdef" for c in out.lower()):
+        raise SystemExit(f"ERROR: git resolved {ref!r} to {out!r}, which is not a 40-hex commit id")
+    return out
+
+
 def _default_commit():
     try:
         out = subprocess.check_output(["git", "-C", REPO, "rev-parse", "HEAD"],
@@ -107,7 +128,7 @@ def main(argv=None):
     parse_version(args.version)                       # fail fast on a bad version string
     if args.min_client_version is not None:
         parse_version(args.min_client_version)        # same fail-fast: a malformed gate would brick publishing
-    commit = args.commit or _default_commit()
+    commit = _full_commit(args.commit) if args.commit else _default_commit()
     if not commit:
         raise SystemExit("ERROR: could not determine --commit (pass it explicitly)")
     ts = args.published_ts if args.published_ts is not None else int(time.time())

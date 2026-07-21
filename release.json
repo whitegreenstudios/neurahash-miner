@@ -1,7 +1,12 @@
 {
-  "git_commit": "608b0dd46c55239d24915eaf0f649ca1a004fda9",
-  "published_ts": 1784444362,
-  "signature": "08b57b4daf0737e924e72c927490e289f50805a0688b828b365ed51261b2d1d115f8bb51845b16874abf21dc2e811e7a40130e486ae39ba3b84a15621fdf61411c",
+  "config": {
+    "corpus_sha": "e2ce84a627798628d7854523e68545180912fbd004c77165786ac1fb74f765f3",
+    "corpus_store": "https://huggingface.co/datasets/whitegreenstudios888/neurahash-data/resolve/main/store",
+    "merge_url": "http://47.84.93.96:8710"
+  },
+  "git_commit": "a0d42eb",
+  "published_ts": 1784601660,
+  "signature": "b8659c02162314836e3fe65095669f6da16350418a4ea877344464171d4230cd2b8da5810229be04cc60ba1eb60b1d8d973ed4ca5eaddc90d12c81ce81985af31b",
   "signer": "0x5168F6cc4cc05bfd6d4714906d68e083c02dDC66",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

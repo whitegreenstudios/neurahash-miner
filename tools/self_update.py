@@ -384,9 +384,17 @@ def _v_bool(v):
 # path, a credential, or anything executable -- the values are endpoint urls, a hex digest, a
 # version tag and a boolean, each SHAPE-VALIDATED before it ever reaches the environment.
 CONFIG_ALLOWLIST = {
-    "merge_url":   ("NEURAHASH_DILOCO_MERGE_URL", _v_url),
-    "content_url": ("NEURAHASH_CONTENT_URL", _v_url),
-    "corpus_sha":  ("NEURAHASH_CORPUS_SHA", _v_hex),
+    "merge_url":    ("NEURAHASH_DILOCO_MERGE_URL", _v_url),
+    "content_url":  ("NEURAHASH_CONTENT_URL", _v_url),
+    # The CORPUS store is a DIFFERENT variable from content_url, and conflating them is an easy and
+    # silent mistake: corpus_sync.store_url_from_env reads NEURAHASH_CONTENT_STORE
+    # (neurahash/corpus_sync.py:102-106), while NEURAHASH_CONTENT_URL is the base/checkpoint tracker
+    # hint. Shipping only content_url therefore looks correct and does NOT redirect the corpus fetch.
+    # This entry is what lets a signed release point joiners at the HF-hosted corpus; it wins over
+    # the coordinator's hello-advertised store, because the miner resolves
+    # `store_url_from_env() or _store_url_from_hello(hello)` (run_miner_client.py:201).
+    "corpus_store": ("NEURAHASH_CONTENT_STORE", _v_url),
+    "corpus_sha":   ("NEURAHASH_CORPUS_SHA", _v_hex),
 }
 PROTOCOL_ALLOWLIST = {
     "signed_put":          ("NEURAHASH_SIGNED_PUT", _v_bool),

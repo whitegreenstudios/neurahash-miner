@@ -44,7 +44,7 @@ import hashlib
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-from .canon import _canon
+from .block_state import _canon
 from . import sig_scheme
 from . import pqc
 from .sig_scheme import SCHEME_SECP256K1, SCHEME_ML_DSA_44, UnsupportedSchemeError
@@ -67,6 +67,35 @@ def gen_account():
 def account_from_key(privkey):
     """Reconstruct an Account from a 32-byte private key (hex str or bytes)."""
     return Account.from_key(privkey)
+
+
+class VerifyOnlyAccount:
+    """A signing-DISABLED stand-in for an `Account`, holding ONLY the public `.address`.
+
+    Used when a coordinator checkpoint is restored WITHOUT its private key (F10: a key-scrubbed
+    new-format checkpoint whose encrypted keyfile is missing, or whose NEURAHASH_COORD_KEY_PSK is
+    unset/wrong). Everything that VERIFIES a signed chain needs only the address (verify_signed_log /
+    _replay_blocks take a plain address string), so a restored coordinator can still read, serve, and
+    tamper-check its ledger. But any attempt to SIGN reaches `.key`, which raises a clear RuntimeError
+    naming what is missing — so a keyless coordinator fails LOUD at the sign site instead of silently
+    minting with a wrong/absent key. `.address` is public and safe to hold in the clear."""
+
+    is_verify_only = True
+
+    def __init__(self, address, reason=None):
+        self.address = address
+        self._reason = reason or (
+            "coordinator loaded in VERIFY-ONLY mode: no private signing key available "
+            "(provide the encrypted keyfile + NEURAHASH_COORD_KEY_PSK to sign)")
+
+    @property
+    def key(self):
+        raise RuntimeError(self._reason)
+
+
+def verify_only_account(address, reason=None):
+    """Factory for a signing-disabled account carrying only `address` (see VerifyOnlyAccount)."""
+    return VerifyOnlyAccount(address, reason)
 
 
 # ---------------------------------------------------------------------------

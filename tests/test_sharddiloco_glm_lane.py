@@ -40,7 +40,16 @@ import sharddiloco_glm_contributor as N
 # test suite that ImportErrors on a fresh clone is worse than one that says why it skipped.
 coordinator_only = pytest.mark.skipif(
     not hasattr(dm, "apply_delta_gated"),
-    reason="coordinator-side merge machinery is private; this checkout ships the contributor subset")
+    reason="coordinator-side merge machinery absent; this checkout ships the contributor subset")
+
+# A separate axis: some tests SPAWN tools/sharddiloco_glm_coordinator.py. Once the trust root was
+# published the merge machinery became importable everywhere, so the check above stopped
+# distinguishing them and the spawn test failed on checkouts that (correctly) do not ship the
+# training-coordinator script. Gate on the actual dependency -- the file -- not on a proxy for it.
+_COORD_SCRIPT = os.path.join(_TOOLS, "sharddiloco_glm_coordinator.py")
+coordinator_script_only = pytest.mark.skipif(
+    not os.path.exists(_COORD_SCRIPT),
+    reason="tools/sharddiloco_glm_coordinator.py is not in this checkout (training-coordinator role)")
                                # noqa: E402
 
 # GLM-4.7-Flash routed-expert canonical shapes, scaled down 32x so the test is instant. The real
@@ -122,7 +131,7 @@ def test_wrong_key_record_is_rejected():
 
 
 # ========================================================================== 3. default-off gate
-@coordinator_only
+@coordinator_script_only
 def test_coordinator_refuses_without_flag():
     """The GLM coordinator inherits the toy coordinator's master gate: with NEURAHASH_SHARDDILOCO unset
     it must refuse (rc 3) before touching the lane or loading any model."""

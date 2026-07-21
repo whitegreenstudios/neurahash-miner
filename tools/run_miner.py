@@ -91,6 +91,45 @@ PROVEN_RECIPE = {
 }
 
 
+# ZERO-CONFIG defaults. A stranger joining the fleet should not have to discover a URL or provision a
+# key by hand -- neither is a secret. The merge registry is a public address, and the wallet key is
+# self-provisioned by the child on first use. Only credentials stay unset-by-default. Anything already
+# in the environment always wins, so an operator or a pod pinning its own values is never overridden.
+# These are the LAST fallback: a signed manifest's `config` is applied first (see the merge point in
+# main()), so moving the lane never requires a code release.
+DEFAULT_MERGE_URL = "http://47.84.93.96:8710"
+DEFAULT_KEY_FILENAME = "miner_key.hex"
+
+
+def apply_zero_config_defaults(work_dir):
+    """Fill in the non-secret environment a public miner would otherwise have to set by hand.
+
+    Returns a list of "NAME=value" strings for the ones this call actually defaulted (for the banner),
+    so the miner can see what it picked rather than having it happen invisibly.
+
+    NEVER overwrites an existing value and NEVER invents a credential: NEURAHASH_CONTENT_TOKEN is
+    deliberately absent here, because a shared write secret baked into the client is exactly what the
+    per-miner signed-PUT work replaces.
+
+    MEASURED 2026-07-21, why the key default matters: a public run WITHOUT it published a delta that
+    landed in the registry as `signed: False`. An unsigned contribution cannot be attributed to a
+    wallet, so it trains, publishes, improves held-out -- and cannot be PAID. Defaulting the key path
+    is what turns a working miner into a payable one.
+    """
+    applied = []
+    if not os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip():
+        os.environ["NEURAHASH_DILOCO_MERGE_URL"] = DEFAULT_MERGE_URL
+        applied.append("NEURAHASH_DILOCO_MERGE_URL=" + DEFAULT_MERGE_URL)
+    if not os.environ.get("NEURAHASH_MINER_KEY", "").strip():
+        # The child (diloco_contributor._miner_account) CREATES this file on first use if absent, so
+        # pointing at a path inside the work dir is enough to give a stranger a stable signed identity
+        # that survives restarts. We never read or create the key here.
+        key_path = os.path.join(work_dir, DEFAULT_KEY_FILENAME)
+        os.environ["NEURAHASH_MINER_KEY"] = key_path
+        applied.append("NEURAHASH_MINER_KEY=" + key_path)
+    return applied
+
+
 def log(msg):
     """One ASCII line to stdout (flushed) -- cp1252 console safe."""
     print(f"[run_miner] {msg}", flush=True)

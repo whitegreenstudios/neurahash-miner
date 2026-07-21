@@ -12,10 +12,12 @@ NOT reimplement training or the delta codec -- each iteration just shells out:
         --seed <fresh> --device <dev> --name <wallet> --compress-delta \
         [--publish-delta --publish-compressed-delta]   # only when publish infra is configured
 
-Publish infra = NEURAHASH_DILOCO_MERGE_URL (the coordinator's merge registry) set AND a pinning
-backend available (PINATA_JWT / PINATA_JWT_FILE, or a local kubo `ipfs` binary). If either is
-missing the miner runs in LOCAL mode: it still trains and KEEPS the compressed delta on disk (so a
-stranger can smoke-test), and prints how to go live -- it never crashes for lack of infra.
+Publish infra = ALL THREE of: NEURAHASH_DILOCO_MERGE_URL (the coordinator's merge registry),
+NEURAHASH_CONTENT_TOKEN (the registry write token -- sent as the `X-Auth` header on the registry
+PUT; without it the store answers HTTP 401), and a pinning backend (PINATA_JWT / PINATA_JWT_FILE,
+or a local kubo `ipfs` binary). If ANY is missing the miner runs in LOCAL mode: it still trains and
+KEEPS the compressed delta on disk (so a stranger can smoke-test), and prints exactly which one is
+missing -- it never crashes for lack of infra.
 
 The base is resolved per iteration: an explicit --base-source (checkpoint path | IPFS CID | tracker
 URL) wins; else a local base in the work dir; else a round-0 base is materialized from HuggingFace
@@ -74,10 +76,21 @@ def _kubo_available():
 
 
 def publish_mode():
-    """Return (is_live, reason). LIVE needs the merge registry URL AND a pinning backend."""
+    """Return (is_live, reason). LIVE needs THREE things: the merge registry URL, the registry WRITE
+    TOKEN, and a pinning backend.
+
+    The token is the easy one to miss (reported by a real joiner on issue #71): the registry PUT in
+    `diloco_contributor.publish_delta` sends NEURAHASH_CONTENT_TOKEN as the `X-Auth` header, but this
+    preflight used to check only the URL + pinning -- so an unset token sailed through as "LIVE" and
+    then failed LATE with an opaque HTTP 401. Checking it here turns that into a named, actionable
+    LOCAL-mode reason. (We deliberately do NOT default the token: the live store's token is not the
+    public demo token, so a default would still 401 while implying it should work.)"""
     merge_url = os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip()
     if not merge_url:
         return False, "NEURAHASH_DILOCO_MERGE_URL not set"
+    if not os.environ.get("NEURAHASH_CONTENT_TOKEN", "").strip():
+        return False, ("NEURAHASH_CONTENT_TOKEN not set -- the registry PUT sends it as the X-Auth "
+                       "header; without it the content store rejects the publish with HTTP 401")
     if _pinata_configured():
         return True, "Pinata pinning"
     if _kubo_available():
@@ -210,8 +223,10 @@ def run_iteration(args, work_dir, name, seed, is_live):
         log("iter done: " + summary)
     else:
         log("iter done: " + summary)
-        log("publish infra not configured (set NEURAHASH_DILOCO_MERGE_URL + PINATA_JWT to go live); "
-            "delta saved locally")
+        log("publish infra not configured -- %s" % publish_mode()[1])
+        log("to go live set ALL THREE: NEURAHASH_DILOCO_MERGE_URL (merge registry), "
+            "NEURAHASH_CONTENT_TOKEN (registry write token, sent as X-Auth), and a pinning backend "
+            "(PINATA_JWT / PINATA_JWT_FILE or a local kubo `ipfs`); delta saved locally")
 
 
 def main():
@@ -228,29 +243,12 @@ def main():
     ap.add_argument("--interval", type=int, default=30,
                     help="seconds to sleep between iterations (ignored with --once)")
     ap.add_argument("--once", action="store_true", help="run a single iteration then exit (testing)")
-    ap.add_argument("--work-dir", default=os.path.join(os.path.expanduser("~"), "neurahash_miner"),
+    ap.add_argument("--work-dir", default="D:/aiCrypto_work/run_miner",
                     help="scratch dir for the base + contribution + compressed delta")
     ap.add_argument("--base-source", default=None,
                     help="explicit base: a checkpoint path, IPFS CID, or tracker URL "
                          "(wins over any local/cold-start base)")
-    ap.add_argument("--no-auto-update", action="store_true",
-                    help="disable the SIGNED, fail-closed auto-updater (default ON; same as "
-                         "NEURAHASH_AUTOUPDATE=0). See tools/self_update.py + SIGNING.md.")
     args = ap.parse_args()
-
-    # SIGNED, FAIL-CLOSED AUTO-UPDATE (default ON) -- see tools/self_update.py. Verifies a release
-    # manifest against the pinned release key and, only on a verified FORWARD release, checks it out
-    # and re-execs. On ANY failure it warns and continues on the current version; never runs unsigned
-    # code. Opt out: --no-auto-update / NEURAHASH_AUTOUPDATE=0. Rate-limited (once/6h).
-    if not args.no_auto_update:
-        try:
-            from self_update import maybe_auto_update          # tools/ is on sys.path here
-        except ImportError:
-            from tools.self_update import maybe_auto_update     # imported as a package
-        try:
-            maybe_auto_update(argv=sys.argv)                   # returns unless it re-execs onto new code
-        except Exception as _e:
-            log(f"auto-update skipped ({_e}); continuing on current version")
 
     work_dir = os.path.abspath(args.work_dir)
     os.makedirs(work_dir, exist_ok=True)

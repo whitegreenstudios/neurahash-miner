@@ -83,8 +83,11 @@ def publish_mode():
     `diloco_contributor.publish_delta` sends NEURAHASH_CONTENT_TOKEN as the `X-Auth` header, but this
     preflight used to check only the URL + pinning -- so an unset token sailed through as "LIVE" and
     then failed LATE with an opaque HTTP 401. Checking it here turns that into a named, actionable
-    LOCAL-mode reason. (We deliberately do NOT default the token: the live store's token is not the
-    public demo token, so a default would still 401 while implying it should work.)"""
+    LOCAL-mode reason. We deliberately do NOT default the token here, even though `fleet/esh_worker.py`
+    defaults its `--token` to the demo value: baking a shared write credential into the turnkey client
+    makes every miner write with one secret, so rotating it breaks the whole fleet at once. Requiring
+    it explicitly keeps per-joiner tokens possible. (Verified 2026-07-21: the store gates PUT on a
+    single `CONTENT_TOKEN` -- `tools/content_store.py:184` -- so an unset token is a hard 401.)"""
     merge_url = os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip()
     if not merge_url:
         return False, "NEURAHASH_DILOCO_MERGE_URL not set"

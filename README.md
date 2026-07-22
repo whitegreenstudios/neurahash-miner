@@ -195,3 +195,16 @@ elected leader was crashed, the two survivors formed a real 2-of-3 quorum and on
 chain fork**. This means the operator running the pool cannot silently cheat miners on payouts. Full
 production activation (a real on-chain validator set + an external audit) is still gated on the
 operator; the mechanism is proven and ships **default-off** until then.
+
+## Being a good GPU neighbor — elastic VRAM (2026-07-22)
+
+**Status (2026-07-22, landing in the miner now).** The miner is being made safe to run on the same GPU
+you game or work on. It detects how much VRAM is actually free (accounting for everything else on the
+card — the pool, your apps, anything), reserves a headroom for **you**, and re-checks every ~20 seconds:
+if you launch something that needs the GPU, the miner **immediately sheds training layers** to give the
+memory back, and only grows again once the memory stays free for a while (so it never thrashes or fights
+you for the card). If not even one layer fits, it **pauses** instead of spilling into system RAM and
+hanging your machine. The static VRAM cap (`NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC`) was also
+hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory rather than total. Opt-in,
+and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
+fits what you can currently spare.

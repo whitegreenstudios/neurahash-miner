@@ -233,5 +233,97 @@ def test_apply_accepted_replicates_merge():
         assert np.array_equal(node2.read_slot(0)[k], expert0[k].astype(np.float32))
 
 
+# ================================================================= 5. F1 probe-pool secrecy on disk
+def test_prep_probe_heldout_go_to_coord_only_dir(tmp_path):
+    """F1: tools/glm_wan_prep_data.build_domain must write train+val to the MINER-facing dir and
+    probe+heldout to the COORDINATOR-ONLY dir, so a miner's data dir never holds the secret gate
+    pool (one `rsync <data-dir> pod:` then cannot defeat the gate)."""
+    import importlib
+    prep = importlib.import_module("glm_wan_prep_data")
+    miner, coord = tmp_path / "miner", tmp_path / "coord"
+    miner.mkdir()
+    coord.mkdir()
+    seq = 4
+    n_tokens = sum(n for _, n in prep.SPLITS) * seq
+    fake_tok = lambda text, add_special_tokens=False: {"input_ids": list(range(n_tokens))}  # noqa: E731
+    _arr, written, _used = prep.build_domain(fake_tok, "x", seq, str(miner), str(coord), "code",
+                                             vocab_size=n_tokens + 1)
+    where = {name: os.path.dirname(path) for name, _shape, path in written}
+    assert where["train"] == str(miner) and where["val"] == str(miner)
+    assert where["probe"] == str(coord) and where["heldout"] == str(coord)
+    # the MINER-facing dir on disk must contain NO probe/heldout file at all
+    miner_files = os.listdir(str(miner))
+    assert not any(("probe" in f or "heldout" in f) for f in miner_files), miner_files
+    assert prep.COORD_ONLY == frozenset({"probe", "heldout"})
+
+
+# ============================================================================ 6. F8 LoRA shape gate
+def test_lora_shape_gate_rejects_mismatch():
+    """F8: validate_lora_factors accepts well-formed factors for the resident dims and REJECTS a
+    rank/dim mismatch (or a non-LoRA payload) BEFORE the coordinator's float64 outer product
+    materialises attacker-controlled factors."""
+    import sharddiloco_glm_expert as G
+    I, Hd, r = 48, 64, 16
+    ref = {"gate": np.zeros((I, Hd), np.float32), "up": np.zeros((I, Hd), np.float32),
+           "down": np.zeros((Hd, I), np.float32)}
+    good = G.garbage_lora(ref, r=r)
+    ok, why = G.validate_lora_factors(good, I, Hd)
+    assert ok, why
+    ok2, why2 = G.validate_lora_factors(good, I + 8, Hd)          # wrong resident dims
+    assert not ok2 and "shape" in why2.lower()
+    ok3, _ = G.validate_lora_factors({"gate": np.zeros((I, Hd), np.float32)}, I, Hd)  # not LoRA
+    assert not ok3
+    big = G.garbage_lora(ref, r=1024)                            # oversized rank
+    ok4, why4 = G.validate_lora_factors(big, I, Hd, max_rank=512)
+    assert not ok4 and "rank" in why4.lower()
+
+
+# ================================================================ 7. F2 no-key defense: local re-gate
+def test_apply_accepted_regate_rejects_regressing_delta():
+    """F2 defense-in-depth: apply_accepted RE-GATES each fetched delta on a local held-out metric and
+    UNFOLDS one that regresses it (leaving the replica untouched), while folding one that improves it.
+    A forged accepted record on the UNSIGNED shared-token lane therefore cannot push an ungated delta
+    into a replica -- the core no-key protection when no coordinator pubkey is pinned yet."""
+    expert0 = _glm_shaped_delta(seed=11, scale=1.0)
+    body = H.pack_arrays(_glm_shaped_delta(seed=12, scale=1.0), np.float16)
+    cid = H.cid_of(body)
+    rec = dict(round=0, accepted=[dict(miner="m", slot=0, cid=cid, outer=0.7)])
+
+    node = _FakeHost([expert0])                                  # ce_fn reports a REGRESSION -> reject
+    seq = iter([1.0, 2.0])
+    rejected = []
+    n = N.apply_accepted(node, _FakeLane({cid: body}), rec, ce_fn=lambda h: next(seq), tol=0.0,
+                         rejected=rejected)
+    assert n == 0 and len(rejected) == 1
+    for k in ("gate", "up", "down"):
+        assert np.array_equal(node.read_slot(0)[k], expert0[k].astype(np.float32)), k
+
+    node2 = _FakeHost([expert0])                                 # ce_fn reports an IMPROVEMENT -> fold
+    seq2 = iter([1.0, 0.5])
+    n2 = N.apply_accepted(node2, _FakeLane({cid: body}), rec, ce_fn=lambda h: next(seq2), tol=0.0)
+    assert n2 == 1
+    assert not np.array_equal(node2.read_slot(0)["gate"], expert0["gate"].astype(np.float32))
+
+
+def test_apply_accepted_regate_rejects_shape_mismatch():
+    """F2/F8 defense-in-depth on the contributor: a fetched delta whose shape does not match the slot
+    is skipped, not broadcast into the weights."""
+    expert0 = _glm_shaped_delta(seed=13, scale=1.0)
+
+    class _BadLane:
+        def get_delta(self, cid):
+            return {"gate": np.zeros((_INT + 1, _HID), np.float64),   # wrong first dim
+                    "up": np.zeros((_INT, _HID), np.float64),
+                    "down": np.zeros((_HID, _INT), np.float64)}
+
+    node = _FakeHost([expert0])
+    rejected = []
+    n = N.apply_accepted(node, _BadLane(),
+                         dict(round=0, accepted=[dict(slot=0, cid="x", outer=0.7)]), rejected=rejected)
+    assert n == 0 and rejected and rejected[0].get("reason") == "shape-mismatch"
+    for k in ("gate", "up", "down"):
+        assert np.array_equal(node.read_slot(0)[k], expert0[k].astype(np.float32))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -122,7 +122,10 @@ def add_common_args(ap):
                     help="expert piece id to keep resident; ALL its experts stay resident on every "
                          "node so contributor and coordinator route identically (plan risk 5)")
     ap.add_argument("--device", default=os.environ.get("NEURAHASH_GLM_DEVICE", "cpu"))
-    ap.add_argument("--data-dir", default=os.environ.get("NEURAHASH_GLM_DATA_DIR", "D:/glm_wan"))
+    # MINER-FACING data dir: train + val ONLY. The coordinator's SECRET probe/heldout live in a
+    # separate coordinator-only dir (tools/glm_wan_prep_data.py writes <out>/miner vs <out>/coord),
+    # so this default resolves to a dir a miner can hold and even ship without leaking the gate (F1).
+    ap.add_argument("--data-dir", default=os.environ.get("NEURAHASH_GLM_DATA_DIR", "D:/glm_wan/miner"))
     ap.add_argument("--domains", default=os.environ.get("NEURAHASH_GLM_DOMAINS", "code,gutenberg"),
                     help="one corpus domain per slot (mode=glm); ids_<domain>_<split>.npy")
     ap.add_argument("--warm-steps", type=int, default=int(os.environ.get("NEURAHASH_GLM_WARM", "400")),
@@ -278,6 +281,64 @@ def apply_vram_guard(device, need_gib, log=None):
     return cap_gib
 
 
+def _maybe_start_vram_manager(args, need_gib, log=None):
+    """OPT-IN unified-VRAM path (env NEURAHASH_VRAM_MANAGER). Returns the started VramManager, or
+    None when the flag is OFF -- in which case build_node_model runs the EXISTING apply_vram_guard
+    exactly as today (byte-identical; a live soak is unaffected). The flag is checked BEFORE any
+    import so the OFF path executes only one env lookup and changes nothing.
+
+    When ON, ONE VramManager (neurahash/vram_manager.py) becomes the single source of truth: its
+    apply_cap() replaces the static guard's ceiling (still sized from live FREE VRAM, still honouring
+    the same NEURAHASH_VRAM_CAP_GB/_FRAC knobs), and a daemon thread runs the ~20s adaptive loop that
+    every tick re-caps, re-advertises the sustainable capacity (on_report), and resizes the resident
+    footprint (on_resize) -- all from ONE detect() so the cap, the reported capacity, and the trained
+    footprint can never disagree.
+
+    on_resize DISPOSITION -- SEAM, not a full rebuild: evicting/loading resident MoE layers on the
+    live GlmExpertLaneHost to match new_units is a larger refactor than this opt-in wiring should
+    carry, so on_resize logs the new target and frees the CUDA cache (empty_cache) -- a shrink then
+    actually returns VRAM to the owner -- while the real hosted-layer rebuild is left to a follow-up
+    (PLAN_CHANGE: resident-layer rebuild seam -- GlmExpertLaneHost needs an add/drop-layer API and
+    the coordinator must accept a mid-session capacity change before the footprint can truly shrink)."""
+    if (os.environ.get("NEURAHASH_VRAM_MANAGER", "") or "").strip().lower() not in (
+            "1", "true", "yes", "on", "y"):
+        return None                       # DEFAULT OFF -> caller runs apply_vram_guard unchanged
+    from neurahash.vram_manager import VramManager
+    _log = log or (lambda m: print(m, flush=True))
+    base_gib = float(os.environ.get("NEURAHASH_VRAM_TUNE_BASE_GIB", "4.0"))     # GLM trunk footprint
+    per_unit = float(os.environ.get("NEURAHASH_VRAM_TUNE_PER_UNIT_GIB", "1.125"))  # per resident layer
+    max_units = int(os.environ.get("NEURAHASH_VRAM_AUTOTUNE_MAX_UNITS", "16"))
+    mgr = VramManager.from_env(args.device, base_gib=base_gib, per_unit_gib=per_unit,
+                               max_units=max_units)
+    if mgr is None:                       # flag truthy but from_env declined -> stay on the guard
+        return None
+    mgr.apply_cap()                       # the GUARD, unified: hard ceiling from live free VRAM
+    _log("[vram-manager] ON (unified guard+capacity+tuner): single source of truth = live free VRAM; "
+         "need ~%.2f GiB, base %.2f GiB + %.3f GiB/unit, max %d units" % (need_gib, base_gib, per_unit, max_units))
+
+    def _on_report(cap_units):
+        _log("[vram-manager] re-advertising sustainable capacity = %d resident units (live-free)" % cap_units)
+
+    def _on_resize(old_units, new_units):
+        _log("[vram-manager] resize %d -> %d resident units (SEAM: real layer rebuild is a PLAN_CHANGE)"
+             % (old_units, new_units))
+        try:
+            import torch
+            if str(args.device).startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()  # a shrink actually returns the freed VRAM to the owner
+        except Exception:
+            pass
+
+    import threading
+    stop = threading.Event()
+    th = threading.Thread(target=mgr.run,
+                          kwargs=dict(on_resize=_on_resize, on_report=_on_report, stop_event=stop),
+                          name="vram-manager", daemon=True)
+    th.start()
+    mgr._loop_stop, mgr._loop_thread = stop, th     # keep the loop refs alive on the returned manager
+    return mgr
+
+
 def build_node_model(args, log=None, need_gib=None):
     """Build the node's base model. BOTH roles call this, with the same args, so both hold the same
     weights and (critically, plan risk 5) the same resident expert set -- if a contributor held only
@@ -288,7 +349,11 @@ def build_node_model(args, log=None, need_gib=None):
     torch.set_num_threads(max(1, int(args.threads)))
     if need_gib is None:
         need_gib = GLM_NEED_GIB if args.mode == "glm" else TINY_NEED_GIB
-    apply_vram_guard(args.device, need_gib, log=log)
+    # OPT-IN unified VRAM manager (NEURAHASH_VRAM_MANAGER). OFF (default) -> None -> the EXISTING
+    # apply_vram_guard runs exactly as today (byte-identical). ON -> the manager owns the cap +
+    # the advertised capacity + the ~20s adaptive loop, all off one live-free source of truth.
+    if _maybe_start_vram_manager(args, need_gib, log=log) is None:
+        apply_vram_guard(args.device, need_gib, log=log)
     if args.mode == "tiny":
         model, cfg = G.build_tiny_glm(seed=TINY["seed"], vocab=TINY["vocab"], hidden=TINY["hidden"],
                                       inter=TINY["inter"], moe_inter=TINY["moe_inter"],
@@ -323,21 +388,53 @@ def build_node_model(args, log=None, need_gib=None):
     model.eval()
     if log:
         log("[glm-node] GLM piece %d resident: %s" % (args.piece, summ))
-    seq = int(np.load(_ids_path(args, 0, "heldout"), mmap_mode="r").shape[1])
+    seq = _infer_seq(args)                      # from a split THIS role holds (never the secret one)
     return model, model.config, seq
 
 
-def _ids_path(args, slot, split):
+def _ids_path(args, slot, split, base=None):
+    """Path to a split's id file. `base` overrides args.data_dir -- the coordinator passes its
+    coordinator-only dir (args.coord_data_dir) for the secret probe/heldout splits (F1), so those
+    files are read from a dir that is never present on a miner box."""
     doms = [d.strip() for d in str(args.domains).split(",") if d.strip()]
     dom = doms[int(slot) % len(doms)]
-    return os.path.join(args.data_dir, "ids_%s_%s.npy" % (dom, split))
+    root = base if base is not None else args.data_dir
+    return os.path.join(root, "ids_%s_%s.npy" % (dom, split))
 
 
 def node_ids(args, slot, split):
-    """Split loader that both roles share: real .npy in mode=glm, deterministic Markov in mode=tiny."""
+    """MINER-FACING split loader both roles share for train/val: real .npy in mode=glm (from the
+    miner-facing --data-dir), deterministic Markov in mode=tiny. The coordinator's SECRET splits
+    (probe/heldout) go through coord_secret_ids instead so they are never sought in the miner dir."""
     if args.mode == "tiny":
         return tiny_ids(split, slot=slot)
     return np.load(_ids_path(args, slot, split))
+
+
+def coord_secret_ids(args, slot, split):
+    """COORDINATOR-ONLY split loader for probe/heldout (F1). In mode=glm these live in the
+    coordinator-only dir (args.coord_data_dir, default <out>/coord), which is NEVER shipped to a
+    miner; in mode=tiny they are the deterministic Markov draw (no files, no secrecy risk on a
+    single box). Only the coordinator process defines coord_data_dir and calls this."""
+    if args.mode == "tiny":
+        return tiny_ids(split, slot=slot)
+    base = getattr(args, "coord_data_dir", None)
+    return np.load(_ids_path(args, slot, split, base=base))
+
+
+def _infer_seq(args):
+    """Sequence length from whatever split this role actually holds. The miner-facing 'val' is
+    present on every box; fall back to the coordinator-only 'heldout' for a coordinator box that
+    kept only <out>/coord. Avoids reading a SECRET split on a miner box (F1: the old code read
+    'heldout' from --data-dir, which no longer contains it)."""
+    cands = [_ids_path(args, 0, "val")]
+    coord = getattr(args, "coord_data_dir", None)
+    if coord:
+        cands.append(_ids_path(args, 0, "heldout", base=coord))
+    for p in cands:
+        if os.path.exists(p):
+            return int(np.load(p, mmap_mode="r").shape[1])
+    raise SystemExit("[glm-node] cannot infer seq length: none of these split files exist: %s" % cands)
 
 
 # ================================================================================ base fingerprints
@@ -373,12 +470,31 @@ def base_digest(model, max_numel=50_000_000):
     return h.hexdigest()
 
 
-def apply_accepted(host, lane, record, log=None):
+def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None):
     """Replay the coordinator's merge locally: for each accepted delta, in the coordinator's order,
     base += outer*delta. The delta is re-FETCHED BY CID from the lane, so the contributor applies the
     exact fp16-roundtripped bytes the coordinator gated on (bit-identical to
-    diloco_merge.apply_delta_gated:484)."""
+    diloco_merge.apply_delta_gated:484).
+
+    LOCAL RE-GATE (F2 defense-in-depth). The round pointer and this ACCEPTED record ride an UNSIGNED
+    lane whose PUT token is a shared public demo token, so a malicious miner can forge an accepted
+    record + a matching state_cid and push an ungated delta into every replica. There is no pinned
+    coordinator key to verify against yet (that needs an owner key decision -- see the module notes),
+    so instead of trusting the coordinator blindly, each fetched delta is RE-GATED on a LOCAL held-out
+    split before it is folded in:
+      * ce_fn : optional callable ce_fn(host) -> float = the model's held-out CE right now. The live
+                contributor passes one closing over its OWN val split (the coordinator's SECRET
+                probe/heldout never ship to a miner box, F1, so 'local held-out' here is the miner's
+                val). A delta is folded only if it does NOT raise that CE by more than `tol`; a delta
+                that regresses is UNFOLDED (slot restored exactly) and appended to `rejected`.
+      * tol   : absolute CE regression allowed per delta. None -> a deliberately LOOSE floor
+                max(0.05*|base_ce|, 0.05) -- this catches poisoning (a garbage delta moves held-out
+                CE by >>5%), not the marginal interference the coordinator's own merge-gate handles.
+    When ce_fn is None the replay is UNCONDITIONAL and bit-identical to the coordinator's merge (the
+    model_root replication invariant the pointer asserts each round, and what the unit test checks).
+    Returns the count of deltas actually FOLDED (a rejected delta is not counted)."""
     n = 0
+    base_ce = ce_fn(host) if ce_fn is not None else None
     for item in record.get("accepted", []):
         slot = int(item["slot"])
         outer = float(item.get("outer", 0.7))
@@ -390,7 +506,29 @@ def apply_accepted(host, lane, record, log=None):
         if _G().is_lora_payload(d):
             d = _G().materialize_from_lora(d)
         cur = host.read_slot(slot)
-        host.write_slot(slot, {k: cur[k] + outer * d[k] for k in cur if k in d})
+        # Shape guard (defense-in-depth): a delta whose keys/shapes do not match the slot cannot be
+        # folded -- skip it rather than broadcast-corrupt the weights. For a legit accepted delta all
+        # three keys match (the coordinator shape-gated it, F8), so this never fires on the happy path.
+        if not all(k in d and np.shape(d[k]) == np.shape(cur[k]) for k in cur):
+            if rejected is not None:
+                rejected.append(dict(item, reason="shape-mismatch"))
+            if log:
+                log("[glm-node] REJECTED accepted delta for slot %d: shape mismatch vs resident" % slot)
+            continue
+        host.write_slot(slot, {k: cur[k] + outer * d[k] for k in cur})
+        if ce_fn is not None:
+            new_ce = ce_fn(host)
+            allow = tol if tol is not None else max(0.05 * abs(base_ce), 0.05)
+            if new_ce > base_ce + allow:
+                host.write_slot(slot, cur)                   # UNFOLD: restore the slot exactly
+                if rejected is not None:
+                    rejected.append(dict(item, base_ce=float(base_ce), new_ce=float(new_ce)))
+                if log:
+                    log("[glm-node] REJECTED accepted delta for slot %d: local held-out CE "
+                        "%.5f -> %.5f (> +%.5f) -- forged/poisoned accepted record?"
+                        % (slot, base_ce, new_ce, allow))
+                continue
+            base_ce = new_ce                                 # accepted -> advance the running baseline
         n += 1
     if log:
         log("[glm-node] applied %d accepted delta(s) for round %s" % (n, record.get("round")))
@@ -439,6 +577,11 @@ def main(argv=None):
     ap.add_argument("--inner", type=int, default=int(os.environ.get("NEURAHASH_GLM_INNER", "60")),
                     help="H local LoRA steps per outer round (the anti-flap core: zero cross-miner comm)")
     ap.add_argument("--lora-r", type=int, default=int(os.environ.get("NEURAHASH_GLM_R", "16")))
+    ap.add_argument("--outer", type=float, default=float(os.environ.get("NEURAHASH_SD_OUTER", "0.7")),
+                    help="LoRA strength the coordinator gates + MERGES at (base += outer*delta). F5: the "
+                         "contributor SELECTS its save-best adapter at THIS same strength so best_val_ce "
+                         "predicts the gate. MUST match the coordinator's --outer (shared "
+                         "NEURAHASH_SD_OUTER default 0.7).")
     ap.add_argument("--lr", type=float, default=float(os.environ.get("NEURAHASH_GLM_LR", "3e-3")))
     ap.add_argument("--batch", type=int, default=int(os.environ.get("NEURAHASH_GLM_BATCH", "16")),
                     help="B=4 on the 4060 (plan sec 1: vocab 154880 log_softmax is ~1.2 GiB at B=48)")
@@ -511,12 +654,24 @@ def main(argv=None):
             continue
 
         # ---- replay every merge that happened since our last round, so our base == coordinator's ----
+        # RE-GATE each replayed delta on our LOCAL val split (F2 defense-in-depth): the pointer +
+        # accepted record are UNSIGNED on a shared-token lane, so a forged record could push an
+        # ungated delta into every replica. We refuse to fold one that regresses our held-out CE.
+        regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
         for r in range(applied + 1, rnd):
             rec = fetch_accepted(lane, r, timeout=args.round_wait, poll=args.poll)
             if rec is None:
                 _flush("[glm-contrib %s] FATAL: accepted record for round %d never appeared" % (miner, r))
                 return 6
-            apply_accepted(host, lane, rec)
+            rejected = []
+            apply_accepted(host, lane, rec, log=_flush, ce_fn=regate_ce, rejected=rejected)
+            if rejected:
+                _flush("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at round %d "
+                       "(regressed local held-out CE or mismatched shape). The pointer + accepted "
+                       "record ride an UNSIGNED shared-token lane, so this looks like a forged/"
+                       "poisoned record -- refusing to fold it and aborting rather than training on a "
+                       "poisoned base." % (miner, len(rejected), r))
+                return 8
             applied = r
         root = model_root(host)
         if not args.garbage and ptr.get("state_cid") and ptr["state_cid"] != root:
@@ -535,7 +690,7 @@ def main(argv=None):
         else:
             c = G.train_glm_expert_contribution(
                 model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
-                batch=args.batch, seed=rnd * 100 + i)
+                batch=args.batch, seed=rnd * 100 + i, sel_outer=args.outer)   # F5: select at the gate outer
             delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
             # WIRE: ship the LoRA FACTORS, not their materialised product. The dense delta IS
             # scale*(B@A), so the factors carry identical information in 67.7x fewer bytes

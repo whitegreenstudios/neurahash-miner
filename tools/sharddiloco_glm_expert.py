@@ -190,6 +190,41 @@ def is_lora_payload(d):
     return bool(d) and "lora_B_gu" in d
 
 
+def validate_lora_factors(payload, I, H, max_rank=512):
+    """Check an attacker-controlled LoRA-factor payload against the RESIDENT expert dims BEFORE it is
+    fed to the float64 outer product in materialize_from_lora (F8). The payload arrives over the
+    shared-token lane; its body size is bounded by content_store's MAX_BODY but its SHAPES are not,
+    so a hostile record could otherwise drive a large or dimension-mismatched matmul on the
+    coordinator (and, once materialised, a delta that does not even align with the slot it targets).
+
+    For a resident expert with dense dims gate:[I,H], up:[I,H], down:[H,I], the only well-formed
+    factors are A_gu:[r,H], B_gu:[2I,r], A_d:[r,I], B_d:[H,r], scale:[>=1]. Returns (ok, reason).
+    """
+    if not is_lora_payload(payload):
+        return False, "not a LoRA-factor payload"
+    try:
+        A_gu = np.asarray(payload["lora_A_gu"])
+        B_gu = np.asarray(payload["lora_B_gu"])
+        A_d = np.asarray(payload["lora_A_d"])
+        B_d = np.asarray(payload["lora_B_d"])
+        scale = np.asarray(payload["lora_scale"]).reshape(-1)
+    except Exception as ex:                                        # noqa: BLE001
+        return False, "malformed factor array (%s)" % ex
+    if any(a.ndim != 2 for a in (A_gu, B_gu, A_d, B_d)):
+        return False, "a LoRA factor is not 2-D"
+    if scale.size < 1:
+        return False, "empty lora_scale"
+    r = int(A_gu.shape[0])
+    if not (1 <= r <= int(max_rank)):
+        return False, "rank r=%d out of [1,%d]" % (r, max_rank)
+    want = {"lora_A_gu": (r, H), "lora_B_gu": (2 * I, r), "lora_A_d": (r, I), "lora_B_d": (H, r)}
+    got = {"lora_A_gu": A_gu.shape, "lora_B_gu": B_gu.shape, "lora_A_d": A_d.shape, "lora_B_d": B_d.shape}
+    for k, exp in want.items():
+        if tuple(got[k]) != tuple(exp):
+            return False, "%s shape %s != expected %s (resident I=%d H=%d)" % (k, got[k], exp, I, H)
+    return True, "ok"
+
+
 def lora_factors_payload(le, E):
     """The contribution as LoRA FACTORS instead of their materialised product.
 
@@ -403,12 +438,19 @@ class GlmExpertLaneHost:
 
 # ================================================================= contributor: train one GLM expert
 def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120, r=16, alpha=None,
-                                   lr=3e-3, batch=48, meter=None, seed=0):
+                                   lr=3e-3, batch=48, meter=None, seed=0, sel_outer=0.7):
     """CONTRIBUTOR local step for GLM expert (L,E): attach a per-expert LoRA (the built GLM path), train
     only that LoRA for up to H inner steps on the node's train shard, SAVE-BEST on the node's PUBLIC val
     (memory moe-capability-gain: LR small, fp32, save-best), then materialize the canonical {gate,up,down}
     weight delta = scale*(B@A). The base fused weights are FROZEN and untouched, so the delta is purely
-    the contribution. Returns {delta (numpy float32), train_flops, n_examples, best_val_ce}."""
+    the contribution. Returns {delta (numpy float32), train_flops, n_examples, best_val_ce}.
+
+    F5 -- PREDICTABLE ACCEPTANCE. The coordinator GATES + MERGES the uploaded adapter at LoRA strength
+    `outer` (base += outer*delta; default 0.7), but this SAVE-BEST selection used to evaluate at the
+    LoRAExperts default strength 1.0, so the miner's own best_val_ce could not predict the gate. The
+    selection/evaluation now runs at `sel_outer` (thread the coordinator's --outer here; default 0.7)
+    while TRAINING stays at full strength (le.outer=1.0) -- only the metric the miner selects on aligns
+    with what the coordinator will actually apply."""
     import torch
     if alpha is None:
         alpha = 2 * r
@@ -437,8 +479,21 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
             for n, v in s.items():
                 getattr(le, n)[str(E)].copy_(v)
 
+    def _sel_val():
+        # F5: SELECT save-best at the SAME LoRA strength the coordinator gates + merges at
+        # (`sel_outer`, default 0.7), NOT the training strength (le.outer=1.0). The miner uploads a
+        # full-strength adapter that the coordinator applies as base += sel_outer*delta, so a snapshot
+        # best at 1.0 need not be best at 0.7; selecting at 1.0 made best_val_ce unable to predict the
+        # gate. Only the SELECTION metric aligns -- training below stays at full strength.
+        prev = le.outer
+        le.outer = float(sel_outer)
+        try:
+            return heldout_ce(model, val_ids)
+        finally:
+            le.outer = prev
+
     fwd = glm_fwd_flops_per_example(cfg, train_ids.shape[1])
-    best_val, best_snap = heldout_ce(model, val_ids), _snap()
+    best_val, best_snap = _sel_val(), _snap()
     n_ex = 0
     for step in range(1, H + 1):
         idx = np.random.default_rng(1000 + seed * 7919 + step).integers(0, len(train_ids), size=batch)
@@ -452,7 +507,7 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
         if meter is not None:
             meter.add_train(len(ids))
         if step % 8 == 0:
-            v = heldout_ce(model, val_ids)
+            v = _sel_val()
             if v < best_val:
                 best_val, best_snap = v, _snap()
     _restore(best_snap)
@@ -536,7 +591,7 @@ def run_smoke(seed=1, verbose=True):
     for i, (L, E) in enumerate(slots):
         key = ("miner%d-secret-key" % i).encode()
         c = train_glm_expert_contribution(model, cfg, L, E, train, val, H=120, r=16, lr=3e-3,
-                                          meter=meter, seed=i)
+                                          meter=meter, seed=i, sel_outer=0.7)   # match the merge outer below
         host.write_slot(i, experts[i])            # ensure model back at canonical after training
         cid = lane.put(c["delta"])                # content-address (sha256 over fp16 wire)
         sig = lane.sign(key, cid, RND, "miner%d" % i)

@@ -8,14 +8,23 @@ is NOT a language number, so it cannot serve as the goal metric for a real-model
 produces genuine GLM-tokenized text so the held-out CE the coordinator reports means something.
 
 SPLIT DISCIPLINE (mirrors `sharddiloco_harness.domain_splits`): four DISJOINT row sets per domain.
-  train   - the miner trains on this
-  val     - the miner's own save-best signal (public to the miner)
-  probe   - the COORDINATOR's secret gate pool; a miner never sees it (dm.SecretRotatedProbe
-            draws a fresh subset each round, so fitting the probe is not available even to a
-            miner who somehow obtained it)
-  heldout - the reported goal metric; touched by nothing else
+  train   - the miner trains on this          -> MINER-FACING dir (<out>/miner)
+  val     - the miner's own save-best signal   -> MINER-FACING dir (<out>/miner), public to the miner
+  probe   - the COORDINATOR's secret gate pool -> COORDINATOR-ONLY dir (<out>/coord)
+  heldout - the reported goal metric           -> COORDINATOR-ONLY dir (<out>/coord)
 Rows are chunked contiguously and then the four ranges are carved out by index, so no row can
 appear in two splits and no token overlaps a boundary.
+
+PROBE-POOL SECRECY IS A HARD OPERATIONAL REQUIREMENT. The per-round rotation (dm.SecretRotatedProbe
+draws a fresh subset each round) does NOT protect against a miner who obtains the whole probe POOL:
+that miner can simply train on the entire pool, a superset of every per-round draw, and the gate is
+defeated -- re-creating this project's "verified != useful" disaster. The probe and heldout id files
+must therefore NEVER be shipped to a miner box. They are written to a SEPARATE coordinator-only
+subdir (<out>/coord) that lives ONLY on the coordinator box; only <out>/miner (train+val) is ever
+copied to a miner. Do not ship the <out> root either -- ship <out>/miner. tools/
+sharddiloco_glm_contributor.py's default --data-dir is <out>/miner precisely so the natural
+"ship my data dir" action carries no secret split; the coordinator reads probe/heldout from
+--coord-data-dir (<out>/coord).
 
 ONE DOMAIN PER EXPERT SLOT. GLM routes with its OWN learned router -- there is no offline
 domain-routing here as there is in the toy harness -- so expert specialisation has to come from
@@ -41,9 +50,11 @@ DEFAULT_OUT = r"D:\glm_wan"
 
 # rows per split, in carve order
 SPLITS = (("train", 4096), ("val", 512), ("probe", 512), ("heldout", 1024))
+# splits that must NEVER reach a miner box -> written to the coordinator-only subdir (F1)
+COORD_ONLY = frozenset({"probe", "heldout"})
 
 
-def build_domain(tok, text, seq, out_dir, domain, vocab_size):
+def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size):
     ids = tok(text, add_special_tokens=False)["input_ids"]
     n_rows_needed = sum(n for _, n in SPLITS)
     have = len(ids) // seq
@@ -59,7 +70,10 @@ def build_domain(tok, text, seq, out_dir, domain, vocab_size):
     for name, n in SPLITS:
         part = arr[off:off + n]
         off += n
-        path = os.path.join(out_dir, "ids_%s_%s.npy" % (domain, name))
+        # probe + heldout are the coordinator's SECRET gate pool + goal metric: they land in a
+        # coordinator-only dir that is never shipped to a miner (F1). train + val are miner-facing.
+        dst = coord_dir if name in COORD_ONLY else miner_dir
+        path = os.path.join(dst, "ids_%s_%s.npy" % (domain, name))
         np.save(path, part)
         written.append((name, part.shape, path))
     return arr, written, off
@@ -76,7 +90,12 @@ def main():
                     help="chars read per domain (bounds tokenizer time; 6M >> the ~800KB needed)")
     args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    # MINER-FACING vs COORDINATOR-ONLY split of the output tree (F1). Only <out>/miner is ever
+    # shipped to a miner; <out>/coord (probe + heldout) stays on the coordinator box.
+    miner_dir = os.path.join(args.out_dir, "miner")
+    coord_dir = os.path.join(args.out_dir, "coord")
+    os.makedirs(miner_dir, exist_ok=True)
+    os.makedirs(coord_dir, exist_ok=True)
     from transformers import AutoConfig, AutoTokenizer          # noqa: E402  (after offline env)
 
     cfg = AutoConfig.from_pretrained(args.tokenizer_dir, local_files_only=True,
@@ -91,11 +110,13 @@ def main():
             raise SystemExit("missing corpus file: " + src)
         with open(src, "r", encoding="utf-8", errors="replace") as f:
             text = f.read(args.max_chars)
-        arr, written, used = build_domain(tok, text, args.seq, args.out_dir, domain, cfg.vocab_size)
+        arr, written, used = build_domain(tok, text, args.seq, miner_dir, coord_dir, domain,
+                                          cfg.vocab_size)
         print("\n[%s] %s -> %d chars -> %d rows of %d tokens (used %d rows)"
               % (domain, src, len(text), arr.shape[0], args.seq, used))
         for name, shape, path in written:
-            print("   %-8s %-12s %s" % (name, str(shape), path))
+            tag = "COORD-ONLY" if name in COORD_ONLY else "miner-facing"
+            print("   %-8s %-12s [%-12s] %s" % (name, str(shape), tag, path))
 
         # disjointness is by construction (contiguous carve); assert it anyway so a future edit
         # that reorders the carve cannot silently leak the heldout set into training.
@@ -107,6 +128,9 @@ def main():
             seen |= set(rng)
             off += n
         print("   splits disjoint: OK (%d rows total, no row in two splits)" % len(seen))
+    print("\nSHIP ONLY: %s  (train + val -- miner-facing)" % miner_dir)
+    print("NEVER SHIP: %s  (probe + heldout -- coordinator's SECRET gate pool + goal metric; a miner"
+          "\n            that obtains these can train on the whole pool and defeat the gate)" % coord_dir)
     return 0
 
 

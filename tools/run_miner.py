@@ -99,6 +99,13 @@ PROVEN_RECIPE = {
 # main()), so moving the lane never requires a code release.
 DEFAULT_MERGE_URL = "http://47.84.93.96:8710"
 DEFAULT_KEY_FILENAME = "miner_key.hex"
+# The PUBLIC demo write token -- the SAME value fleet/esh_worker.py already ships as its --token
+# default and the README documents as "a public demo token committed in the source". The store's
+# write gate is a single shared secret this token opens, so it secures nothing: integrity is still
+# enforced by content-addressing (sha256(body)==path, no overwrite/forge). Defaulting it here makes
+# `run_miner.py` publish with ZERO configuration, exactly like esh_worker -- an explicitly set
+# NEURAHASH_CONTENT_TOKEN still wins (use a private relay's token).
+DEFAULT_CONTENT_TOKEN = "2802648a1e87b4b3c6ca6da2688b4308"
 
 
 def apply_zero_config_defaults(work_dir):
@@ -107,9 +114,10 @@ def apply_zero_config_defaults(work_dir):
     Returns a list of "NAME=value" strings for the ones this call actually defaulted (for the banner),
     so the miner can see what it picked rather than having it happen invisibly.
 
-    NEVER overwrites an existing value and NEVER invents a credential: NEURAHASH_CONTENT_TOKEN is
-    deliberately absent here, because a shared write secret baked into the client is exactly what the
-    per-miner signed-PUT work replaces.
+    NEVER overwrites an existing value: an explicitly set env var always wins. NEURAHASH_CONTENT_TOKEN
+    defaults to the PUBLIC demo token (the same value esh_worker ships) so a stranger publishes with
+    ZERO setup -- it secures nothing (see DEFAULT_CONTENT_TOKEN), and a private relay's token still
+    overrides it.
 
     MEASURED 2026-07-21, why the key default matters: a public run WITHOUT it published a delta that
     landed in the registry as `signed: False`. An unsigned contribution cannot be attributed to a
@@ -120,6 +128,9 @@ def apply_zero_config_defaults(work_dir):
     if not os.environ.get("NEURAHASH_DILOCO_MERGE_URL", "").strip():
         os.environ["NEURAHASH_DILOCO_MERGE_URL"] = DEFAULT_MERGE_URL
         applied.append("NEURAHASH_DILOCO_MERGE_URL=" + DEFAULT_MERGE_URL)
+    if not os.environ.get("NEURAHASH_CONTENT_TOKEN", "").strip():
+        os.environ["NEURAHASH_CONTENT_TOKEN"] = DEFAULT_CONTENT_TOKEN
+        applied.append("NEURAHASH_CONTENT_TOKEN=<public demo token>")
     if not os.environ.get("NEURAHASH_MINER_KEY", "").strip():
         # The child (diloco_contributor._miner_account) CREATES this file on first use if absent, so
         # pointing at a path inside the work dir is enough to give a stranger a stable signed identity

@@ -52,13 +52,15 @@ python tools/run_miner.py --once
   RTX 5090 + RTX 4060: base fetched outbound from HuggingFace, real corpus synced **by hash over
   WAN** (`--sync-corpus`), signed delta published over WAN.
 - `--once` runs a single fetch → train → publish cycle then exits; drop it to loop forever.
-- With no publish infra configured the miner runs in **LOCAL mode**: it still trains and keeps the
-  compressed delta on disk (so you can smoke-test), and prints how to go live — it never crashes for
-  lack of infra. To PUBLISH you need **all three**: `NEURAHASH_DILOCO_MERGE_URL`,
-  `NEURAHASH_CONTENT_TOKEN` (the registry write token, sent as the `X-Auth` header — without it the
-  registry PUT returns HTTP 401 even though the pin succeeds; ask a maintainer for one), **and** a
-  pinning backend (`PINATA_JWT` / `PINATA_JWT_FILE`, or a local `ipfs`/kubo daemon). The miner reports
-  which one is missing instead of claiming LIVE and failing on publish.
+- **Publishing to EARN is zero-config (2026-07-22).** `run_miner.py` auto-defaults everything needed
+  to go live — no env vars, no token to request: the merge registry URL, a per-machine signing key
+  (created on first run), **and** the public demo write token (`NEURAHASH_CONTENT_TOKEN`, the same
+  value `esh_worker` ships; it opens the shared store but secures nothing, since integrity is enforced
+  by content-addressing). A pinning backend is auto-installed (a pinned, digest-verified kubo) when you
+  have neither `PINATA_JWT` nor a local `ipfs`. So a bare `python tools/run_miner.py --once` fetches,
+  trains, **and** publishes. Any explicit value you set (e.g. a private relay's token) always wins; if
+  a backend genuinely can't be reached the miner stays in **LOCAL mode** (trains + keeps the delta on
+  disk) and names what's missing instead of crashing.
 - Other flags: `--device cuda|cpu` (default `cuda`), `--base qwen3-0.6b`, `--steps N`,
   `--wallet <name-or-keypath>`. First cold-start downloads the base weights from HuggingFace (~1.2 GB)
   via `tools/make_base_from_hf.py`. Set `NEURAHASH_MINER_KEY=<path>` to sign your contributions (GAP1).

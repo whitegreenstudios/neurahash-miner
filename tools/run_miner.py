@@ -529,13 +529,16 @@ def main():
                          "default: a hostname-derived id")
     ap.add_argument("--base", default="qwen3-0.6b", help="base model key (NEURAHASH_BASE)")
     ap.add_argument("--steps", type=int, default=200, help="inner training steps per contribution")
-    ap.add_argument("--lr", type=float, default=3e-4, help="contributor local-SGD learning rate")
+    ap.add_argument("--lr", type=float, default=1e-5,
+                    help="contributor local-SGD learning rate (default 1e-5; a higher lr such as the "
+                         "old 3e-4 default destroys this 0.6B base -- held-out CE worsens every run)")
     ap.add_argument("--device", default="cuda", help="training device: cuda (default) or cpu")
     ap.add_argument("--interval", type=int, default=30,
                     help="seconds to sleep between iterations (ignored with --once)")
     ap.add_argument("--once", action="store_true", help="run a single iteration then exit (testing)")
-    ap.add_argument("--work-dir", default="D:/aiCrypto_work/run_miner",
-                    help="scratch dir for the base + contribution + compressed delta")
+    ap.add_argument("--work-dir", default=os.path.join(os.path.expanduser("~"), ".neurahash", "run_miner"),
+                    help="scratch dir for the base + contribution + compressed delta "
+                         "(default: ~/.neurahash/run_miner)")
     ap.add_argument("--base-source", default=None,
                     help="explicit base: a checkpoint path, IPFS CID, or tracker URL "
                          "(wins over any local/cold-start base)")

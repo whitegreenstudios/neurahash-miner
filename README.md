@@ -41,11 +41,16 @@ the trunk locally, and publishes a small (<10 MB) signed, compressed delta outbo
 
 ```bash
 pip install -r requirements.txt
-python tools/run_miner.py --once --lr 1e-5
+python tools/run_miner.py --once
 ```
 
-- **`--lr 1e-5` is mandatory.** The argument default (`3e-4`) destroys the base model — always pass
-  `--lr 1e-5`.
+- **Safe defaults (2026-07-22).** `--lr` now defaults to **`1e-5`** — the value that actually
+  improves the base (verified same-seed: held-out CE `3.1936 → 2.8949`). The old `3e-4` default
+  *destroyed* the base (`3.1936 → 6.4395`, 5/5 seeds), so a higher `--lr` remains a footgun — don't
+  raise it. `--work-dir` now defaults to a portable `~/.neurahash/run_miner` (it previously
+  hard-coded a maintainer-only absolute path). Proven this day in a fresh-clone WAN test on an
+  RTX 5090 + RTX 4060: base fetched outbound from HuggingFace, real corpus synced **by hash over
+  WAN** (`--sync-corpus`), signed delta published over WAN.
 - `--once` runs a single fetch → train → publish cycle then exits; drop it to loop forever.
 - With no publish infra configured the miner runs in **LOCAL mode**: it still trains and keeps the
   compressed delta on disk (so you can smoke-test), and prints how to go live — it never crashes for

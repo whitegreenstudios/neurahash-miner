@@ -470,7 +470,7 @@ def base_digest(model, max_numel=50_000_000):
     return h.hexdigest()
 
 
-def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None):
+def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None, own_slot=None):
     """Replay the coordinator's merge locally: for each accepted delta, in the coordinator's order,
     base += outer*delta. The delta is re-FETCHED BY CID from the lane, so the contributor applies the
     exact fp16-roundtripped bytes the coordinator gated on (bit-identical to
@@ -490,11 +490,18 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
       * tol   : absolute CE regression allowed per delta. None -> a deliberately LOOSE floor
                 max(0.05*|base_ce|, 0.05) -- this catches poisoning (a garbage delta moves held-out
                 CE by >>5%), not the marginal interference the coordinator's own merge-gate handles.
+      * own_slot : the lane slot index this contributor is ASSIGNED to TRAIN (its single domain).
+                The local re-gate is a valid signal ONLY for this slot; an accepted delta for any
+                OTHER slot is CROSS-DOMAIN and is folded UNCONDITIONALLY on the coordinator's signed
+                accept. This node holds the FULL resident expert set but trains only its own domain,
+                so it provably cannot judge another domain on its own val -- folding slot 1's
+                gutenberg delta worsens a slot-0 code node's code val, a FALSE positive that used to
+                self-abort the whole replica (rc 8). None -> legacy re-gate-EVERY-slot behaviour.
     When ce_fn is None the replay is UNCONDITIONAL and bit-identical to the coordinator's merge (the
     model_root replication invariant the pointer asserts each round, and what the unit test checks).
     Returns the count of deltas actually FOLDED (a rejected delta is not counted)."""
     n = 0
-    base_ce = ce_fn(host) if ce_fn is not None else None
+    own = None if own_slot is None else int(own_slot)
     for item in record.get("accepted", []):
         slot = int(item["slot"])
         outer = float(item.get("outer", 0.7))
@@ -515,8 +522,17 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
             if log:
                 log("[glm-node] REJECTED accepted delta for slot %d: shape mismatch vs resident" % slot)
             continue
+        # F2 local re-gate applies ONLY to the delta for THIS node's OWN trained slot, where its
+        # single-domain val is a valid signal. A cross-domain accepted delta (any OTHER slot) is
+        # folded UNCONDITIONALLY on the coordinator's signed accept: this node trains only its own
+        # domain and provably cannot judge another domain on its own val -- re-gating slot 1's
+        # gutenberg delta on a slot-0 code node's code val is a FALSE positive that self-aborted the
+        # replica (rc 8). base_ce is measured fresh right before the own-slot fold (i.e. AFTER any
+        # cross-domain folds this round), so the check reflects only the own delta's effect.
+        regate = ce_fn is not None and (own is None or slot == own)
+        base_ce = ce_fn(host) if regate else None
         host.write_slot(slot, {k: cur[k] + outer * d[k] for k in cur})
-        if ce_fn is not None:
+        if regate:
             new_ce = ce_fn(host)
             allow = tol if tol is not None else max(0.05 * abs(base_ce), 0.05)
             if new_ce > base_ce + allow:
@@ -528,7 +544,6 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
                         "%.5f -> %.5f (> +%.5f) -- forged/poisoned accepted record?"
                         % (slot, base_ce, new_ce, allow))
                 continue
-            base_ce = new_ce                                 # accepted -> advance the running baseline
         n += 1
     if log:
         log("[glm-node] applied %d accepted delta(s) for round %s" % (n, record.get("round")))
@@ -654,9 +669,12 @@ def main(argv=None):
             continue
 
         # ---- replay every merge that happened since our last round, so our base == coordinator's ----
-        # RE-GATE each replayed delta on our LOCAL val split (F2 defense-in-depth): the pointer +
-        # accepted record are UNSIGNED on a shared-token lane, so a forged record could push an
-        # ungated delta into every replica. We refuse to fold one that regresses our held-out CE.
+        # RE-GATE the delta for OUR OWN trained slot on our LOCAL val split (F2 defense-in-depth): the
+        # pointer + accepted record are UNSIGNED on a shared-token lane, so a forged record could push
+        # an ungated delta into every replica. We refuse to fold one that regresses our held-out CE.
+        # Cross-domain deltas (OTHER slots) are folded on the coordinator's signed accept -- our
+        # single-domain val cannot judge another node's domain, so re-gating them there false-positive
+        # rejected legitimate accepts and self-aborted this replica (own_slot=i scopes the check).
         regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
         for r in range(applied + 1, rnd):
             rec = fetch_accepted(lane, r, timeout=args.round_wait, poll=args.poll)
@@ -664,7 +682,7 @@ def main(argv=None):
                 _flush("[glm-contrib %s] FATAL: accepted record for round %d never appeared" % (miner, r))
                 return 6
             rejected = []
-            apply_accepted(host, lane, rec, log=_flush, ce_fn=regate_ce, rejected=rejected)
+            apply_accepted(host, lane, rec, log=_flush, ce_fn=regate_ce, rejected=rejected, own_slot=i)
             if rejected:
                 _flush("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at round %d "
                        "(regressed local held-out CE or mismatched shape). The pointer + accepted "

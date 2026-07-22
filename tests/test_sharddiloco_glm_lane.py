@@ -325,5 +325,49 @@ def test_apply_accepted_regate_rejects_shape_mismatch():
         assert np.array_equal(node.read_slot(0)[k], expert0[k].astype(np.float32))
 
 
+def test_apply_accepted_regate_scoped_to_own_trained_slot():
+    """F2 fix (live bug 2026-07-22): the local-val re-gate is a valid signal ONLY for the contributor's
+    OWN trained slot. A node holds the FULL resident expert set but trains ONE domain; folding another
+    slot's legitimate ACCEPTED cross-domain delta worsens its single-domain val -- a FALSE positive
+    that used to self-abort the whole replica (rc 8, contributor couldn't stay in sync). Cross-domain
+    deltas must be folded on the coordinator's signed accept; only an OWN-slot delta that regresses
+    local val is still rejected."""
+    expert0 = _glm_shaped_delta(seed=21, scale=1.0)          # slot 0 = THIS node's TRAINED domain (code)
+    expert1 = _glm_shaped_delta(seed=22, scale=1.0)          # slot 1 = another domain, resident-only
+
+    # --- cross-domain (slot 1) accepted delta: FOLD IN even though local val would REJECT it ---
+    d1 = H.pack_arrays(_glm_shaped_delta(seed=23, scale=1.0), np.float16)
+    cid1 = H.cid_of(d1)
+    node = _FakeHost([expert0, expert1])
+    calls = {"n": 0}
+
+    def worsening_ce(h):                                     # any call would trip the +tol reject
+        calls["n"] += 1
+        return 1.0 + calls["n"]                             # strictly increasing -> pure regression
+
+    rejected = []
+    n = N.apply_accepted(node, _FakeLane({cid1: d1}),
+                         dict(round=0, accepted=[dict(miner="m1", slot=1, cid=cid1, outer=0.7)]),
+                         ce_fn=worsening_ce, tol=0.0, rejected=rejected, own_slot=0)
+    assert n == 1 and rejected == []                         # folded, NO local reject, NO rc-8 abort
+    assert calls["n"] == 0                                   # local val NEVER consulted for a cross slot
+    assert not np.array_equal(node.read_slot(1)["gate"], expert1["gate"].astype(np.float32))  # slot1 moved
+    for k in ("gate", "up", "down"):
+        assert np.array_equal(node.read_slot(0)[k], expert0[k].astype(np.float32)), k          # slot0 intact
+
+    # --- OWN slot (slot 0) accepted delta that regresses local val: STILL REJECTED (unfolded) ---
+    d0 = H.pack_arrays(_glm_shaped_delta(seed=24, scale=1.0), np.float16)
+    cid0 = H.cid_of(d0)
+    node2 = _FakeHost([expert0, expert1])
+    seq = iter([1.0, 2.0])                                   # base 1.0 -> merged 2.0 => regression
+    rejected2 = []
+    n2 = N.apply_accepted(node2, _FakeLane({cid0: d0}),
+                          dict(round=1, accepted=[dict(miner="m0", slot=0, cid=cid0, outer=0.7)]),
+                          ce_fn=lambda h: next(seq), tol=0.0, rejected=rejected2, own_slot=0)
+    assert n2 == 0 and len(rejected2) == 1                   # own-domain regression -> rejected as before
+    for k in ("gate", "up", "down"):
+        assert np.array_equal(node2.read_slot(0)[k], expert0[k].astype(np.float32)), k          # unfolded
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

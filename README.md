@@ -215,3 +215,32 @@ hanging your machine. The static VRAM cap (`NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_
 hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory rather than total. Opt-in,
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
+
+## Alpha 2.0 (2026-07-24) — truly decoupled, self-syncing corpus, trustless-settled
+
+**Status (2026-07-24, shipped as the signed `v2.0.0` auto-update — you are reading this because your
+client can pull it).** Three things landed on the shardDiLoCo lane, all proven live on an RTX 5090 +
+RTX 4060 training over the real internet as fresh stranger clones, then a 12-hour soak that settled
+141 real mints through the quorum with zero withheld and zero errors:
+
+- **Truly decoupled (#146).** The lane no longer makes a fast GPU wait for a slow one: each expert
+  slot advances on **its own event clock** (DeepMind Decoupled-DiLoCo style, quorum K=1). Measured on
+  the pair, the 5090 went from ~33 rounds/hr (old lock-step) to **~60**, while the 4060 ran free at its
+  own ~36 — the fast card is never barriered on the slow one again. Behind `NEURAHASH_SD_ASYNC`;
+  default-off and byte-identical on today's synchronous lanes.
+- **Corpus auto-sync.** You no longer stage the corpus by hand: the coordinator advertises a **sha256
+  manifest**, and the miner auto-downloads any missing/mismatched file (HuggingFace CDN first) and
+  **verifies it fail-closed** before training. Proven: both boxes started with empty data dirs and
+  self-filled over WAN. The coordinator's secret probe/held-out splits are structurally excluded.
+- **Trustless settlement on the training lane.** Every training payout now settles through the same
+  **staked M-of-N quorum trust root** — a mint is credited only if a majority of staked validators
+  co-sign it, else it is withheld. Proven live: real GPU-trained mints settled with a quorum hash, and
+  a **forged (inflated) mint was refused by the validator majority and left no ledger entry.**
+  Default-off (`NEURAHASH_GLM_QUORUM`); the coordinator/settlement side lives in the full node package.
+
+Together with the signed self-update the miner already had: **auto-update + auto-corpus + decoupled
+GPU/WAN training + trustless settlement**, all in one lane.
+
+*Alpha 1.0 (`v1.0.0`, 2026-07-21) is the baseline this builds on:* proven signed self-update against
+the pinned release key, the **zero-config public miner** (safe defaults — a bare `run_miner.py --once`
+earns with no env vars), and the shardDiLoCo + trustless-coordinator + elastic-VRAM work above.

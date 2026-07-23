@@ -1113,7 +1113,12 @@ def main(argv=None):
     # can force the old behavior. The opt-out cannot crash: a v2 pointer carries the v1 aliases
     # (round==event, state_cid==model_root) as a strict superset, so the sync loop reads those two fields
     # and ignores the per-slot breakdown. See docs/ALPHA2_PLAN.md sec 2 + _select_async_mode.
-    if _select_async_mode(ptr, os.environ):
+    _mode_async = _select_async_mode(ptr, os.environ)
+    _pdec = dm.sd_pointer_decode(ptr)
+    _flush("[glm-contrib %s] MODE=%s (pointer v%s event=%s name=%s) -- #146 async iff v2"
+           % (miner, "ASYNC" if _mode_async else "SYNC", _pdec.get("v"), _pdec.get("event"),
+              H.POINTER_NAME))
+    if _mode_async:
         return _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner,
                           train_ids, val_ids, seq, _flush)
 

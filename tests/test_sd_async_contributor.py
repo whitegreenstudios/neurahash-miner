@@ -161,3 +161,28 @@ class TestShardDiLoCoAsyncContributor:
         got = C._collect_unprocessed(list(man.keys()), set(), C._parse_contrib_name)
         assert sorted(nm for nm, _e, _m in got) == sorted([n0, n1])   # BOTH survive, accepted-name excluded
         assert all(e == 5 for _nm, e, _m in got)                       # same authoritative base_event
+
+
+class TestShardDiLoCoFrontierBoundedScan:
+    """Restart hygiene: the pointer's event is the authoritative frontier -- accepted records beyond
+    it are a dead run's leftovers and must never be folded (measured live 2026-07-23)."""
+
+    def _man(self, events):
+        return {N.accepted_name(e): {"sha256": "x"} for e in events}
+
+    def test_frontier_none_is_unbounded(self):
+        man = self._man([1, 2, 3, 4, 5])
+        assert N.scan_accepted_events_bounded(man, 0, None) == [1, 2, 3, 4, 5]
+
+    def test_frontier_caps_the_scan(self):
+        man = self._man([1, 2, 3, 4, 5, 6, 7])
+        assert N.scan_accepted_events_bounded(man, 0, 3) == [1, 2, 3]
+        assert N.scan_accepted_events_bounded(man, 2, 3) == [3]
+
+    def test_frontier_zero_folds_nothing(self):
+        man = self._man([1, 2, 3])
+        assert N.scan_accepted_events_bounded(man, 0, 0) == []
+
+    def test_gap_still_stops_before_frontier(self):
+        man = self._man([1, 2, 4, 5])                              # 3 missing
+        assert N.scan_accepted_events_bounded(man, 0, 5) == [1, 2]

@@ -843,6 +843,21 @@ def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000):
     return out
 
 
+def scan_accepted_events_bounded(manifest_names, last_applied, frontier, max_scan=1_000_000):
+    """scan_accepted_events BOUNDED by the pointer's authoritative event frontier (restart hygiene).
+    The lane store never deletes, so after a coordinator restart the manifest still lists accepted
+    records from the PREVIOUS run at events the new run has not reached yet. The pointer is the
+    single source of truth for how far THIS run has advanced -- folding any accepted(e) with
+    e > pointer.event would replay a dead run's merges onto a fresh base (measured live 2026-07-23:
+    a restarted lane poisoned a contributor through exactly this). frontier=None -> unbounded
+    (identical to scan_accepted_events). Pure: no I/O."""
+    evs = scan_accepted_events(manifest_names, last_applied, max_scan=max_scan)
+    if frontier is None:
+        return evs
+    f = int(frontier)
+    return [e for e in evs if e <= f]
+
+
 def async_should_abort_no_progress(local_root, pointer_root, applied_any, seconds_since_progress,
                                    round_wait):
     """Async lane no-progress abort decision (alpha 2.0 #146, reuses rc6 semantics). Root mismatch is
@@ -947,7 +962,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             time.sleep(args.poll)
             continue
         applied_any = False
-        for e in scan_accepted_events(man, last_applied):
+        for e in scan_accepted_events_bounded(man, last_applied, dec.get("event")):
             entry = man.get(accepted_name(e))
             if not entry:
                 break                                            # gap: stop -- never fold out of order

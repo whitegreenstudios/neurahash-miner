@@ -40,8 +40,10 @@ Usage (real GLM, plan step S4):
 import argparse
 import hashlib
 import os
+import re
 import sys
 import time
+import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -51,6 +53,9 @@ for _p in (_REPO, _HERE):
 
 import numpy as np                                               # noqa: E402
 import sharddiloco_harness as H                                  # noqa: E402  (numpy-only, no torch)
+from neurahash import diloco_merge as dm                         # noqa: E402  (numpy-only, no torch:
+# the W1 async primitives sd_pointer_decode / token telemetry. diloco_merge pulls ONLY numpy +
+# delta_codec, so this keeps the --help / coordinator-default-off paths torch-free and instant.)
 
 
 # ==================================================================== lane naming (RUNTIME override)
@@ -59,6 +64,16 @@ import sharddiloco_harness as H                                  # noqa: E402  (
 GLM_POINTER_NAME = "sharddiloco/glm/pointer"
 CONTRIB_PREFIX_FMT = "cg/r%d/"
 ACCEPTED_NAME_FMT = "sharddiloco/glm/accepted/r%d"
+
+# ---- corpus-over-WAN auto sync (W6) --------------------------------------------------------------
+# The coordinator advertises DATA_RECORD_NAME (same trust surface + name shape as GLM_POINTER_NAME);
+# a contributor fetches ONLY the miner-facing splits it matches -- ids_<domain>_train/val.npy or the
+# data manifest. The SECRET probe/heldout splits (sharddiloco_glm_coordinator.py:573) must never
+# match, so even a forged record cannot make miner code pull them (F1 defense-in-depth).
+DATA_RECORD_NAME = "sharddiloco/glm/data"
+DATA_MANIFEST_NAME = "data_manifest.json"
+RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither locally-valid nor fetched+verified
+_ALLOWED_DATA_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)\.npy\Z")
 
 
 def use_glm_lane_names():
@@ -565,6 +580,208 @@ def fetch_accepted(lane, rnd, timeout=60.0, poll=0.25):
     return None
 
 
+# ============================================================ corpus-over-WAN auto sync (W6, DOWNLOAD)
+def _default_urlopen(url, timeout):
+    """The real network opener behind data_http_get; injected out in tests so the streaming/ceiling logic
+    runs with a fake chunked response and ZERO network."""
+    return urllib.request.urlopen(url, timeout=timeout)
+
+
+def _response_content_length(r):
+    """Best-effort integer Content-Length from a urllib response OR a test stand-in (getheader/headers);
+    None when the header is absent or non-integer. Pure read, no consumption of the body."""
+    val = None
+    geth = getattr(r, "getheader", None)
+    if callable(geth):
+        val = geth("Content-Length")
+    if val is None:
+        hdrs = getattr(r, "headers", None)
+        if hdrs is not None:
+            try:
+                val = hdrs.get("Content-Length")
+            except Exception:                                    # noqa: BLE001
+                val = None
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def data_http_get(url, timeout=60, expected_size=None, dest_path=None, opener=_default_urlopen):
+    """F2: fetch a content object over plain HTTP(S), STREAMING it in 1 MiB chunks straight to `dest_path`
+    while hashing incrementally -- so a miner never buffers an arbitrarily large body in RAM. The data
+    record rides the UNSIGNED shared-token lane, so a forged record could name a giant body; a hard
+    ceiling of expected_size + 65536 slack bounds the transfer: a Content-Length header over the ceiling
+    is rejected BEFORE any body byte is read, and an actual over-read aborts MID-STREAM (leaving a partial
+    temp file the caller cleans up). `expected_size` comes from the (untrusted) record's files[name]['size'];
+    None disables the ceiling. Returns (sha256_hex, n_bytes_written). Injectable at TWO levels for zero-
+    network tests: glm_data_autosync injects this whole function, and this function injects `opener`
+    (so the ceiling logic itself is exercised through a fake chunked response). Any HTTP/URL error
+    propagates so the caller fails this seed and tries the next."""
+    if dest_path is None:
+        raise ValueError("data_http_get streams to a temp file; dest_path is required")
+    ceiling = None if expected_size is None else int(expected_size) + 65536
+    h = hashlib.sha256()
+    n = 0
+    with opener(url, timeout) as r:
+        if ceiling is not None:
+            clen = _response_content_length(r)
+            if clen is not None and clen > ceiling:
+                raise ValueError("Content-Length %d over ceiling %d for %s (rejected before body read)"
+                                 % (clen, ceiling, url))
+        with open(dest_path, "wb") as f:
+            while True:
+                blk = r.read(1 << 20)
+                if not blk:
+                    break
+                n += len(blk)
+                if ceiling is not None and n > ceiling:
+                    raise ValueError("body over ceiling %d bytes for %s (read %d so far, aborting mid-stream)"
+                                     % (ceiling, url, n))
+                h.update(blk)
+                f.write(blk)
+    return h.hexdigest(), n
+
+
+def _sha256_stream(path, chunk=1 << 20):
+    """sha256 of a local file, streamed in 1 MiB chunks so a ~26 MB ids file is never held in RAM."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(chunk), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def _rm_quiet(path):
+    """Best-effort remove of a partial/failed temp file, swallowing any OS error -- used to clean up after
+    a seed that over-ran the F2 ceiling, was unreachable, or served wrong bytes, before trying the next."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _is_allowed_data_name(name):
+    """F1 hard-guard: is `name` a file a MINER is allowed to fetch? A data record rides the same
+    UNSIGNED shared-token lane as the pointer, so a forged one could name any path. Permit ONLY a pure
+    basename that is a miner-facing split (ids_<domain>_train.npy / _val.npy) or the data manifest;
+    reject path traversal and -- the whole point of the guard -- the SECRET probe/heldout splits
+    (ids_*_probe.npy / _heldout.npy), which live only on the coordinator box
+    (sharddiloco_glm_coordinator.py:573) and must never be fetchable by miner code."""
+    if not name or name != os.path.basename(name):
+        return False
+    if "/" in name or "\\" in name or ".." in name:
+        return False
+    return name == DATA_MANIFEST_NAME or bool(_ALLOWED_DATA_RE.match(name))
+
+
+def _read_data_record(lane):
+    """Read the coordinator's named data record (DATA_RECORD_NAME) via the manifest -- the same
+    name -> sha256 -> get_json resolution read_pointer/fetch_accepted use, because ContentLane.get_json
+    takes a CID, not a name. Returns the record dict, or None if the record is absent or unreadable, in
+    which case the caller NO-OPs to today's local --data-dir behavior."""
+    try:
+        man = lane.manifest()
+        entry = man.get(DATA_RECORD_NAME)
+        if not entry:
+            return None
+        return lane.get_json(entry["sha256"])
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get):
+    """W6 corpus-over-WAN DOWNLOAD half: before training, make a bare stranger clone fetch and VERIFY
+    its ids files, and FAIL CLOSED on anything it cannot verify. Today the loaders bare-np.load
+    whatever sits in --data-dir with ZERO verification (node_ids); this closes exactly that gap.
+
+    Reads the coordinator's advertised record (W5 data_seeds.json shape: manifest_sha256 / seeds /
+    files{name:{sha256,size}}). For each named file: keep a locally-present sha-matching copy (zero
+    network), else GET <seed>/o/<sha> from the seeds IN ORDER, verify sha256(body) == sha, and install
+    it atomically (tmp + os.replace) -- first verified seed wins. A record file that ends up neither
+    locally-valid nor fetched-and-verified exits rc RC_DATA_UNVERIFIED (never train on unverified
+    data), naming the file and every seed tried. A record that names a disallowed file is refused
+    ENTIRELY (F1). Never deletes or touches a file the record does not name. Opt out with
+    NEURAHASH_GLM_DATA_AUTOSYNC=0. http_get is injected like W5's uploaders so tests run this whole
+    path with zero network."""
+    optout = os.environ.get("NEURAHASH_GLM_DATA_AUTOSYNC", "").strip().lower()
+    if optout in ("0", "false", "no", "off"):
+        log("[glm-contrib] data autosync OFF (NEURAHASH_GLM_DATA_AUTOSYNC=%s) -- using --data-dir as-is"
+            % optout)
+        return
+    record = _read_data_record(lane)
+    if not record:
+        log("[glm-contrib] no data record %r advertised on the lane -- using local --data-dir files as-is"
+            % DATA_RECORD_NAME)
+        return
+    files = record.get("files") or {}
+    seeds = [str(s) for s in (record.get("seeds") or [])]
+
+    # F1 HARD-GUARD: validate EVERY key BEFORE any I/O -- one bad name poisons the whole record.
+    # F2 companion: every entry must also carry a 64-hex sha256 AND a positive int size. Without a
+    # size the download ceiling would be disabled, so a forged record could declare-nothing-send-huge;
+    # the W5 publisher always emits both, so a well-formed record never trips this. Fail-closed.
+    for name in files:
+        if not _is_allowed_data_name(name):
+            log("[glm-contrib] SECURITY: data record names disallowed file %r -- only "
+                "ids_<domain>_(train|val).npy or %s may be fetched (the SECRET probe/heldout splits "
+                "must never be); REFUSING the entire record and fetching nothing."
+                % (name, DATA_MANIFEST_NAME))
+            return
+        info = files[name]
+        sha_ok = isinstance(info, dict) and isinstance(info.get("sha256"), str) \
+            and len(info["sha256"]) == 64 and all(c in "0123456789abcdef" for c in info["sha256"])
+        size_ok = isinstance(info, dict) and isinstance(info.get("size"), int) \
+            and not isinstance(info.get("size"), bool) and info["size"] > 0
+        if not (sha_ok and size_ok):
+            log("[glm-contrib] SECURITY: data record entry %r lacks a valid sha256/size (size is the "
+                "download ceiling -- an entry without one is unbounded); REFUSING the entire record "
+                "and fetching nothing." % name)
+            return
+
+    for name in sorted(files):
+        info = files[name]
+        sha = str(info.get("sha256", "")) if isinstance(info, dict) else ""
+        size = info.get("size") if isinstance(info, dict) else None   # F2: untrusted declared size -> ceiling
+        path = os.path.join(data_dir, name)
+        if os.path.isfile(path) and _sha256_stream(path) == sha:
+            log("[glm-contrib] data ok (local sha match, no fetch): %s o/%s.." % (name, sha[:12]))
+            continue
+        tried = []
+        installed = False
+        for seed in seeds:
+            url = seed.rstrip("/") + "/o/" + sha
+            tried.append(url)
+            os.makedirs(data_dir, exist_ok=True)
+            tmp = "%s.tmp.%d" % (path, os.getpid())
+            try:
+                # F2: stream to tmp under a size+slack ceiling -- a forged over-large body aborts here in
+                # bounded RAM, and this seed is treated as failed (partial tmp cleaned up, try the next).
+                got, nbytes = http_get(url, timeout=60, expected_size=size, dest_path=tmp)
+            except Exception as e:                               # noqa: BLE001
+                _rm_quiet(tmp)
+                log("[glm-contrib] data seed unusable %s (%s)" % (url, e))
+                continue
+            if got != sha:
+                _rm_quiet(tmp)
+                log("[glm-contrib] data seed served WRONG BYTES %s (got %s.. want %s..)"
+                    % (url, got[:12], sha[:12]))
+                continue
+            os.replace(tmp, path)
+            log("[glm-contrib] data FETCHED+VERIFIED %s (%d B) from %s" % (name, nbytes, url))
+            installed = True
+            break
+        if not installed:
+            log("[glm-contrib] FATAL: cannot verify data file %s (want sha256 %s). Tried %d seed(s): "
+                "%s. Refusing to train on unverified data (rc%d)."
+                % (name, sha, len(tried), tried, RC_DATA_UNVERIFIED))
+            raise SystemExit(RC_DATA_UNVERIFIED)
+    log("[glm-contrib] data autosync OK: %d file(s) verified against record %r"
+        % (len(files), DATA_RECORD_NAME))
+
+
 # ============================================================================== contributor CLI
 def _resolve_key(args):
     if args.key:
@@ -575,6 +792,227 @@ def _resolve_key(args):
     if env:
         return bytes.fromhex(env)
     raise SystemExit("[glm-contrib] no signing key: pass --key <hex16> / --key-file / NEURAHASH_SD_KEY")
+
+
+# ==================================================================== alpha 2.0 non-blocking cadence (#146)
+# The truly-decoupled lane (docs/ALPHA2_PLAN.md sec 1-3). These four helpers are the PURE decisions the
+# async cadence makes -- factored out so they are unit-testable with NO socket / GPU / model. The sync
+# loop in main() is UNCHANGED (byte-identical alpha-1.0 join path); the async cadence is a separate
+# function (_run_async) reached only via the single pointer-driven mode-selection branch.
+
+_ASYNC_OPT_OUT = ("0", "false", "no", "off", "n")   # NEURAHASH_SD_ASYNC values that force the sync path
+
+
+def _select_async_mode(ptr, env=None):
+    """Pointer-driven mode selection (alpha 2.0 #146). Decode the pointer with the W1 codec and return
+    True iff the NON-BLOCKING async cadence should run:
+      * v1 pointer  -> ALWAYS False (a fresh public clone must still join today's v1 sync lanes
+        BYTE-IDENTICALLY -- pointer-version, never env, decides this).
+      * v2 pointer  -> True UNLESS NEURAHASH_SD_ASYNC is the explicit opt-out (0/false/no/off/n), in
+        which case False = sync fallback. The fallback is safe and does NOT crash: a v2 pointer carries
+        the v1 aliases (round==event, state_cid==model_root, diloco_merge.py:1213) as a strict superset,
+        so the sync loop reads those two fields and simply ignores the per-slot breakdown.
+    `env` defaults to os.environ; passed explicitly by tests. Pure: decode only, no I/O."""
+    dec = dm.sd_pointer_decode(ptr)
+    if int(dec.get("v", 1)) != 2:
+        return False
+    e = os.environ if env is None else env
+    optout = (e.get("NEURAHASH_SD_ASYNC", "") or "").strip().lower()
+    return optout not in _ASYNC_OPT_OUT
+
+
+def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000):
+    """Non-blocking catch-up scan (alpha 2.0 #146). Given the names currently present in the lane
+    manifest (any container supporting `in`; a manifest dict's keys work directly) and the last event
+    already folded locally, return the ORDERED list of accepted event numbers to apply next:
+    e = last_applied+1, +2, ... while accepted_name(e) is present, STOPPING at the first gap.
+
+    Global events are monotonic and contiguous (SlotClock bumps by 1 per advance and the coordinator
+    publishes accepted(e) for each -- diloco_merge.py:1284, ALPHA2_PLAN sec 2), so a gap means 'not yet
+    visible'. We never skip a gap: applying e+1 before e would fold deltas out of the coordinator's
+    order and diverge the replica. Returns [] when nothing new is visible -- the caller then trains
+    against the current base rather than waiting. `max_scan` is a defensive finite cap so a malformed
+    manifest cannot loop forever; unreached on the happy path. Pure: no I/O."""
+    out = []
+    e = int(last_applied) + 1
+    n = 0
+    while n < int(max_scan) and accepted_name(e) in manifest_names:
+        out.append(e)
+        e += 1
+        n += 1
+    return out
+
+
+def async_should_abort_no_progress(local_root, pointer_root, applied_any, seconds_since_progress,
+                                   round_wait):
+    """Async lane no-progress abort decision (alpha 2.0 #146, reuses rc6 semantics). Root mismatch is
+    NORMAL mid-flight -- another slot advanced between our reads -- so a mismatch ALONE never aborts
+    (this is the deliberate departure from the v1 sync rc7 drift-abort). We abort ONLY when the
+    coordinator advertises a root we cannot reach AND we have folded no accepted record for
+    `round_wait` seconds, i.e. the missing records are unreconstructable rather than merely late.
+    Rules, in order:
+      * applied_any True     -> False  (any progress this tick resets the timer -> never abort now).
+      * falsy pointer_root   -> False  (coordinator advertises no root -> nothing to be stuck against).
+      * local == pointer root -> False (fully caught up -> not stuck).
+      * else                 -> True iff seconds_since_progress >= round_wait.
+    Pure: no clock read (the caller passes the elapsed time), no I/O."""
+    if applied_any:
+        return False
+    if not pointer_root:
+        return False
+    if local_root == pointer_root:
+        return False
+    return float(seconds_since_progress) >= float(round_wait)
+
+
+def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid, sig, train_flops,
+                               delta_bytes, steps, tokens):
+    """Assemble the async-lane contribution record: today's signed record EXTENDED with the alpha-2
+    telemetry the coordinator (W2) reads -- base_event (the event this delta was trained against; the
+    r-number in the contrib name MEANS this), base_root (our local model_root), steps (inner steps
+    executed) and tokens (rows*seq consumed). It is a strict SUPERSET of the sync record: base_round is
+    kept == base_event so a v1-shaped reader still finds a base height, mirroring the v2 pointer's
+    superset discipline. Pure dict assembly, no I/O."""
+    return dict(
+        miner=miner, expert=int(i), layer=int(L), glm_expert=int(E),
+        base_round=int(base_event),          # v1-compat alias: the r-number == base_event
+        base_event=int(base_event),
+        expert_cid=expert_cid, trunk_cid=None, sig=sig,
+        train_flops=float(train_flops), trunk_bytes=0, delta_bytes=int(delta_bytes),
+        base_root=base_root, steps=int(steps), tokens=int(tokens),
+    )
+
+
+def async_publish_name(base_event, miner, k):
+    """F-Q1: the UNIQUE per-publish contribution name = contrib_name(base_event, miner) + a per-miner
+    monotonic counter suffix '.<k>'. When a miner completes >=2 H-blocks against ONE base_event (the
+    coordinator merge lagging), each publish lands on a DISTINCT manifest name instead of the 2nd atomically
+    repointing (and silently losing) the 1st -- the exact lost-work bug F-Q1 closes. The signature covers
+    ecid/base_event/miner, NOT the name (H.sign at the publish site), so the suffix is signature-safe, and
+    the coordinator reads base_event/miner from the RECORD, not the name. Pure."""
+    return "%s.%d" % (contrib_name(base_event, miner), int(k))
+
+
+def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log):
+    """NON-BLOCKING async cadence (alpha 2.0 #146). Selected by main() only when the coordinator
+    publishes a v2 pointer. The contributor NEVER waits on a barrier: each iteration it
+      (1) scans the manifest ONCE and folds any accepted records past last_applied (non-blocking
+          catch-up, reusing apply_accepted incl. the F2/F5 own-slot re-gate, 4984891) -- if none are
+          visible it does NOT wait;
+      (2) trains H local LoRA steps on its OWN slot against the CURRENT base;
+      (3) publishes its delta + a signed record extended with base_event/base_root/steps/tokens, then
+          loops immediately.
+    Root mismatch is EXPECTED mid-flight and never aborts on its own; only prolonged no-progress while
+    our root cannot reach the coordinator's aborts (rc6). Self-abort codes preserved: rc6 (no progress,
+    redefined here), rc8 (poisoned accepted record -- unchanged from sync). rc7 (drift) does NOT exist
+    in this path. Returns the process exit code. The only sleeps are args.poll pacing on a transient
+    manifest/pointer read failure -- there is no barrier sleep."""
+    # LOCAL re-gate closure, IDENTICAL to the sync path: the own-slot delta is re-gated on our own val
+    # split (F2 defense-in-depth); cross-domain deltas fold unconditionally on the coordinator's signed
+    # accept (own_slot=i scopes the check so a cross-domain accept is not false-positive rejected).
+    regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+    last_applied = 0            # events <= this are folded into our base (event 0 == the fresh base)
+    publish_k = 0               # F-Q1: per-miner monotonic publish counter -> a UNIQUE record name every
+                                # publish, so a 2nd H-block against the same base_event never repoints (and
+                                # silently drops) the previous record. Never resets within a run.
+    last_progress_t = time.time()
+    rounds_done = 0             # OUR OWN published contributions -- this is what --max-rounds counts here
+    log("[glm-contrib %s] ASYNC cadence (v2 lane, #146): non-blocking; train continuously, never wait "
+        "on a barrier. --max-rounds=%d counts our own contributions." % (miner, args.max_rounds))
+    while rounds_done < args.max_rounds:
+        # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
+        try:
+            ptr = lane.read_pointer()
+        except Exception:                                        # noqa: BLE001
+            time.sleep(args.poll)
+            continue
+        if ptr is None:
+            time.sleep(args.poll)
+            continue
+        try:
+            dec = dm.sd_pointer_decode(ptr)                      # decode EVERY pointer read (v1|v2)
+        except ValueError:
+            time.sleep(args.poll)                               # malformed pointer mid-flight -> pace
+            continue
+        if dec["done"]:
+            log("[glm-contrib %s] coordinator signalled DONE; exiting after %d contributions"
+                % (miner, rounds_done))
+            return 0
+        pointer_root = dec["model_root"]
+
+        # -- (1) NON-BLOCKING catch-up: fold every accepted record past last_applied, IN ORDER. -------
+        try:
+            man = lane.manifest()
+        except Exception:                                        # noqa: BLE001
+            time.sleep(args.poll)
+            continue
+        applied_any = False
+        for e in scan_accepted_events(man, last_applied):
+            entry = man.get(accepted_name(e))
+            if not entry:
+                break                                            # gap: stop -- never fold out of order
+            try:
+                rec = lane.get_json(entry["sha256"])
+            except Exception:                                    # noqa: BLE001
+                break                                            # transient fetch fail -> retry next tick
+            rejected = []
+            apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=i)
+            if rejected:
+                log("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at event %d "
+                    "(regressed local held-out CE or mismatched shape). The pointer + accepted record "
+                    "ride an UNSIGNED shared-token lane, so this looks like a forged/poisoned record -- "
+                    "refusing to fold it and aborting rather than training on a poisoned base."
+                    % (miner, len(rejected), e))
+                return 8
+            last_applied = e
+            applied_any = True
+        if applied_any:
+            last_progress_t = time.time()
+
+        # -- (2) root mismatch is NORMAL mid-flight; abort ONLY on prolonged no-progress (rc6). -------
+        root = model_root(host)
+        if async_should_abort_no_progress(root, pointer_root, applied_any,
+                                          time.time() - last_progress_t, args.round_wait):
+            log("[glm-contrib %s] FATAL: no accepted-record progress for %.0fs while local model_root="
+                "%s.. cannot reach coordinator root=%s.. (missing records are unreconstructable, not "
+                "merely late)." % (miner, args.round_wait, root[:12], str(pointer_root)[:12]))
+            return 6
+
+        # -- (3) train H local LoRA steps on my slot against the CURRENT base, ZERO cross-miner comm. --
+        t_tr = time.time()
+        if args.garbage:
+            delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rounds_done)
+            train_flops, best_val, steps, tokens = 1.0, float("nan"), 0, 0
+            payload = delta                    # adversarial control stays dense: it has no factors
+        else:
+            c = G.train_glm_expert_contribution(
+                model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
+                batch=args.batch, seed=rounds_done * 100 + i, sel_outer=args.outer)   # F5 select@gate
+            delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
+            steps = int(args.inner)                              # H inner steps executed
+            tokens = int(c.get("n_examples", 0)) * int(seq)      # rows*seq actually consumed
+            payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
+
+        # -- (4) publish today's payload + signed record EXTENDED with base_event/base_root/steps/tokens.
+        base_event = int(last_applied)         # the event this delta was trained against
+        ecid = lane.put_delta(payload)
+        sig = H.sign(key, ecid, base_event, miner)               # r-number == base_event (W2 reads it so)
+        delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
+        record = build_async_contrib_record(miner, i, L, E, base_event, root, ecid, sig, train_flops,
+                                             delta_bytes, steps, tokens)
+        pub_name = async_publish_name(base_event, miner, publish_k)   # F-Q1: unique name per publish
+        lane.put_json_named(pub_name, record)
+        publish_k += 1
+        rounds_done += 1
+        log("[glm-contrib %s] async round %d: %s slot %d (L%d,E%d) in %.1fs, best_val_ce=%.5f, "
+            "base_event=%d published as %s expert_cid=%s.. delta=%dB base_root=%s.. steps=%d tokens=%d"
+            % (miner, rounds_done, "GARBAGE (adversarial control)" if args.garbage else
+               "trained %d LoRA steps on" % args.inner, i, L, E, time.time() - t_tr, best_val,
+               base_event, pub_name, ecid[:12], delta_bytes, root[:12], steps, tokens))
+        # (5) loop IMMEDIATELY: scan -> train -> publish -> scan. No barrier, no re-advertise wait.
+
+    log("[glm-contrib %s] hit max-rounds=%d; exiting" % (miner, args.max_rounds))
+    return 0
 
 
 def main(argv=None):
@@ -623,6 +1061,12 @@ def main(argv=None):
     _flush("[glm-contrib %s] UP owns slot %d = GLM (L%d,E%d) | mode=%s lane=%s (all-outbound)"
            % (miner, i, L, E, args.mode, args.url))
 
+    if args.mode != "tiny":
+        # W6 corpus-over-WAN: fetch+verify this miner's ids files BEFORE anything reads them.
+        # build_node_model() below infers seq length from ids_<dom>_val.npy (_infer_seq), so this MUST
+        # run first; a single call here covers BOTH the sync and async cadences that branch below.
+        glm_data_autosync(lane, args.data_dir, log=_flush)
+
     G = _G()
     model, cfg, seq = build_node_model(args, log=_flush)
     host = G.GlmExpertLaneHost(model, cfg, slots)
@@ -646,6 +1090,17 @@ def main(argv=None):
         _flush("[glm-contrib %s] FATAL: no coordinator pointer at %s after %.0fs"
                % (miner, args.url, args.wait_up))
         return 4
+
+    # ---- MODE SELECTION (alpha 2.0, #146): pointer-driven, decided ONCE on the first pointer. -------
+    # A v2 pointer (coordinator opted into NEURAHASH_SD_ASYNC) runs the NON-BLOCKING async cadence; a v1
+    # pointer -- or an explicit NEURAHASH_SD_ASYNC=0 opt-out on a v2 lane -- falls through to the EXISTING
+    # sync loop below, BYTE-IDENTICAL, so a fresh public clone still joins today's v1 lanes and an operator
+    # can force the old behavior. The opt-out cannot crash: a v2 pointer carries the v1 aliases
+    # (round==event, state_cid==model_root) as a strict superset, so the sync loop reads those two fields
+    # and ignores the per-slot breakdown. See docs/ALPHA2_PLAN.md sec 2 + _select_async_mode.
+    if _select_async_mode(ptr, os.environ):
+        return _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner,
+                          train_ids, val_ids, seq, _flush)
 
     done_last = -1
     applied = -1            # last round whose ACCEPTED record has been replayed locally

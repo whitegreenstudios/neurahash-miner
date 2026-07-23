@@ -682,10 +682,12 @@ def goodput_counters():
       batch_serial_fallback : batch invocations whose result mode was 'serial_fallback'.
       batch_all_rejected    : batch invocations whose result mode was 'all_rejected'.
       batch_deferrals       : grace-window defer decisions (a defer is NOT processing).
-      batch_candidates      : total candidates folded across all batch invocations."""
+      batch_candidates      : total candidates folded across all batch invocations.
+      staled                : async-lane contributions aged out by the max-staleness bound
+                              (skipped before any merge; NOT `processed`). Sync lanes leave it 0."""
     return {"processed": 0, "accepted": 0, "rejected_gate": 0, "vetoed": 0, "corpus_dropped": 0,
             "batches": 0, "batch_combined": 0, "batch_serial_fallback": 0, "batch_all_rejected": 0,
-            "batch_deferrals": 0, "batch_candidates": 0}
+            "batch_deferrals": 0, "batch_candidates": 0, "staled": 0}
 
 
 def goodput_summary(c):
@@ -1106,3 +1108,159 @@ def staleness_ok(base_round, coord_round, max_stale=None):
     if age <= int(max_stale):
         return True, "fresh(age=%d<=%d)" % (age, int(max_stale))
     return False, "stale(age=%d>%d)" % (age, int(max_stale))
+
+
+# ==================================================================== truly-decoupled async lane (#146)
+# Alpha 2.0 makes the GLM shardDiLoCo lane event-driven instead of round-locked (docs/ALPHA2_PLAN.md,
+# modelled on DeepMind "Decoupled DiLoCo", arXiv:2604.21428). These are the PURE, I/O-free primitives the
+# async coordinator (W2) and contributor (W3) build on: a token-quality telemetry weight, the v2 pointer
+# codec (backward-compatible with the v1 wire so pre-alpha-2 readers keep working), and a deterministic
+# per-slot event clock. Nothing here does network / disk / time I/O or touches any flag-off behavior --
+# W1 is foundation only; the sync lane is byte-identical until W2/W3 opt in behind NEURAHASH_SD_ASYNC.
+
+
+def token_quality_weight(steps, tokens):
+    """Paper's per-contribution weight = tokens * (tokens / steps) (Decoupled DiLoCo, arXiv:2604.21428
+    Alg 2): quantity (total tokens) x quality (tokens-per-step, i.e. mean batch density). A larger, denser
+    contribution weighs more. Pure float, no state.
+
+    IMPORTANT -- in OUR lane this is TELEMETRY / a future K>1 tie-break ONLY; it does NOT admit a delta.
+    DeepMind trusts its learners and averages by this weight; we cannot trust anonymous miners, so merge
+    ACCEPTANCE stays the secret-probe gate + merged-result held-out keep-best (deliberate divergence #2,
+    docs/ALPHA2_PLAN.md section 1). Recording the weight lets the coordinator break ties and log
+    contribution size WITHOUT ever letting an attacker buy acceptance by inflating a token count.
+
+    Guard: non-positive steps or tokens -> 0.0 -- a contribution that trained on nothing, or reported a
+    bogus <=0 count, carries zero weight instead of raising or producing inf/NaN (steps=0 would divide)."""
+    if steps <= 0 or tokens <= 0:
+        return 0.0
+    tokens = float(tokens)
+    steps = float(steps)
+    return tokens * (tokens / steps)
+
+
+# Pointer v2 wire keys. The v2 pointer is a strict SUPERSET of the v1 pointer
+# (tools/sharddiloco_harness.py publish_pointer -> {round, state_cid, done}) so a v1-only reader -- e.g. a
+# fresh public clone still joining an older sync lane -- finds the two fields it looks at. ALIASING
+# DECISION: v2 mirrors its global `event` counter into v1 `round`, and its `model_root` into v1
+# `state_cid`. Because `event` is globally monotonic (SlotClock below), a v1 reader comparing only `round`
+# still sees a strictly increasing integer and advances correctly; it simply never learns the per-slot
+# breakdown carried in the v2-only keys.
+_SD_PTR_V1_ROUND = "round"      # v1 monotonic-round field (aliased from v2 `event`)
+_SD_PTR_V1_ROOT = "state_cid"   # v1 model-root field (aliased from v2 `model_root`)
+
+
+def sd_pointer_encode(event, slot_rounds, model_root, done=False):
+    """Build the ALPHA-2 async lane pointer (v2) as a plain JSON-ready dict. WHY v2 exists: the sync lane
+    published one `round` per barrier; the async lane advances each expert slot on its own clock, so the
+    pointer must carry a GLOBAL monotonic `event` sequence PLUS a per-slot outer-round map -- and still be
+    readable by v1-only clients mid-migration.
+
+    Fields emitted:
+      v          -> 2 (version tag; ABSENT on v1 pointers, which is how decode distinguishes them)
+      event      -> the global monotonic event sequence (SlotClock.event); the pointer/settlement height
+      rounds     -> {slot: outer_round} map -- each slot's independent progress
+      model_root -> the composed model root (CID / hash) this event points at
+      done       -> terminal flag
+    plus the v1 back-compat ALIASES (see module note above): `round` = event, `state_cid` = model_root. A
+    v1 reader ignores the v2-only keys and sees a monotonic `round` + a `state_cid` root, so it stays
+    correct through the migration.
+
+    Pure: no I/O. `slot_rounds` None is treated as an empty map; values are coerced to int."""
+    rounds = {} if slot_rounds is None else {k: int(v) for k, v in dict(slot_rounds).items()}
+    ev = int(event)
+    return {
+        "v": 2,
+        "event": ev,
+        "rounds": rounds,
+        "model_root": model_root,
+        "done": bool(done),
+        _SD_PTR_V1_ROUND: ev,         # v1 alias: monotonic round == global event
+        _SD_PTR_V1_ROOT: model_root,  # v1 alias: state_cid == model_root
+    }
+
+
+def sd_pointer_decode(obj):
+    """Normalize EITHER a v1 pointer ({round, state_cid, done}) OR a v2 pointer (sd_pointer_encode output)
+    into ONE shape so W2/W3 read every pointer through a single path during migration:
+        {v, event, slot_rounds, model_root, done}
+    v1 -> {v:1, event:<round>, slot_rounds:None, model_root:<state_cid>, done:<done or False>}. Here
+    `slot_rounds is None` is the explicit signal "pre-async lane; no per-slot breakdown exists".
+    v2 -> {v:2, event:<event>, slot_rounds:<rounds map>, model_root:<model_root>, done:<done or False>}.
+
+    Version is decided by the `v` key (== 2 -> v2; absent/other -> v1), matching encode (stamps v:2) and
+    v1 publishers (stamp none). Malformed input -- not a dict, or missing a REQUIRED key for the detected
+    shape -- raises ValueError NAMING the offending key, so a caller sees exactly what was wrong instead of
+    a silent None. `done` is optional in both shapes (defaults False)."""
+    if not isinstance(obj, dict):
+        raise ValueError("sd_pointer_decode: expected a dict pointer, got %s" % type(obj).__name__)
+    if obj.get("v") == 2:
+        for key in ("event", "rounds", "model_root"):
+            if key not in obj:
+                raise ValueError("sd_pointer_decode: v2 pointer missing required key '%s'" % key)
+        return {
+            "v": 2,
+            "event": int(obj["event"]),
+            "slot_rounds": {k: int(v) for k, v in dict(obj["rounds"]).items()},
+            "model_root": obj["model_root"],
+            "done": bool(obj.get("done", False)),
+        }
+    for key in (_SD_PTR_V1_ROUND, _SD_PTR_V1_ROOT):
+        if key not in obj:
+            raise ValueError("sd_pointer_decode: v1 pointer missing required key '%s'" % key)
+    return {
+        "v": 1,
+        "event": int(obj[_SD_PTR_V1_ROUND]),
+        "slot_rounds": None,
+        "model_root": obj[_SD_PTR_V1_ROOT],
+        "done": bool(obj.get("done", False)),
+    }
+
+
+class SlotClock:
+    """Coordinator-side event bookkeeping for the async lane (#146). PURE and deterministic -- no time
+    calls, no I/O -- so it is trivially testable and replayable. Two counters:
+      * a GLOBAL monotonic `event` sequence, bumped on EVERY slot advance -- this is what the pointer and
+        accepted records are keyed by, and what keeps settlement heights non-decreasing (F13) even though
+        slots advance out of lock-step;
+      * a per-slot outer-round counter, bumped independently -- slot 0's progress never waits on slot 1's,
+        which is the entire point of decoupling (docs/ALPHA2_PLAN.md section 1).
+
+    `slot` may be any hashable slot id (e.g. an (layer, expert) tuple like (1, 0)). Starts at event 0 with
+    every slot at round 0; the first advance of a given slot returns (1, 1)."""
+
+    def __init__(self):
+        self._event = 0
+        self._slot_rounds = {}
+
+    @property
+    def event(self):
+        """Current global monotonic event sequence (0 before any advance)."""
+        return self._event
+
+    def slot_round(self, slot):
+        """Current outer-round count for `slot` (0 if it has never advanced)."""
+        return self._slot_rounds.get(slot, 0)
+
+    def advance(self, slot):
+        """Advance `slot` by one outer round: bump the GLOBAL event AND this slot's own round. Returns the
+        pair (new_global_event, new_slot_round). The shared global bump is why events stay strictly
+        monotonic across ALL slots while each slot's round count stays independent."""
+        self._event += 1
+        self._slot_rounds[slot] = self._slot_rounds.get(slot, 0) + 1
+        return self._event, self._slot_rounds[slot]
+
+    def age(self, base_event):
+        """Global events elapsed since `base_event` (current_event - base_event), clamped to >= 0 so a
+        contribution naming a base_event >= current (a race, or its own just-published event) reads as age
+        0 rather than negative."""
+        age = int(self._event) - int(base_event)
+        return age if age > 0 else 0
+
+    def fresh(self, base_event, max_stale):
+        """Is a contribution trained against `base_event` fresh enough to merge NOW? DELEGATES to the
+        existing staleness_ok(base_round, coord_round, max_stale) with coord_round = the current event, so
+        the async lane reuses the EXACT #126 policy (max_stale None/<=0 -> always fresh; the merge GATE,
+        not staleness, is the real protection against untrusted miners). Returns staleness_ok's
+        (ok, reason) pair unchanged -- no duplicated logic here."""
+        return staleness_ok(base_event, self._event, max_stale)

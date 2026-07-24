@@ -1,9 +1,14 @@
 # NeuraHash Miner
 
-The **miner client** for NeuraHash — a proof-of-useful-work pool where the "work" is training a
-shared Mixture-of-Experts model. Your GPU (or CPU) connects to a pool coordinator, trains its
-assigned expert-shard for each round, signs the resulting trunk delta with your own key, and submits
-it. Honest work that the coordinator can reproduce (recompute-verify) is what earns credit.
+The **miner client** for NeuraHash — a proof-of-useful-work network where the "work" is training a
+shared Mixture-of-Experts model. Your GPU trains its assigned expert slots (compact LoRA deltas on
+a frozen GLM trunk), signs each delta with your own locally-generated key, and publishes it —
+**all-outbound** (works behind NAT, nothing to port-forward) and **decoupled** (fast GPUs never
+wait for slow ones). What earns credit is not "the work ran": it is **measured improvement on a
+secret, rotated held-out set** — a contribution that does not make the shared model better pays
+zero, and on the trustless lane the payout itself is co-signed by a staked M-of-N validator quorum
+rather than trusted to any single coordinator. (The original round-based pool lane, where the
+coordinator recompute-verifies your training step bit-for-bit, still exists as the legacy path.)
 
 This repository is the **client half only**. It does not contain the coordinator, the consensus /
 verdict logic, the ledger, or the emission/reward economics — you point it at a coordinator someone
@@ -26,9 +31,11 @@ else runs (or that you run from the full node package).
 - **Your wallet key is yours, generated locally.** The miner creates a per-node secp256k1 identity on
   your machine (gitignored, never uploaded). Back it up; losing it loses the address your work
   credits. No private key ships in this repo.
-- **Determinism matters.** Your training step must reproduce byte-for-byte what the coordinator
-  recomputes, or your honest work is rejected. `tests/test_worker_determinism.py` pins the expected
-  recompute hash — run it after install (see below).
+- **Determinism matters (legacy pool lane).** On the round-based pool lane your training step must
+  reproduce byte-for-byte what the coordinator recomputes, or your honest work is rejected.
+  `tests/test_worker_determinism.py` pins the expected recompute hash — run it after install (see
+  below). The GLM shardDiLoCo lane gates on held-out improvement instead (no bit-exact recompute
+  across different GPU architectures).
 
 ---
 

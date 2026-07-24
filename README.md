@@ -235,6 +235,30 @@ hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory ra
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
 
+## Alpha 3.3 (2026-07-24) — the fleet-hosted pipeline: one live model, held by miners together
+
+The missing half of G1 rollouts. The CE lane proved miners can each hold ~5 GB of GLM for
+*training*; the pipeline makes the same economics work for *generation*: the fleet holds **one
+live copy of the full 47-layer model together**, split into layer-range stages
+(`tools/glm_pipe_stage.py`, ~1.1 GiB/layer — the same VRAM class as CE mining), and only the
+**4 KB per-token hidden-state vector** crosses machines. Stages never talk to each other: every
+hop is a content-store PUT + poll (all-outbound, NAT-safe — the same rule as everything here).
+The rollout worker drives it (`--pipeline <run> --pipe-stages N`): it keeps just the tokenizer +
+final norm + lm-head (~0.7 GB) and **samples locally** — the paid entity keeps the sampling seed
+and signs what it sampled.
+
+- **Fidelity proven bit-exact:** chained stages reproduce the native transformers forward with
+  `maxdiff = 0.0` (prefill and decode) against a ground-truth model in the same process. (Two
+  real quirks found on the way, both documented in code: `DynamicCache` reads its sequence length
+  from slot 0, so stage layers are remapped to dense per-stage cache slots; and the *un-cached*
+  native prefill path emits NaN on CPU bf16 — the pipeline always uses caches.)
+- **Same capacity honesty as v3.2:** the worker refuses a pipeline whose stages don't cover the
+  full depth (`--pipe-span`, truncated policy = reward 0.0 measured) unless explicitly smoking.
+- **Throughput scales with miners:** one sample pays hops × store-RTT per token, but many samples
+  ride the pipeline concurrently — more stage miners = more layers hosted *and* more tokens/s.
+  A direct low-latency stage-to-stage path is the planned optimization; the store path works
+  everywhere today.
+
 ## Alpha 3.2 (2026-07-24) — the G1 train-role ships in the client
 
 The G1 campaign's **rollout worker and its reward function are now part of the miner**

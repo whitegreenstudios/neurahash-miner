@@ -471,6 +471,43 @@ def load_policy_backend(args, ptr, log=None):
         raise RuntimeError("load_policy_backend: no --shard-dir / base model dir given")
     cfg_dir = getattr(args, "config_dir", None) or base_dir
     device = getattr(args, "device", None) or ("cuda" if torch.cuda.is_available() else "cpu")
+    # PIPELINE mode (the fleet-hosted engine, tools/glm_pipe.py): the full 47-layer policy is held
+    # by MANY miners (each a ~1.1 GiB/layer stage); this worker keeps only tokenizer + final norm +
+    # lm_head (~0.7 GiB) and SAMPLES locally -- the paid entity keeps the seed and signs what it
+    # sampled. This is how rollout duty reaches 8 GB cards: composition, never one big card.
+    if getattr(args, "pipeline", None):
+        import glm_pipe as GP                                # lazy (same dir)
+        lane_url = getattr(args, "url", "") or ""
+        if not lane_url:
+            raise SystemExit("--pipeline needs --url (the content store the stages ride)")
+        import sharddiloco_harness as H
+        plane = H.ContentLane(lane_url, getattr(args, "token", "") or "")
+        n_stages = int(getattr(args, "pipe_stages", 0) or 0)
+        if n_stages <= 0:
+            raise SystemExit("--pipeline needs --pipe-stages N (how many stage miners serve it)")
+        # Same capacity honesty as the single-card path: a pipeline that does not cover the FULL
+        # depth is a truncated policy (reward 0.0 measured) -- refuse unless smoke-testing.
+        span = str(getattr(args, "pipe_span", "") or "")
+        if span:
+            lo, hi = (int(x) for x in span.split(":"))
+            n_total = None
+            try:
+                with open(os.path.join(cfg_dir, "config.json"), "r", encoding="utf-8") as f:
+                    n_total = int(json.load(f).get("num_hidden_layers") or 0) or None
+            except (OSError, ValueError, TypeError):
+                pass
+            if (lo != 0 or (n_total is not None and hi < n_total)) \
+                    and not getattr(args, "allow_partial", False):
+                raise SystemExit(
+                    "CAPACITY: pipeline span %s covers %s of %s layers -- a truncated policy "
+                    "scores reward 0.0 (measured). Add stages until the fleet covers the full "
+                    "depth, or --allow-partial for mechanics smokes only." % (span, hi - lo, n_total))
+        log("PIPELINE backend: run=%s stages=%d span=%s (worker holds norm+head; sampling stays "
+            "local)" % (args.pipeline, n_stages, span or "unstated"))
+        return GP.make_pipeline_backend(plane, args.pipeline, n_stages, base_dir, cfg_dir,
+                                        device=device, timeout=float(
+                                            os.environ.get("NEURAHASH_PIPE_TIMEOUT_S", "600")),
+                                        log=log)
     # HARD VRAM CAP -- set for EVERY load path BEFORE the first CUDA allocation (project rule
     # vram-cap-live-verified; 2026-07-24 incident: an uncapped load took 32,077/32,607 MiB,
     # starved the display, crashed the box). Honors NEURAHASH_VRAM_CAP_GB; default leaves ~8 GiB
@@ -655,6 +692,14 @@ def build_parser():
                     help="load the FULL GLM bf16 with a hard VRAM cap + CPU/disk offload (59 GiB "
                          "on disk -- slow bootstrap for big-RAM boxes; the fleet answer is "
                          "pipeline rollouts across many cards)")
+    ap.add_argument("--pipeline", default=None,
+                    help="run id of a fleet-hosted pipeline (tools/glm_pipe_stage.py miners hold "
+                         "the layers; this worker holds only norm+head and samples locally)")
+    ap.add_argument("--pipe-stages", dest="pipe_stages", type=int, default=0,
+                    help="number of pipeline stages serving --pipeline")
+    ap.add_argument("--pipe-span", dest="pipe_span", default=None,
+                    help="layer span the stage fleet covers, lo:hi -- refused if truncated "
+                         "unless --allow-partial (a partial policy has no training signal)")
     return ap
 
 

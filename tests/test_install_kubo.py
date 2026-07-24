@@ -289,45 +289,5 @@ def test_default_fetch_refuses_non_https():
         ik._default_fetch("http://dist.ipfs.tech/kubo/v0.42.0/kubo.zip")
 
 
-# ------------------------------------------------- run_miner wiring: --doctor reflects reality
-def test_doctor_pinning_backend_reflects_reality(tmp_path, monkeypatch):
-    """The --doctor line must track the MACHINE, not a PATH lookup: FAIL (naming the auto-install
-    outcome) when nothing can pin, PASS naming the binary once one is installed in the work dir."""
-    from tools import run_miner as rm
-
-    monkeypatch.setattr(ik.shutil, "which", _fake_which)
-    monkeypatch.delenv("PINATA_JWT", raising=False)
-    monkeypatch.delenv("PINATA_JWT_FILE", raising=False)
-    monkeypatch.setenv(ik.IPFS_BIN_ENV, "")
-    monkeypatch.setenv(ik.AUTO_INSTALL_ENV, "0")             # opt-out: no network in this test
-    monkeypatch.setattr(rm, "KUBO_AUTO_REASON", None)
-    wd = str(tmp_path)
-
-    def pinning(work_dir):
-        rm.ensure_pinning_backend(work_dir)                  # what main() does before --doctor
-        _code, checks = rm.doctor(work_dir, head_fn=lambda _u: (True, "HTTP 200"))
-        return [c for c in checks if c["name"] == "pinning backend"][0]
-
-    absent = pinning(wd)
-    assert absent["ok"] is False
-    assert "auto-install disabled" in absent["detail"]
-    assert "install kubo, or set PINATA_JWT" in absent["remedy"]
-
-    os.makedirs(ik.install_dir(wd))
-    binary = os.path.join(ik.install_dir(wd), "ipfs.exe" if os.name == "nt" else "ipfs")
-    with open(binary, "wb") as f:
-        f.write(PAYLOAD)
-    present = pinning(wd)
-    assert present["ok"] is True
-    assert binary in present["detail"]
-    assert os.environ[ik.IPFS_BIN_ENV] == binary             # named explicitly, PATH untouched
-    assert rm.publish_mode(wd) == (False, "NEURAHASH_DILOCO_MERGE_URL not set")   # pinning is OK now
-
-
-def test_ensure_pinning_backend_skips_when_pinata_configured(tmp_path, monkeypatch):
-    from tools import run_miner as rm
-
-    monkeypatch.setenv("PINATA_JWT", "fake-jwt-for-test")
-    monkeypatch.setattr(ik, "ensure_kubo",
-                        lambda *_a, **_k: pytest.fail("must not install when Pinata is configured"))
-    assert rm.ensure_pinning_backend(str(tmp_path)) is None
+# The run_miner --doctor wiring tests were removed with the deprecated Qwen turnkey lane
+# (2026-07-24); install_kubo itself remains covered by every test above.

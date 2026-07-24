@@ -56,13 +56,27 @@ dated result sections below are kept as the project's historical record.
 
 Honesty first: today's lane proves the **network** (trustless training, verified payouts, living
 corpus) — it does not make the base model smarter on standard benchmarks, and we won't pretend
-otherwise. The path that does is **verifiable-reward post-training** (alpha-4), and before any
-fleet-scale run we bound ourselves to a gate: **G1**, a pre-registered 2-GPU ablation on
-GLM-4.7-Flash — held-out LiveCodeBench / competition-math / MMLU-Pro, McNemar significance,
-hard training-budget caps, results published **win or lose**. The full frozen protocol is in
-[docs/G1_PREREGISTRATION_2026-07-24.md](docs/G1_PREREGISTRATION_2026-07-24.md) — published here
-*before* any training so nobody (including us) can move the goalposts. If G1 fails twice, we say
-so publicly and rethink; miners' time is never spent on a recipe this gate has not passed.
+otherwise. The path that does is **verifiable-reward post-training (RLVR)**, and it is coming as
+a **real open training campaign — G1** — whose one goal is a measurably smarter GLM, where every
+joining miner does real training work (generating and verifying reasoning rollouts is the
+compute-dominant part of RLVR) and more miners means the verdict arrives sooner.
+
+- **The protocol is frozen and public**:
+  [docs/G1_PREREGISTRATION_2026-07-24.md](docs/G1_PREREGISTRATION_2026-07-24.md) — held-out
+  LiveCodeBench / competition-math / MMLU-Pro, McNemar significance, outcome-based stopping
+  (stable success, or an honest published negative), the eval sets never shipped to miners.
+  Published *before* any training so nobody — including us — can move the goalposts.
+- **The training engine is built and tested**: verifiable math tasks distributed like the corpus,
+  an un-gameable reward checker, the rollout worker (the miner "train" role), and the GRPO
+  learner — all landing after final on-GPU verification. The campaign opens on this same keyless
+  client; joining it will be the same one command.
+- **The trained model belongs to everyone and cannot be lost**: every accepted training result is
+  mirrored to HuggingFace (`neurahash-data/glm_ckpt`) with a `best.json` naming the
+  best-so-far checkpoint — verified reconstructable from HF alone, with the operator's
+  infrastructure switched off.
+
+If G1's recipe fails its own gate, we say so publicly and rethink; miners' time is never spent on
+a recipe the gate has not passed.
 
 ---
 
@@ -205,7 +219,11 @@ fits what you can currently spare.
 
 ## Alpha 3.1 (2026-07-24) — keyless mining, and a crash that can't happen again
 
-**Status (2026-07-24, shipping as `v3.1.0`).**
+**Status (2026-07-24, SHIPPED as the owner-signed `v3.1.0`** — the update chain was re-proven on
+release day: a stale v3.0.0 clone verified the signature against the pinned key and applied
+`v3.1.0` with no re-exec loop, and a brand-new user (fresh clone of the signed release, no key,
+empty data dir) booted straight into mining: wallet auto-created → corpus self-fetched and
+verified → training, first try.**)
 
 - **Keyless open admission — nobody issues you anything.** Run the contributor with no `--key`
   and no `--miner`: your machine makes its own secp256k1 wallet, your name derives from your

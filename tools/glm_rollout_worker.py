@@ -683,6 +683,14 @@ def _load_tasks_dir(tasks_dir, max_tasks=None):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    # v3.2.1: signed auto-update at startup (same fail-closed, pinned-key, 6h-rate-limited check the
+    # contributor runs; opt-out NEURAHASH_AUTOUPDATE=off). A verified forward release re-execs us
+    # BEFORE the heavy model load; any failure just continues on current code.
+    try:
+        from self_update import check_and_update                 # lazy; sys.path has _HERE
+        check_and_update()
+    except Exception as e:                                       # noqa: BLE001 -- never block rollouts
+        _stderr_log("auto-update check failed (%r); continuing on current code" % (e,))
     if not args.url and not args.tasks_dir:
         raise SystemExit("ERROR: give --url (lane) or --tasks-dir (local tasks); neither was set.")
     fetch_tasks_fn = None

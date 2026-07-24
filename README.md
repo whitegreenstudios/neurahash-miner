@@ -263,6 +263,16 @@ the same content lane the training deltas ride. Same keyless wallet identity as 
 
 CE-lane mining is unchanged — small cards keep training and earning exactly as in v3.1.0.
 
+**v3.2.1 — auto-update is now actually wired in.** Honest finding from release day: the signed
+updater (`tools/self_update.py`) was fully built, but nothing in the GLM-only client ever *called*
+it — the automatic checks lived in the deprecated legacy client, so a running miner sat on old
+code forever. As of v3.2.1 the contributor checks **at startup and every ~6h at a safe
+between-rounds boundary** (the rollout worker checks at startup): signature verified against the
+pinned release key, forward-only, fail-closed (any error → keep mining on current code), and
+rate-limit-stamped *before* each attempt so a broken release can never re-exec-loop. Opt out with
+`NEURAHASH_AUTOUPDATE=off`. From this release on, every signed release reaches every running
+miner within ~6h with no action from anyone.
+
 ## Alpha 3.1 (2026-07-24) — keyless mining, and a crash that can't happen again
 
 **Status (2026-07-24, SHIPPED as the owner-signed `v3.1.0`** — the update chain was re-proven on

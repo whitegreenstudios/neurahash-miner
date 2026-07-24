@@ -1196,6 +1196,38 @@ def async_publish_name(base_event, miner, k):
     return "%s.%d" % (contrib_name(base_event, miner), int(k))
 
 
+# ==================================================================== v3.2.1 signed auto-update wire
+# Why this exists: tools/self_update.py (the signed, pinned-key, fail-closed updater) was fully built
+# but NOTHING in the GLM-only client ever called it -- the automatic startup/periodic checks lived in
+# the deprecated legacy pool client, so a running GLM miner sat on an old release forever (found live
+# 2026-07-24: the 4060 stayed on v3.1.0 after v3.2.0 was signed). This wire calls it at process
+# startup and at the SAME safe between-rounds boundary as the corpus resync. Properties, all
+# inherited from check_and_update(): FAIL-CLOSED (any error -> keep mining on current code),
+# signature verified against the PINNED release key (no host can forge one, only withhold), forward-
+# only (no rollback), 6h rate limit persisted in a dotfile stamped BEFORE the attempt (a broken
+# release cannot re-exec loop), opt-out NEURAHASH_AUTOUPDATE=off. On a verified forward release it
+# RE-EXECS this process with its original argv -- the lane treats that as normal miner churn.
+def _maybe_self_update(log=_flush, _check=None):
+    """One rate-limited signed-update check; never raises Exception into the mining loop (SystemExit
+    from the updater's own re-exec/exit path is deliberately NOT swallowed -- swallowing it would
+    cancel the update). Returns the UpdateResult, or None when the check itself failed."""
+    try:
+        if _check is None:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from self_update import check_and_update as _check
+        r = _check()
+        act = getattr(r, "action", None)
+        if act not in ("rate-limited", "disabled", "no-op-not-forward", None):
+            log("[auto-update] %s" % (r,))
+        return r
+    except Exception as e:                                       # noqa: BLE001 -- never kill mining
+        try:
+            log("[auto-update] WARN: check failed (%r); mining continues on current code" % (e,))
+        except Exception:                                        # noqa: BLE001
+            pass
+        return None
+
+
 def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log,
                *, wallet=None):
     """NON-BLOCKING async cadence (alpha 2.0 #146). Selected by main() only when the coordinator
@@ -1233,6 +1265,10 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         log("[glm-contrib %s] periodic corpus resync ENABLED (NEURAHASH_GLM_DATA_RESYNC): re-checking "
             "the advertised data record at each round boundary; fail-closed keeps the old corpus" % miner)
     while rounds_done < args.max_rounds:
+        # -- (0a) v3.2.1 signed auto-update: same SAFE between-rounds boundary as the resync below;
+        # internally 6h rate-limited via dotfile, so this is one cheap file-stat on all but ~4
+        # checks/day. A verified forward release re-execs us here -- never mid-train.
+        _maybe_self_update(log)
         # -- (0) alpha 3.0 periodic corpus re-sync: a SAFE between-rounds boundary (never mid-train).
         # Flag-gated + zero I/O when the record is unchanged. On a VERIFIED new corpus, reload our ids so
         # the next train step uses the fresh data with NO restart; on an unverifiable one, keep the old.
@@ -1391,6 +1427,10 @@ def main(argv=None):
                          "(sharddiloco_glm_expert.garbage_delta) that the secret-probe gate must REJECT")
     add_common_args(ap)
     args = ap.parse_args(argv)
+
+    # v3.2.1: signed auto-update at STARTUP -- before the heavy model load, so a fresh release
+    # re-execs cheaply. Fail-closed + 6h rate-limited + opt-out (NEURAHASH_AUTOUPDATE=off).
+    _maybe_self_update(_flush)
 
     use_glm_lane_names()
     key, wallet = _resolve_identity(args, log=_flush)

@@ -216,6 +216,27 @@ hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory ra
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
 
+## Alpha 3.0 (2026-07-24) — daily corpus, auto-updated to every running miner
+
+**Status (2026-07-24, shipping as `v3.0.0`).** Alpha 3.0 makes the training data a living thing:
+
+- **Daily corpus, zero effort.** The coordinator now publishes a fresh, license-clean daily corpus
+  (arXiv abstracts / Wikipedia summaries / Hacker News) with a signed sha256 manifest. A miner with an
+  **empty** data dir fills it by itself; nothing to download or configure.
+- **Auto-update while running.** With `NEURAHASH_GLM_DATA_RESYNC=1`, a *running* miner re-checks the
+  advertised corpus at every round boundary and, when a new version is published, re-fetches + verifies
+  and trains on it with **no restart**. Fail-closed: an unverifiable corpus is refused and the
+  known-good one kept. Proven live on two stranger machines (RTX 5090 + RTX 4060 over the real WAN) —
+  both picked up a mid-run v2 re-publish (`corpus resync: manifest a5c6f0be..->9648c756..`).
+- **Restart-proof lineage.** A coordinator restarting on a content store that still holds an old run's
+  records can no longer strand miners: it publishes a genesis pointer at boot, and the miner-side
+  catch-up now verifies every folded record against the advertised lineage (fail-closed rollback +
+  frontier clamp), covered by new regression tests.
+- **Research honesty note (why alpha-3 ships few features):** we spent the cycle answering the question
+  the training plateau demanded. Verdict: the plateau is a base-model *capability* ceiling, not a
+  data/storage one — so the roadmap now points at verifiable-reward post-training (alpha-4). Details
+  land with the alpha-4 release.
+
 ## Alpha 2.0 (2026-07-24) — truly decoupled, self-syncing corpus, trustless-settled
 
 **Status (2026-07-24, shipped as the signed `v2.0.0` auto-update — you are reading this because your

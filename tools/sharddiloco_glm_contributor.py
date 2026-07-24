@@ -782,6 +782,87 @@ def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get):
         % (len(files), DATA_RECORD_NAME))
 
 
+# ==================================================================== alpha 3.0 periodic corpus resync
+# glm_data_autosync (W6) runs ONCE at startup. Alpha 3.0 Objective 2 lets a RUNNING miner pick up a
+# freshly-published corpus WITHOUT a restart: behind NEURAHASH_GLM_DATA_RESYNC (default OFF -> the
+# whole block is unreachable and the lane is byte-identical to alpha 2.0), the async loop re-reads the
+# advertised data record at a round boundary and, ONLY when the manifest sha changed, re-runs the SAME
+# fail-closed fetch+verify (glm_data_autosync -- not duplicated). "Fail-closed" here means KEEP the old
+# verified corpus on any unverifiable update: a running miner never trains on garbage and never dies
+# because tomorrow's seed was briefly unreachable. The change-detection is a PURE function so the
+# common no-change case is one dict compare (zero fetch) and is unit-tested with no I/O.
+_RESYNC_OPT_IN = ("1", "true", "yes", "on")
+
+
+def _data_resync_enabled(env=None):
+    """THE guard for the alpha-3.0 periodic re-sync (acceptance #4). Returns True iff
+    NEURAHASH_GLM_DATA_RESYNC is an explicit opt-in (1/true/yes/on); unset or anything else -> False,
+    and _run_async then never reaches the re-check (flag-off == alpha-2.0 byte-identical)."""
+    e = os.environ if env is None else env
+    return (e.get("NEURAHASH_GLM_DATA_RESYNC", "") or "").strip().lower() in _RESYNC_OPT_IN
+
+
+def plan_data_resync(prev_record, new_record):
+    """PURE decision (no I/O) the periodic re-sync makes at every round boundary, so the common
+    "nothing changed" case costs one dict compare and NEVER fetches. Given the record the miner last
+    verified against (prev_record) and the one now advertised (new_record; None if absent/unreadable),
+    return (changed, old_sha, new_sha, changed_files):
+      * changed       -- True iff new_record is a dict carrying a manifest_sha256 that DIFFERS from
+                         prev_record's. A missing/None/sha-less new_record -> False (never treat a
+                         vanished or malformed record as a reason to disturb the running corpus).
+      * changed_files -- sorted names whose files[name]['sha256'] differs between the two records
+                         (added, removed, or re-hashed) -- the N in "re-fetched N file(s)". Only
+                         computed once the sha gate has already fired.
+    manifest_sha256 is the sha of the exact manifest bytes (glm_publish_data.py:178), so it flips iff
+    any published file changed -- the cheapest possible change signal."""
+    new_sha = new_record.get("manifest_sha256") if isinstance(new_record, dict) else None
+    old_sha = prev_record.get("manifest_sha256") if isinstance(prev_record, dict) else None
+    if not new_sha or new_sha == old_sha:
+        return False, old_sha, new_sha, []
+    old_files = (prev_record.get("files") or {}) if isinstance(prev_record, dict) else {}
+    new_files = new_record.get("files") or {}
+
+    def _sha_of(files, name):
+        v = files.get(name)
+        return v.get("sha256") if isinstance(v, dict) else None
+
+    changed_files = sorted(n for n in (set(old_files) | set(new_files))
+                           if _sha_of(old_files, n) != _sha_of(new_files, n))
+    return True, old_sha, new_sha, changed_files
+
+
+def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=data_http_get, env=None):
+    """Alpha-3.0 periodic corpus re-sync STEP (Objective 2), safe to call at every async round
+    boundary. Returns (record_now, refreshed):
+      * flag OFF -> (prev_record, False), ZERO I/O. (_run_async's guard already skips it; the internal
+        check makes the function independently safe + testable.)
+      * flag ON, record unchanged -> (prev_record, False): one lane read + a dict compare, NO fetch.
+      * flag ON, manifest sha changed -> re-run glm_data_autosync (the SAME fail-closed fetch+verify,
+        reused not duplicated). SUCCESS -> log "corpus resync: manifest <old>..-><new>.. re-fetched N
+        file(s)" and return (new_record, True) so the caller reloads its ids + advances its baseline.
+        FAIL-CLOSED: if the new corpus cannot be verified (autosync raises SystemExit), the old
+        verified files on disk are left untouched -- log the refusal and return (prev_record, False)
+        so the miner keeps training on the KNOWN-GOOD corpus and retries next boundary.
+    (glm_data_autosync's own F1 guard still protects the disk if the new record names a disallowed
+    file -- it fetches nothing in that case, so no unverified/secret split can ever land.)"""
+    if not _data_resync_enabled(env):
+        return prev_record, False
+    new_record = _read_data_record(lane)
+    changed, old_sha, new_sha, changed_files = plan_data_resync(prev_record, new_record)
+    if not changed:
+        return prev_record, False
+    try:
+        glm_data_autosync(lane, data_dir, log=log, http_get=http_get)
+    except SystemExit as e:
+        log("[glm-contrib] corpus resync REFUSED: new manifest %s..->%s.. failed fail-closed verify "
+            "(rc%s) -- keeping the current verified corpus, will retry next round"
+            % (str(old_sha)[:8], str(new_sha)[:8], getattr(e, "code", "?")))
+        return prev_record, False
+    log("[glm-contrib] corpus resync: manifest %s..->%s.. re-fetched %d file(s)"
+        % (str(old_sha)[:8], str(new_sha)[:8], len(changed_files)))
+    return new_record, True
+
+
 # ============================================================================== contributor CLI
 def _resolve_key(args):
     if args.key:
@@ -856,6 +937,86 @@ def scan_accepted_events_bounded(manifest_names, last_applied, frontier, max_sca
         return evs
     f = int(frontier)
     return [e for e in evs if e <= f]
+
+
+def _clamp_base_event(last_applied, frontier):
+    """P3 (dead-run lineage fix): a contribution's base_event MUST NOT exceed the frontier the latched
+    pointer advertises. Publishing base_event > pointer.event is exactly the 'future-base-event' the
+    coordinator drops (measured live 2026-07-24: a dead run's leftovers pushed a contributor's frontier
+    hundreds of events past a fresh coordinator -> 561+ drops, mints starved). Returns min(last_applied,
+    frontier); frontier None -> unbounded (== last_applied). Pure."""
+    b = int(last_applied)
+    if frontier is None:
+        return b
+    f = int(frontier)
+    return f if b > f else b
+
+
+def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
+    """Fold ONE coordinator accepted record, then VERIFY replica bit-exactness: our local model_root MUST
+    equal the record's advertised model_root. That invariant is the whole reason model_root exists (see its
+    docstring) -- a divergent local replay is caught IMMEDIATELY. Two fail-CLOSED outcomes stop a
+    never-deleting store's dead-run leftovers (measured live 2026-07-24) from poisoning our base:
+      * own-slot re-gate tripped     -> (False, 'poison', rejected): caller aborts rc8 (severity unchanged).
+      * post-fold root != advertised -> (False, 'lineage', []): the record is NOT on our latched lineage;
+        EVERY slot is restored exactly (rollback), so the base is byte-identical to before this call.
+    Clean fold -> (True, 'ok', []). Snapshots all slots up front (DEEP-copied: read_slot returns numpy VIEWS
+    that share storage with the model, so apply_accepted's in-place copy_ would otherwise mutate the snapshot
+    too and make the rollback a no-op). Mirrors the coordinator's _lineage_ok wrong-lineage-root drop,
+    node-side. A record without an advertised model_root (never emitted by the async coordinator) is folded
+    as before (no false reject)."""
+    snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}     # DEEP copy -> real rollback
+            for j in range(len(host.slots))]
+    rejected = []
+    apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=own_slot)
+    if rejected:
+        return False, "poison", rejected                          # caller handles rc8 (do not advance)
+    want = rec.get("model_root")
+    if want is not None and model_root(host) != str(want):
+        for j, d in enumerate(snap):
+            host.write_slot(j, d)                                 # UNFOLD everything: off-lineage, fail-closed
+        return False, "lineage", []
+    return True, "ok", []
+
+
+def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log):
+    """The non-blocking accepted-record catch-up of _run_async, FACTORED OUT so the dead-run lineage guard
+    is unit-testable against a dirty namespace. Fold every visible accepted record in (last_applied,
+    frontier] IN ORDER via _fold_accepted_checked, which fail-CLOSES on an off-lineage record: the frontier
+    NEVER advances past a record we could not validate, so a previous run's leftovers (still listed by the
+    never-deleting store) can never become our training base. Returns (last_applied, applied_any, abort):
+    abort is None normally, or 8 when an own-slot delta tripped the local re-gate (rc8, unchanged). Emits at
+    most ONE aggregate LINEAGE-SKIP line (never one per record). Non-blocking: no visible record ->
+    (unchanged, False, None) and the caller trains against the current base."""
+    applied_any = False
+    skipped_at = None
+    for e in scan_accepted_events_bounded(man, last_applied, frontier):
+        entry = man.get(accepted_name(e))
+        if not entry:
+            break                                            # gap: stop -- never fold out of order
+        try:
+            rec = lane.get_json(entry["sha256"])
+        except Exception:                                    # noqa: BLE001
+            break                                            # transient fetch fail -> retry next tick
+        ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=log)
+        if reason == "poison":
+            log("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at event %d "
+                "(regressed local held-out CE or mismatched shape). The pointer + accepted record "
+                "ride an UNSIGNED shared-token lane, so this looks like a forged/poisoned record -- "
+                "refusing to fold it and aborting rather than training on a poisoned base."
+                % (miner, len(rejected), e))
+            return last_applied, applied_any, 8
+        if reason == "lineage":
+            skipped_at = e
+            break                                            # frontier held; never fold past an off-lineage record
+        last_applied = e
+        applied_any = True
+    if skipped_at is not None:
+        log("[glm-contrib %s] LINEAGE-SKIP: accepted record at event %d does not extend our latched "
+            "lineage (local model_root != its advertised root) -- a previous run's leftover in the "
+            "never-deleting store; refusing to fold it, frontier held at event %d (fail-closed)."
+            % (miner, skipped_at, last_applied))
+    return last_applied, applied_any, None
 
 
 def async_should_abort_no_progress(local_root, pointer_root, applied_any, seconds_since_progress,
@@ -934,7 +1095,26 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     rounds_done = 0             # OUR OWN published contributions -- this is what --max-rounds counts here
     log("[glm-contrib %s] ASYNC cadence (v2 lane, #146): non-blocking; train continuously, never wait "
         "on a barrier. --max-rounds=%d counts our own contributions." % (miner, args.max_rounds))
+    # -- alpha 3.0 Objective 2: periodic corpus re-sync baseline. OFF unless NEURAHASH_GLM_DATA_RESYNC;
+    # when off, _resync_on is False and NOTHING below (no lane read, no fetch, no reload) ever runs, so
+    # this lane stays byte-identical to alpha 2.0. The seed record is the one the startup autosync just
+    # verified against, so the first round's compare is a no-op (nothing changed yet).
+    _resync_on = _data_resync_enabled(os.environ)
+    _prev_data_record = _read_data_record(lane) if _resync_on else None
+    if _resync_on:
+        log("[glm-contrib %s] periodic corpus resync ENABLED (NEURAHASH_GLM_DATA_RESYNC): re-checking "
+            "the advertised data record at each round boundary; fail-closed keeps the old corpus" % miner)
     while rounds_done < args.max_rounds:
+        # -- (0) alpha 3.0 periodic corpus re-sync: a SAFE between-rounds boundary (never mid-train).
+        # Flag-gated + zero I/O when the record is unchanged. On a VERIFIED new corpus, reload our ids so
+        # the next train step uses the fresh data with NO restart; on an unverifiable one, keep the old.
+        if _resync_on:
+            _prev_data_record, _refreshed = glm_data_periodic_resync(
+                lane, args.data_dir, _prev_data_record, log=log)
+            if _refreshed:
+                train_ids = node_ids(args, i, "train")
+                val_ids = node_ids(args, i, "val")
+                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
         try:
             ptr = lane.read_pointer()
@@ -955,32 +1135,21 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             return 0
         pointer_root = dec["model_root"]
 
-        # -- (1) NON-BLOCKING catch-up: fold every accepted record past last_applied, IN ORDER. -------
+        # -- (1) NON-BLOCKING catch-up: fold every accepted record past last_applied, IN ORDER, but ONLY
+        #    those that extend OUR latched lineage (P2 dead-run guard: a never-deleting store still lists a
+        #    previous run's accepted records at events THIS run has not reached; folding them poisons our
+        #    base -> the future-base-event drop storm measured live 2026-07-24). catch_up_accepted verifies
+        #    each fold reproduces the coordinator's advertised root and fail-CLOSES otherwise, holding the
+        #    frontier. Non-blocking: nothing visible -> train against the current base rather than wait. ---
         try:
             man = lane.manifest()
         except Exception:                                        # noqa: BLE001
             time.sleep(args.poll)
             continue
-        applied_any = False
-        for e in scan_accepted_events_bounded(man, last_applied, dec.get("event")):
-            entry = man.get(accepted_name(e))
-            if not entry:
-                break                                            # gap: stop -- never fold out of order
-            try:
-                rec = lane.get_json(entry["sha256"])
-            except Exception:                                    # noqa: BLE001
-                break                                            # transient fetch fail -> retry next tick
-            rejected = []
-            apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=i)
-            if rejected:
-                log("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at event %d "
-                    "(regressed local held-out CE or mismatched shape). The pointer + accepted record "
-                    "ride an UNSIGNED shared-token lane, so this looks like a forged/poisoned record -- "
-                    "refusing to fold it and aborting rather than training on a poisoned base."
-                    % (miner, len(rejected), e))
-                return 8
-            last_applied = e
-            applied_any = True
+        last_applied, applied_any, _abort = catch_up_accepted(
+            host, lane, man, last_applied, dec.get("event"), regate_ce, i, miner, log)
+        if _abort is not None:
+            return _abort                                        # rc8: poisoned own-slot delta (unchanged)
         if applied_any:
             last_progress_t = time.time()
 
@@ -1009,7 +1178,14 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
 
         # -- (4) publish today's payload + signed record EXTENDED with base_event/base_root/steps/tokens.
-        base_event = int(last_applied)         # the event this delta was trained against
+        # P3: never publish a base_event beyond the frontier the latched pointer advertises (fail-closed
+        # clamp; the coordinator drops base_event > cur_event as future-base-event). With the P2 guard in
+        # place last_applied <= frontier already, so this is a defense-in-depth no-op on the happy path.
+        base_event = _clamp_base_event(last_applied, dec.get("event"))
+        if base_event != int(last_applied):
+            log("[glm-contrib %s] BASE-CLAMP: last_applied=%d exceeds pointer frontier event=%s -- clamped "
+                "base_event to the frontier (dead-run leftover folded past the live coordinator?)."
+                % (miner, int(last_applied), dec.get("event")))
         ecid = lane.put_delta(payload)
         sig = H.sign(key, ecid, base_event, miner)               # r-number == base_event (W2 reads it so)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))

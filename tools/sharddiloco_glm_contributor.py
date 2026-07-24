@@ -296,6 +296,9 @@ def apply_vram_guard(device, need_gib, log=None):
     return cap_gib
 
 
+_VRAM_MGR = None   # per-process VramManager singleton (set below; one manager per process by design)
+
+
 def _maybe_start_vram_manager(args, need_gib, log=None):
     """OPT-IN unified-VRAM path (env NEURAHASH_VRAM_MANAGER). Returns the started VramManager, or
     None when the flag is OFF -- in which case build_node_model runs the EXISTING apply_vram_guard
@@ -351,7 +354,53 @@ def _maybe_start_vram_manager(args, need_gib, log=None):
                           name="vram-manager", daemon=True)
     th.start()
     mgr._loop_stop, mgr._loop_thread = stop, th     # keep the loop refs alive on the returned manager
+    global _VRAM_MGR
+    _VRAM_MGR = mgr                                 # round loops consult this via _vram_units()
     return mgr
+
+
+def _vram_units(vm=None):
+    """Current sustainable resident-unit capacity, or None when no manager runs (flag off)."""
+    m = vm if vm is not None else _VRAM_MGR
+    if m is None:
+        return None
+    try:
+        return int(m.tuner.current_units)
+    except Exception:                               # noqa: BLE001 -- capacity probe must never crash a round
+        return None
+
+
+def _vram_pause_if_starved(log, miner="", vm=None, poll_s=15.0, sleep_fn=None, max_waits=None):
+    """The elastic-VRAM PAUSE the design promised ("it pauses instead of spilling"): when the
+    manager advertises 0 sustainable units, BLOCK here (log once, re-check every poll_s) instead
+    of entering train/eval that will OOM. Crash this prevents (2026-07-24, keyless live test):
+    "[vram-manager] resize 12 -> 0" immediately followed by a fatal CUDA OOM inside heldout_ce
+    (openadm_contrib5090.log:60-92). Returns the number of waits; no-manager / units>0 -> 0
+    immediately. max_waits + sleep_fn are test seams."""
+    sleep_fn = sleep_fn or time.sleep
+    waits = 0
+    u = _vram_units(vm)
+    if u is None or u > 0:
+        return 0
+    log("[glm-contrib %s] VRAM starved: manager advertises 0 sustainable units -- PAUSED "
+        "(re-checking every %.0fs; training resumes when capacity returns)" % (miner, poll_s))
+    while True:
+        sleep_fn(poll_s)
+        waits += 1
+        u = _vram_units(vm)
+        if u is None or u > 0:
+            log("[glm-contrib %s] VRAM recovered (%s unit(s)) -- resuming after %d wait(s)"
+                % (miner, "?" if u is None else str(u), waits))
+            return waits
+        if max_waits is not None and waits >= max_waits:
+            return waits
+
+
+def _is_cuda_oom(exc):
+    """True for CUDA out-of-memory errors. torch.cuda.OutOfMemoryError subclasses RuntimeError,
+    so a message check covers both it and the classic RuntimeError('CUDA out of memory') --
+    and keeps this helper importable torch-free for tests."""
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def build_node_model(args, log=None, need_gib=None):
@@ -865,6 +914,9 @@ def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=da
 
 # ============================================================================== contributor CLI
 def _resolve_key(args):
+    """The keyed (operator-issued) HMAC signing key, or None. --key / --key-file / NEURAHASH_SD_KEY -> a
+    16-byte HMAC key (the roster identity, byte-identical to before). NONE set -> None, and the caller falls
+    back to the LOCAL wallet identity (keyless open admission). No longer raises: keyless is now the default."""
     if args.key:
         return bytes.fromhex(args.key)
     if args.key_file and os.path.exists(args.key_file):
@@ -872,7 +924,75 @@ def _resolve_key(args):
     env = os.environ.get("NEURAHASH_SD_KEY")
     if env:
         return bytes.fromhex(env)
-    raise SystemExit("[glm-contrib] no signing key: pass --key <hex16> / --key-file / NEURAHASH_SD_KEY")
+    return None
+
+
+def derive_glm_miner_name(address):
+    """Keyless miner id derived from a wallet address: 'glm-' + the first 8 hex chars (0x stripped). 32 bits
+    of address -> collision-free enough for a first-seen name pin, and needs NO operator-issued name. The
+    coordinator derives the SAME name from the RECOVERED signer address, so a keyless miner can only ever use
+    the name its own key produces -- that binding is open admission's no-spoofing property."""
+    a = str(address)
+    if a[:2] in ("0x", "0X"):
+        a = a[2:]
+    return "glm-" + a[:8]
+
+
+def _default_wallet_path(args):
+    """Where the keyless wallet identity lives: --wallet-file / NEURAHASH_SD_WALLET / ~/.neurahash/glm_miner_key
+    (durable, so the identity -- and its payout address -- is STABLE across restarts)."""
+    p = (getattr(args, "wallet_file", None) or os.environ.get("NEURAHASH_SD_WALLET", "") or "").strip()
+    return p or os.path.join(os.path.expanduser("~"), ".neurahash", "glm_miner_key")
+
+
+def _load_or_create_wallet(args, log=None):
+    """Load (or CREATE on first run) this miner's LOCAL secp256k1 wallet identity -- the keyless-admission
+    identity AND payout address. Same on-disk format as a pool worker key (a bare private-key hex), so the key
+    created here doubles as a wallet key. Mirrors tools/diloco_contributor._miner_account, but ALWAYS returns
+    an account (a stranger must be able to join with NO config), creating + persisting one when absent."""
+    from neura_l1.signing import account_from_key, gen_account
+    path = _default_wallet_path(args)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            acct = account_from_key(f.read().strip())
+        if log:
+            log("[glm-contrib] wallet identity loaded from %s -> %s" % (path, acct.address))
+        return acct
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    acct = gen_account()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(acct.key.hex())
+    try:
+        os.chmod(path, 0o600)                                # best-effort secrecy (no-op semantics on Windows)
+    except Exception:                                        # noqa: BLE001 -- never fail over a chmod
+        pass
+    if log:
+        log("[glm-contrib] wallet identity CREATED at %s -> %s (keyless open admission)" % (path, acct.address))
+    return acct
+
+
+def _resolve_identity(args, log=None):
+    """Resolve THIS miner's signing identity -> (key, wallet). Keyed: (16-byte HMAC key, None) when an
+    operator key was supplied (byte-identical path). Keyless: (None, secp256k1 account) otherwise -- the
+    LOCAL wallet signs a RECOVERABLE ECDSA record the coordinator open-admits by its derived name."""
+    key = _resolve_key(args)
+    if key is not None:
+        return key, None
+    return None, _load_or_create_wallet(args, log=log)
+
+
+def _sign_contrib(key, wallet, cid, base_round, name):
+    """Sign one contribution over the SAME canonical GLM message either role verifies against
+    (dm.contrib_canonical_message, exactly as H.sign builds it): keyed -> HMAC-SHA256 (byte-identical to
+    before); keyless -> secp256k1 sign_bytes over that identical message -- a RECOVERABLE signature the
+    coordinator ecrecovers to the wallet address. Exactly one of (key, wallet) is set."""
+    if key is not None:
+        return H.sign(key, cid, base_round, name)
+    from neura_l1.signing import sign_bytes
+    msg = dm.contrib_canonical_message(cid, base_round, name, None, None)
+    return sign_bytes(wallet, msg)
 
 
 # ==================================================================== alpha 2.0 non-blocking cadence (#146)
@@ -1042,14 +1162,18 @@ def async_should_abort_no_progress(local_root, pointer_root, applied_any, second
 
 
 def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid, sig, train_flops,
-                               delta_bytes, steps, tokens):
+                               delta_bytes, steps, tokens, address=None):
     """Assemble the async-lane contribution record: today's signed record EXTENDED with the alpha-2
     telemetry the coordinator (W2) reads -- base_event (the event this delta was trained against; the
     r-number in the contrib name MEANS this), base_root (our local model_root), steps (inner steps
     executed) and tokens (rows*seq consumed). It is a strict SUPERSET of the sync record: base_round is
     kept == base_event so a v1-shaped reader still finds a base height, mirroring the v2 pointer's
-    superset discipline. Pure dict assembly, no I/O."""
-    return dict(
+    superset discipline. Pure dict assembly, no I/O.
+
+    `address` (open admission, additive): a keyless miner stamps its CLAIMED wallet address here for
+    transparency; the coordinator TRUSTS only the address recovered from `sig`, never this field. None
+    (keyed / flag-off) -> the key is OMITTED, byte-identical to before."""
+    rec = dict(
         miner=miner, expert=int(i), layer=int(L), glm_expert=int(E),
         base_round=int(base_event),          # v1-compat alias: the r-number == base_event
         base_event=int(base_event),
@@ -1057,6 +1181,9 @@ def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid
         train_flops=float(train_flops), trunk_bytes=0, delta_bytes=int(delta_bytes),
         base_root=base_root, steps=int(steps), tokens=int(tokens),
     )
+    if address is not None:
+        rec["address"] = str(address)
+    return rec
 
 
 def async_publish_name(base_event, miner, k):
@@ -1069,7 +1196,8 @@ def async_publish_name(base_event, miner, k):
     return "%s.%d" % (contrib_name(base_event, miner), int(k))
 
 
-def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log):
+def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log,
+               *, wallet=None):
     """NON-BLOCKING async cadence (alpha 2.0 #146). Selected by main() only when the coordinator
     publishes a v2 pointer. The contributor NEVER waits on a barrier: each iteration it
       (1) scans the manifest ONCE and folds any accepted records past last_applied (non-blocking
@@ -1163,19 +1291,37 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             return 6
 
         # -- (3) train H local LoRA steps on my slot against the CURRENT base, ZERO cross-miner comm. --
+        # VRAM-starve PAUSE + OOM round-skip (2026-07-24): never enter train/eval while the manager
+        # advertises 0 sustainable units, and a CUDA OOM mid-round skips the round (cache freed,
+        # pause, retry next round) instead of killing the miner.
+        _vram_pause_if_starved(log, miner=miner)
         t_tr = time.time()
-        if args.garbage:
-            delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rounds_done)
-            train_flops, best_val, steps, tokens = 1.0, float("nan"), 0, 0
-            payload = delta                    # adversarial control stays dense: it has no factors
-        else:
-            c = G.train_glm_expert_contribution(
-                model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
-                batch=args.batch, seed=rounds_done * 100 + i, sel_outer=args.outer)   # F5 select@gate
-            delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
-            steps = int(args.inner)                              # H inner steps executed
-            tokens = int(c.get("n_examples", 0)) * int(seq)      # rows*seq actually consumed
-            payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
+        try:
+            if args.garbage:
+                delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rounds_done)
+                train_flops, best_val, steps, tokens = 1.0, float("nan"), 0, 0
+                payload = delta                    # adversarial control stays dense: it has no factors
+            else:
+                c = G.train_glm_expert_contribution(
+                    model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
+                    batch=args.batch, seed=rounds_done * 100 + i, sel_outer=args.outer)   # F5 select@gate
+                delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
+                steps = int(args.inner)                              # H inner steps executed
+                tokens = int(c.get("n_examples", 0)) * int(seq)      # rows*seq actually consumed
+                payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
+        except Exception as _oom:                                    # noqa: BLE001
+            if not _is_cuda_oom(_oom):
+                raise
+            log("[glm-contrib %s] round SKIPPED: CUDA OOM under memory pressure -- freeing cache + "
+                "pausing, will retry next round (%s)" % (miner, str(_oom)[:120]))
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:                                        # noqa: BLE001
+                pass
+            _vram_pause_if_starved(log, miner=miner)
+            time.sleep(5.0)
+            continue
 
         # -- (4) publish today's payload + signed record EXTENDED with base_event/base_root/steps/tokens.
         # P3: never publish a base_event beyond the frontier the latched pointer advertises (fail-closed
@@ -1187,10 +1333,11 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 "base_event to the frontier (dead-run leftover folded past the live coordinator?)."
                 % (miner, int(last_applied), dec.get("event")))
         ecid = lane.put_delta(payload)
-        sig = H.sign(key, ecid, base_event, miner)               # r-number == base_event (W2 reads it so)
+        sig = _sign_contrib(key, wallet, ecid, base_event, miner)  # HMAC (keyed) or secp256k1 (keyless); r-number == base_event (W2 reads it so)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
         record = build_async_contrib_record(miner, i, L, E, base_event, root, ecid, sig, train_flops,
-                                             delta_bytes, steps, tokens)
+                                             delta_bytes, steps, tokens,
+                                             address=(wallet.address if wallet is not None else None))
         pub_name = async_publish_name(base_event, miner, publish_k)   # F-Q1: unique name per publish
         lane.put_json_named(pub_name, record)
         publish_k += 1
@@ -1208,11 +1355,16 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--miner", default=os.environ.get("NEURAHASH_SD_MINER", "miner0"))
+    ap.add_argument("--miner", default=os.environ.get("NEURAHASH_SD_MINER"),
+                    help="miner id. Keyed: defaults to 'miner0'. KEYLESS (no --key): IGNORED -- the id is "
+                         "derived from the wallet address ('glm-'+addr[2:10]) so the coordinator can bind it")
     ap.add_argument("--slot", type=int, default=int(os.environ.get("NEURAHASH_SD_EXPERT", "0")),
                     help="lane slot index this miner OWNS (maps to --slots[slot])")
     ap.add_argument("--key", default=None)
     ap.add_argument("--key-file", default=None)
+    ap.add_argument("--wallet-file", dest="wallet_file", default=None,
+                    help="path to the LOCAL secp256k1 wallet identity for KEYLESS open admission (created on "
+                         "first run if absent); default NEURAHASH_SD_WALLET or ~/.neurahash/glm_miner_key")
     ap.add_argument("--max-rounds", type=int, default=int(os.environ.get("NEURAHASH_SD_MAX_ROUNDS", "1000")))
     ap.add_argument("--poll", type=float, default=0.25)
     ap.add_argument("--wait-up", type=float, default=300.0,
@@ -1241,16 +1393,26 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     use_glm_lane_names()
-    key = _resolve_key(args)
+    key, wallet = _resolve_identity(args, log=_flush)
     slots = parse_slots(args.slots)
     i = int(args.slot)
     if not (0 <= i < len(slots)):
         raise SystemExit("[glm-contrib] --slot %d out of range for --slots %s" % (i, args.slots))
     L, E = slots[i]
-    miner = args.miner
+    # KEYLESS: the miner id IS the wallet-address derivation (the coordinator binds the name to the recovered
+    # key, so any other name is rejected). KEYED: --miner / NEURAHASH_SD_MINER, else the legacy 'miner0'.
+    if wallet is not None:
+        derived = derive_glm_miner_name(wallet.address)
+        if args.miner and args.miner != derived:
+            _flush("[glm-contrib] NOTE: --miner %s ignored for the keyless identity; the coordinator binds "
+                   "the name to the key -> using derived %s" % (args.miner, derived))
+        miner = derived
+    else:
+        miner = args.miner or "miner0"
     lane = H.ContentLane(args.url, args.token)
-    _flush("[glm-contrib %s] UP owns slot %d = GLM (L%d,E%d) | mode=%s lane=%s (all-outbound)"
-           % (miner, i, L, E, args.mode, args.url))
+    _flush("[glm-contrib %s] UP owns slot %d = GLM (L%d,E%d) | identity=%s mode=%s lane=%s (all-outbound)"
+           % (miner, i, L, E, ("keyed" if key is not None else "keyless " + wallet.address),
+              args.mode, args.url))
 
     if args.mode != "tiny":
         # W6 corpus-over-WAN: fetch+verify this miner's ids files BEFORE anything reads them.
@@ -1296,7 +1458,7 @@ def main(argv=None):
               H.POINTER_NAME))
     if _mode_async:
         return _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner,
-                          train_ids, val_ids, seq, _flush)
+                          train_ids, val_ids, seq, _flush, wallet=wallet)
 
     done_last = -1
     applied = -1            # last round whose ACCEPTED record has been replayed locally
@@ -1350,34 +1512,52 @@ def main(argv=None):
             return 7
 
         # ---- train H local LoRA steps on my slot, with ZERO cross-miner comm ----
+        # VRAM-starve PAUSE + OOM round-skip (2026-07-24): same protection as the async lane.
+        _vram_pause_if_starved(log, miner=miner)
         t_tr = time.time()
         payload = None                    # what actually goes on the wire (dense delta or factors)
-        if args.garbage:
-            delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rnd)
-            train_flops, best_val = 1.0, float("nan")
-            payload = delta               # adversarial control stays dense: it has no factors
-        else:
-            c = G.train_glm_expert_contribution(
-                model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
-                batch=args.batch, seed=rnd * 100 + i, sel_outer=args.outer)   # F5: select at the gate outer
-            delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
-            # WIRE: ship the LoRA FACTORS, not their materialised product. The dense delta IS
-            # scale*(B@A), so the factors carry identical information in 67.7x fewer bytes
-            # (18,874,493 -> 278,731 measured at real GLM dims). This is not an optimisation we can
-            # skip: the shared VPS lane is a ~894 MB box that RESET THE CONNECTION on 18.87 MB
-            # bodies, so dense-over-WAN does not work at all. fp16 transport of the factors
-            # reproduces the product as faithfully as fp16 transport of the product itself
-            # (relative error ratio 0.65x-1.49x across B magnitudes 1e-4..1e-2 -- both are simply
-            # fp16 precision), so the gate cannot decide differently because of the wire.
-            payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
+        try:
+            if args.garbage:
+                delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rnd)
+                train_flops, best_val = 1.0, float("nan")
+                payload = delta               # adversarial control stays dense: it has no factors
+            else:
+                c = G.train_glm_expert_contribution(
+                    model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
+                    batch=args.batch, seed=rnd * 100 + i, sel_outer=args.outer)   # F5: select at the gate outer
+                delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
+                # WIRE: ship the LoRA FACTORS, not their materialised product. The dense delta IS
+                # scale*(B@A), so the factors carry identical information in 67.7x fewer bytes
+                # (18,874,493 -> 278,731 measured at real GLM dims). This is not an optimisation we can
+                # skip: the shared VPS lane is a ~894 MB box that RESET THE CONNECTION on 18.87 MB
+                # bodies, so dense-over-WAN does not work at all. fp16 transport of the factors
+                # reproduces the product as faithfully as fp16 transport of the product itself
+                # (relative error ratio 0.65x-1.49x across B magnitudes 1e-4..1e-2 -- both are simply
+                # fp16 precision), so the gate cannot decide differently because of the wire.
+                payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
+        except Exception as _oom:                                    # noqa: BLE001
+            if not _is_cuda_oom(_oom):
+                raise
+            log("[glm-contrib %s] round %d SKIPPED: CUDA OOM under memory pressure -- freeing cache + "
+                "pausing, will retry next round (%s)" % (miner, rnd, str(_oom)[:120]))
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:                                        # noqa: BLE001
+                pass
+            _vram_pause_if_starved(log, miner=miner)
+            time.sleep(5.0)
+            continue
 
         # ---- publish the fp16 content-addressed delta + a signed record (D1/D2), trunk FROZEN ----
         ecid = lane.put_delta(payload)
-        sig = H.sign(key, ecid, rnd, miner)
+        sig = _sign_contrib(key, wallet, ecid, rnd, miner)       # HMAC (keyed) or secp256k1 (keyless)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
         record = dict(miner=miner, expert=int(i), layer=int(L), glm_expert=int(E), base_round=int(rnd),
                       expert_cid=ecid, trunk_cid=None, sig=sig, train_flops=float(train_flops),
                       trunk_bytes=0, delta_bytes=delta_bytes, base_root=root)
+        if wallet is not None:
+            record["address"] = wallet.address                  # keyless: claimed address (coordinator trusts recovered)
         rname = contrib_name(rnd, miner)
         rec_cid = lane.put_json_named(rname, record)
         done_last = rnd

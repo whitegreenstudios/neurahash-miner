@@ -52,6 +52,20 @@ dated result sections below are kept as the project's historical record.
 
 ---
 
+## The road to a smarter model — G1, pre-registered (2026-07-24)
+
+Honesty first: today's lane proves the **network** (trustless training, verified payouts, living
+corpus) — it does not make the base model smarter on standard benchmarks, and we won't pretend
+otherwise. The path that does is **verifiable-reward post-training** (alpha-4), and before any
+fleet-scale run we bound ourselves to a gate: **G1**, a pre-registered 2-GPU ablation on
+GLM-4.7-Flash — held-out LiveCodeBench / competition-math / MMLU-Pro, McNemar significance,
+hard training-budget caps, results published **win or lose**. The full frozen protocol is in
+[docs/G1_PREREGISTRATION_2026-07-24.md](docs/G1_PREREGISTRATION_2026-07-24.md) — published here
+*before* any training so nobody (including us) can move the goalposts. If G1 fails twice, we say
+so publicly and rethink; miners' time is never spent on a recipe this gate has not passed.
+
+---
+
 ## Install
 
 ```bash
@@ -75,12 +89,14 @@ held-out improvement, so there is no fragile torch/BLAS determinism requirement 
 
 ## Mine — join the GLM shardDiLoCo lane
 
-The lane is roster-gated for now — ask the operator for a **slot number + miner key**
-(permissionless admission is on the roadmap). Then:
+**No key, no signup, no account.** Your machine creates its own wallet identity on first run
+(`~/.neurahash/glm_miner_key` — back it up, it owns your payouts), signs every contribution with
+it, and the network admits you on your first valid signed contribution. Your miner name *is* your
+address (`glm-<addr[2:10]>`), so nobody can impersonate you and no operator can gate you:
 
 ```bash
 python tools/sharddiloco_glm_contributor.py --mode glm \
-  --slot <n> --miner <your-name> --key <roster-key> \
+  --slot <n> \
   --shard-dir <glm-shards> --config-dir <glm-config> \
   --data-dir <empty-dir> --domains daily \
   --url <content-store-url> --token <store-token> --device cuda
@@ -88,10 +104,15 @@ python tools/sharddiloco_glm_contributor.py --mode glm \
 
 Everything heavy is fetched and verified for you: the GLM base shards come from the public bundle
 (see [BUNDLE.md](BUNDLE.md)), an **empty `--data-dir` self-fills** with the advertised corpus
-(sha256-verified, fail-closed), and with `NEURAHASH_GLM_DATA_RESYNC=1` your running miner picks up
-each newly published daily corpus with no restart. All traffic is outbound; NAT is fine. To pull a
-newly signed client release, run `python tools/self_update.py` (signature-verified against the
-pinned release key; wiring it into the contributor loop is on the roadmap).
+(sha256-verified, fail-closed), with `NEURAHASH_GLM_DATA_RESYNC=1` your running miner picks up
+each newly published daily corpus with no restart — and if VRAM gets tight on a shared GPU, the
+miner **pauses instead of crashing** and resumes when memory returns. All traffic is outbound;
+NAT is fine. Payouts settle **to your wallet address** through the staked validator quorum —
+proven live the day this shipped: keyless strangers' mints settled as
+`settled miner=0xc47c93…` with quorum co-signatures. To pull a newly signed client release, run
+`python tools/self_update.py` (signature-verified against the pinned release key).
+
+(`--miner`/`--key` remain supported for operator-rostered miners; they are no longer required.)
 
 ### Useful environment variables
 
@@ -181,6 +202,27 @@ hanging your machine. The static VRAM cap (`NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_
 hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory rather than total. Opt-in,
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
+
+## Alpha 3.1 (2026-07-24) — keyless mining, and a crash that can't happen again
+
+**Status (2026-07-24, shipping as `v3.1.0`).**
+
+- **Keyless open admission — nobody issues you anything.** Run the contributor with no `--key`
+  and no `--miner`: your machine makes its own secp256k1 wallet, your name derives from your
+  address (spoof-proof by construction), the coordinator admits you on your first valid signed
+  contribution, and your mints settle **to your wallet address** through the staked M-of-N
+  quorum. Proven live before shipping: two stranger machines joined with nothing but a fresh
+  clone, trained real GLM (held-out CE 7.71 → 7.45), and their payouts settled to their
+  self-made addresses with quorum co-signatures.
+- **VRAM resilience.** The elastic-VRAM "pause instead of crash" promise is now real: at 0
+  sustainable capacity the miner pauses and re-checks (never enters a doomed train/eval), and a
+  CUDA OOM mid-round now costs one skipped round, not the miner. This was the exact crash a
+  stranger on a busy shared GPU hit during the keyless live test — found and fixed the same day.
+- **One lane** (see the deprecation notice above), and **the G1 pre-registration is published**
+  ([docs/G1_PREREGISTRATION_2026-07-24.md](docs/G1_PREREGISTRATION_2026-07-24.md)): the frozen
+  protocol for the real open training campaign — the run whose goal is a **measurably smarter
+  model**, where every joining miner does real training work and makes the verdict arrive
+  sooner. Published before any training so the goalposts cannot move.
 
 ## Alpha 3.0 (2026-07-24) — daily corpus, auto-updated to every running miner
 

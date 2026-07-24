@@ -136,6 +136,23 @@ proven live the day this shipped: keyless strangers' mints settled as
 | `NEURAHASH_VRAM_MANAGER=on` | elastic VRAM: shed/grow training layers around whatever else uses your GPU |
 | `NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC` | hard per-process GPU memory ceiling |
 
+### G1 train-role — RLVR rollouts (v3.2, capacity-gated)
+
+The [G1 campaign](docs/G1_PREREGISTRATION_2026-07-24.md)'s rollout worker ships in the client:
+
+```bash
+python tools/glm_rollout_worker.py --url <content-store-url> --token <store-token> \
+  --shard-dir <glm-shards> --config-dir <glm-config>
+```
+
+It samples candidate solutions to verifiable math tasks, scores them with the in-repo reward
+(`tools/glm_reward.py` — auditable), and publishes signed rollout sets the GRPO learner trains
+on. **Honest note:** the full rollout policy is 59 GiB bf16, so today this role needs
+`--full-model` on a big-RAM box (slow, VRAM-capped, box-safe) — the worker refuses
+truncated-stack rollouts because a partial policy measured reward 0.0 (no training signal). The
+full-speed engine is fleet-hosted pipeline rollouts across many 8 GiB cards as the fleet grows;
+until your card can take rollout duty, the CE lane above is real training and real earning.
+
 ---
 
 ## What is (and isn't) in this repo
@@ -145,6 +162,7 @@ proven live the day this shipped: keyless strangers' mints settled as
 `tools/sharddiloco_harness.py`, `tools/piece_loader.py`, `tools/diloco_contributor.py`), the base
 bundle fetchers (`tools/fetch_glm_base.py`, `tools/bundle_pointer.py` + the kubo/IPFS fallback),
 the signed self-update chain (`tools/self_update.py`, `tools/sign_release.py`, `release.json`),
+the G1 train-role (`tools/glm_rollout_worker.py` + the verifiable reward `tools/glm_reward.py`),
 elastic-VRAM management, wallet/identity, and — for auditability of the trust root — the staked
 M-of-N settlement/quorum verification code and its tests.
 
@@ -216,6 +234,34 @@ hanging your machine. The static VRAM cap (`NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_
 hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory rather than total. Opt-in,
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
+
+## Alpha 3.2 (2026-07-24) — the G1 train-role ships in the client
+
+The G1 campaign's **rollout worker and its reward function are now part of the miner**
+(`tools/glm_rollout_worker.py`, `tools/glm_reward.py`). In RLVR the rollout-generation step *is*
+the compute-dominant training work: the worker fetches math tasks from the lane
+(sha256-verified, fail-closed), samples N candidate solutions from the current policy, scores
+each with the **verifiable reward** (final-answer match against gold — the exact function that
+decides pay is in this repo, auditable line by line), and signs + publishes the rollout set over
+the same content lane the training deltas ride. Same keyless wallet identity as the CE lane.
+
+**Capacity honesty, so nobody burns GPU for nothing:**
+
+- The full rollout policy is the whole 47-layer GLM — **59 GiB in bf16**. No consumer card holds
+  it, and 4-bit does not rescue it (measured: bnb quantizes only `nn.Linear`; GLM's fused expert
+  modules stay bf16). The worker therefore **refuses truncated-stack rollouts by default**: a
+  partial policy measured reward 0.0 — zero learning signal — so generating from it would be
+  waste dressed up as work (`--allow-partial` exists for smoke tests only).
+- `--full-model` loads plain bf16 under a **hard VRAM cap** with CPU/disk offload — box-safe,
+  slow: a bootstrap path for big-RAM operators, not the real engine.
+- The real engine is the same answer as everything else here: **fleet-hosted pipeline rollouts**,
+  ~57 GiB of layers spread across many ordinary 8 GiB cards (the proven cross-card generation
+  pattern). Meaning: the G1 rollout engine is literally *made of miners* — every card that joins
+  brings it closer to running at full speed.
+- Every load path in the worker now sets the per-process VRAM cap **before** the first CUDA
+  allocation, so a rollout worker can never starve your desktop or a co-resident CE miner.
+
+CE-lane mining is unchanged — small cards keep training and earning exactly as in v3.1.0.
 
 ## Alpha 3.1 (2026-07-24) — keyless mining, and a crash that can't happen again
 

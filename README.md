@@ -39,12 +39,28 @@ else runs (or that you run from the full node package).
 
 ---
 
-## All-outbound miner (latest) — `tools/run_miner.py`
+## Which lane do I run? (four ways to contribute)
 
-**Status: 2026-07-13.** A newer, turnkey miner that needs **no inbound port and no live coordinator
-link** — it works behind any NAT. Each iteration fetches the base from HuggingFace (outbound), trains
-the trunk locally, and publishes a small (<10 MB) signed, compressed delta outbound. A stranger can
-`git clone` and run it with nothing else installed from the private core:
+| Lane | Command | What your GPU trains | Status |
+|---|---|---|---|
+| **All-outbound turnkey miner** (start here) | `python tools/run_miner.py --once` | Qwen3-0.6B open-base trunk deltas | **LIVE**, permissionless, zero-config, earns |
+| **GLM shardDiLoCo** (the flagship lane the Alpha 2.0/3.0 sections describe) | `python tools/sharddiloco_glm_contributor.py --mode glm --slot <n> --miner <name> --key <roster-key> ...` | one expert slot of GLM-4.7-Flash (compact LoRA deltas), corpus self-syncs (v3) | **LIVE testnet** — needs a slot + roster key from the operator (permissionless admission is on the roadmap) |
+| Rung B fleet (per-expert MoE) | `python fleet/esh_worker.py --node <i> --nodes <N>` | your disjoint expert slice of OLMoE-1B-7B | proven (2026-07-08/16) |
+| Legacy round-based pool | `python run_miner_client.py --host <coordinator> ...` | the pool model, bit-exact recompute-verified | legacy, still supported |
+
+If you just want to plug a GPU in and earn: the first row. If you want to help train the model no
+single machine can hold: the second row — say hi to the operator for a slot key, then everything
+else (base shards, corpus, updates) fetches and verifies itself.
+
+---
+
+## All-outbound miner (start here) — `tools/run_miner.py`
+
+**Status: 2026-07-13 (safe defaults 2026-07-22).** The turnkey miner: **no inbound port, no live
+coordinator link** — it works behind any NAT. Each iteration fetches the open base (Qwen3-0.6B) from
+HuggingFace (outbound), trains its trunk locally, and publishes a small (<10 MB) signed, compressed
+delta outbound. This is the *open-base lane* — the GLM expert-shard lane is the separate contributor
+above. A stranger can `git clone` and run it with nothing else installed from the private core:
 
 ```bash
 pip install -r requirements.txt
@@ -78,8 +94,9 @@ Determinism gate for the delta codec (run after install):
 python -m pytest tests/test_delta_codec_golden.py -q
 ```
 
-The old networked "Rung B fleet worker" (`run_miner_client.py`, documented below) is unchanged and
-still supported — this all-outbound path is an addition, not a replacement.
+The older networked clients (`run_miner_client.py`, the legacy round-based pool lane, and
+`fleet/esh_worker.py`, the Rung B fleet worker — both documented below) are unchanged and still
+supported — this all-outbound path is an addition, not a replacement.
 
 ---
 
@@ -92,18 +109,32 @@ pip install -r requirements.txt
 Install a **torch** build that matches your machine (CPU-only or a CUDA version) from the PyTorch
 site — `requirements.txt` leaves torch unpinned on purpose.
 
-Verify your build reproduces the pool's recompute path (this is the gate that matters):
+Then run the gate for the lane you'll mine. All-outbound / GLM lanes — the delta codec must
+round-trip bit-exact:
+
+```bash
+python -m pytest tests/test_delta_codec_golden.py -q
+```
+
+Legacy round-based pool lane only — your build must also reproduce the pool's recompute path:
 
 ```bash
 python -m pytest tests/test_worker_determinism.py -q
 ```
 
-Both tests must pass. A mismatch means your torch/BLAS build diverges from the pool's reference and
-your honest work would be false-rejected — fix the environment before mining.
+A determinism mismatch means your torch/BLAS build diverges from the pool's reference and your
+honest work would be false-rejected **on the legacy lane** — fix the environment before mining
+there. (The GLM lane does not require bit-exact recompute across GPU architectures; it gates on
+held-out improvement.)
 
 ---
 
-## Mine
+## Mine — legacy round-based pool lane (`run_miner_client.py`)
+
+> Most miners should NOT start here: the one-command path is `python tools/run_miner.py --once`
+> (above), and the flagship GLM lane is `tools/sharddiloco_glm_contributor.py` (see "Join the GLM
+> lane" below). This section documents the original round-based pool client, which requires a
+> reachable coordinator, a byte-identical corpus, and bit-exact recompute.
 
 Point it at a coordinator and give yourself a name (your payout address is derived from your local
 key; `--name` labels the connection):
@@ -131,16 +162,21 @@ python run_miner_client.py --host <coordinator-host> --port <port> --name my-rig
 | `NEURAHASH_CORPUS=real` | train on the real text corpus in `corpus_data/` (vs the toy grammar) |
 | `NEURAHASH_CONTENT_STORE` | URL of the content store `--sync-corpus` fetches the corpus from |
 | `NEURAHASH_TLS_PIN` | the coordinator's 64-hex sha256 cert fingerprint (enforced before the handshake) |
-| `NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC` | hard per-process GPU memory ceiling |
+| `NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC` | hard per-process GPU memory ceiling (all lanes) |
+| `NEURAHASH_VRAM_MANAGER=on` | elastic VRAM: shed/grow training layers around whatever else uses your GPU (GLM lane) |
+| `NEURAHASH_GLM_DATA_RESYNC=1` | v3: a running GLM-lane miner picks up a newly published corpus with no restart (fail-closed) |
 | `NEURAHASH_PQC=hybrid` | opt-in post-quantum (ML-DSA-44) admission alongside secp256k1 |
 
 ---
 
 ## What is (and isn't) in this repo
 
-**Included (the client):** the launcher (`run_miner_client.py`), the worker/training loop
+**Included (the client):** the all-outbound turnkey miner (`tools/run_miner.py`, with signed
+self-update), the GLM shardDiLoCo contributor (`tools/sharddiloco_glm_contributor.py` +
+`tools/sharddiloco_glm_expert.py` + `tools/sharddiloco_harness.py`), the Rung B fleet worker
+(`fleet/esh_worker.py`), the legacy pool launcher (`run_miner_client.py`), the worker/training loop
 (`neurahash/worker_core.py`), the wire protocol, TLS/pin handling, the model architecture + factory,
-the corpus loader, VRAM budgeting, wallet/identity, and the determinism gate.
+the corpus loader, VRAM budgeting, wallet/identity, and the determinism gates.
 
 **Not included (the private core):** the coordinator, the committee/verdict logic, trustverify, the
 ledger, emission/reward economics, stake gates, and the settlement chain. `--solo` (spinning up a
@@ -180,9 +216,10 @@ machines:
 | 1 | RTX 4060 (separate box, WAN-relayed through the content store) | 76.4MB delta relayed and sha256-verified round-trip |
 | 2 | Google Colab (free T4, zero setup, fresh `git clone`) | 38.9MB delta relayed, sha256-verified, structurally validated |
 
-Each node was proven independently reachable and contributing over WAN. **Not yet done:** a single
-aligned gather combining fresh contributions from all 3 at once into one reported held-out number —
-that's next now that the solo soak has freed the 5090.
+Each node was proven independently reachable and contributing over WAN. **Not yet done (as of
+2026-07-08):** a single aligned gather combining fresh contributions from all 3 at once.
+**UPDATE (2026-07-16): done and exceeded** — a 10-hour Rung-B run with **5 miners** completed 89
+rounds in 7.45 h and took the base model from **51% → 100%** on its held-out gate.
 
 ---
 
@@ -197,6 +234,24 @@ coordinating only over a remote content lane. Result: **both experts credited ev
 stalls, held-out cross-entropy fell 4.54 → 2.94, and the sharded-vs-synchronous compute ratio stayed
 ≈ 1.03** (the redundancy tax stays small). *(The coordinator/merge side lives in the full node package,
 not this client repo.)*
+
+### Join the GLM lane
+
+This is the lane the Alpha 2.0 / 3.0 sections describe. It is roster-gated for now — ask the
+operator for a **slot number + miner key** (permissionless admission is on the roadmap). Then:
+
+```bash
+python tools/sharddiloco_glm_contributor.py --mode glm \
+  --slot <n> --miner <your-name> --key <roster-key> \
+  --shard-dir <glm-shards> --config-dir <glm-config> \
+  --data-dir <empty-dir> --domains daily \
+  --url <content-store-url> --token <store-token> --device cuda
+```
+
+Everything heavy is fetched and verified for you: the GLM base shards come from the public bundle
+(see [BUNDLE.md](BUNDLE.md)), an **empty `--data-dir` self-fills** with the advertised corpus
+(sha256-verified, fail-closed), and with `NEURAHASH_GLM_DATA_RESYNC=1` your running miner picks up
+each newly published daily corpus with no restart. All traffic is outbound; NAT is fine.
 
 ## Trustless coordinator — the pool no longer runs on trust
 

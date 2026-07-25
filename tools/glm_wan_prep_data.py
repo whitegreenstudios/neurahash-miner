@@ -35,6 +35,8 @@ Offline: the tokenizer is loaded from a local directory; HF_HUB_OFFLINE is set b
 so no code path can reach the hub (an unbounded hub check is a measured indefinite hang here).
 """
 import argparse
+import hashlib
+import json
 import os
 import sys
 
@@ -48,35 +50,124 @@ DEFAULT_CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 DEFAULT_TOK = r"D:\hf_models\GLM-4.7-Flash-bf16"
 DEFAULT_OUT = r"D:\glm_wan"
 
-# rows per split, in carve order
+# rows per split, in carve order (train count overridable via --train-rows for long soaks)
 SPLITS = (("train", 4096), ("val", 512), ("probe", 512), ("heldout", 1024))
+
+
+def _splits_with_train(train_rows):
+    return tuple((name, (train_rows if name == "train" else n)) for name, n in SPLITS)
 # splits that must NEVER reach a miner box -> written to the coordinator-only subdir (F1)
 COORD_ONLY = frozenset({"probe", "heldout"})
 
 
-def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size):
-    ids = tok(text, add_special_tokens=False)["input_ids"]
-    n_rows_needed = sum(n for _, n in SPLITS)
-    have = len(ids) // seq
-    if have < n_rows_needed:
-        raise SystemExit("domain %s: only %d rows of %d tokens available, need %d -- feed more text"
-                         % (domain, have, seq, n_rows_needed))
-    arr = np.asarray(ids[: have * seq], dtype=np.int64).reshape(have, seq)
-    if int(arr.max()) >= vocab_size:
-        raise SystemExit("domain %s: token id %d >= vocab_size %d" % (domain, arr.max(), vocab_size))
+SPLIT_BUCKETS = 8192            # hash granularity; only affects how evenly documents distribute
 
-    off = 0
-    written = []
-    for name, n in SPLITS:
-        part = arr[off:off + n]
-        off += n
+
+def split_of_document(doc, splits=SPLITS, buckets=SPLIT_BUCKETS):
+    """Which split a document belongs to -- a pure function of its CONTENT, forever.
+
+    THIS IS THE INVARIANT THE GOAL METRIC RESTS ON. Held-out cross-entropy only means
+    "generalization" if the model never trained on the held-out text. That has to hold across
+    corpus refreshes, not just within one prep.
+
+    The previous scheme carved splits by POSITION out of one flat token stream
+    (`arr[off:off+n]` per split). Combined with `daily_corpus_extract.py --roll`, which rebuilds a
+    CUMULATIVE window each day, that meant every refresh re-cut the same growing pool at fixed
+    offsets: a row held out yesterday could land in train today, silently, with every mechanical
+    check still green. That is the exact failure this project was founded on (memory
+    `pouw-verified-not-useful`: ~900 rounds paid while held-out validation worsened).
+
+    Assigning by content hash instead makes split membership permanent -- growing or reordering the
+    corpus adds documents to each split but never MOVES one between splits. Ratios follow the
+    configured row counts, so the mix is unchanged.
+    """
+    total = float(sum(n for _, n in splits))
+    h = int(hashlib.sha256(doc.encode("utf-8", "replace")).hexdigest()[:8], 16) % buckets
+    edge = 0.0
+    for name, n in splits:
+        edge += n / total
+        if h < edge * buckets:
+            return name
+    return splits[-1][0]
+
+
+def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, splits=SPLITS):
+    """Tokenize + write one domain's splits. Documents are lines (the corpus roll files are
+    line-per-document), assigned to splits by content hash and tokenized SEPARATELY, so no row can
+    straddle two splits -- the old flat-stream chunking let a held-out row carry the tail of a
+    training document even within a single prep."""
+    docs = [ln for ln in text.splitlines() if ln.strip()]
+    if not docs:
+        raise SystemExit("domain %s: corpus has no non-empty lines" % domain)
+    by_split = {}
+    for d in docs:
+        by_split.setdefault(split_of_document(d, splits), []).append(d)
+
+    written, parts, used = [], [], 0
+    for name, n in splits:
+        mine = by_split.get(name, [])
+        ids = tok("\n".join(mine), add_special_tokens=False)["input_ids"] if mine else []
+        have = len(ids) // seq
+        if have < n:
+            raise SystemExit(
+                "domain %s split %s: only %d rows of %d tokens available, need %d. Splits are "
+                "content-addressed (a document keeps its split forever), so the fix is MORE TEXT --"
+                " never re-carve to make the counts fit, that is what lets a document change split."
+                % (domain, name, have, seq, n))
+        part = np.asarray(ids[: n * seq], dtype=np.int64).reshape(n, seq)
+        if int(part.max()) >= vocab_size:
+            raise SystemExit("domain %s: token id %d >= vocab_size %d"
+                             % (domain, part.max(), vocab_size))
         # probe + heldout are the coordinator's SECRET gate pool + goal metric: they land in a
         # coordinator-only dir that is never shipped to a miner (F1). train + val are miner-facing.
         dst = coord_dir if name in COORD_ONLY else miner_dir
         path = os.path.join(dst, "ids_%s_%s.npy" % (domain, name))
         np.save(path, part)
         written.append((name, part.shape, path))
-    return arr, written, off
+        parts.append(part)
+        used += n
+    return np.concatenate(parts, axis=0), written, used
+
+
+def _sha256_file(path, chunk=1 << 20):
+    """Streamed sha256 (1 MiB chunks) so a multi-hundred-MB ids file is fingerprinted without ever
+    being read into RAM whole -- the same shape publish_corpus_to_hf._sha256_file uses."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def write_data_manifest(miner_dir, domains, seq, train_rows):
+    """Fingerprint the MINER-FACING id files into <miner_dir>/data_manifest.json for corpus-over-WAN
+    auto sync (W5). The manifest is the contract both halves of the transport read: the publisher
+    (tools/glm_publish_data.py) content-addresses each file by its sha256, and the contributor
+    auto-sync sha-verifies every download -- ending the 12h-soak hand-copy of ids_*.npy.
+
+    F1 IS STRUCTURAL, NOT A CHECK. This function is handed ``miner_dir`` and NOTHING about
+    ``<out>/coord``, so it is physically incapable of enumerating probe/heldout -- the coordinator's
+    secret gate pool can never leak into a manifest even if a future edit is careless. Only
+    ``ids_*.npy`` are listed (the shipped data; the manifest itself and any stray file are skipped),
+    sorted so the manifest is deterministic and diff-stable across re-runs.
+    """
+    files = {}
+    for name in sorted(os.listdir(miner_dir)):
+        if not (name.startswith("ids_") and name.endswith(".npy")):
+            continue
+        p = os.path.join(miner_dir, name)
+        if not os.path.isfile(p):
+            continue
+        files[name] = {"sha256": _sha256_file(p), "size": os.path.getsize(p)}
+    manifest = {"v": 1, "domains": list(domains), "seq": int(seq),
+                "train_rows": int(train_rows), "files": files}
+    path = os.path.join(miner_dir, "data_manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return manifest, path
 
 
 def main():
@@ -88,7 +179,11 @@ def main():
     ap.add_argument("--seq", type=int, default=32)
     ap.add_argument("--max-chars", type=int, default=6_000_000,
                     help="chars read per domain (bounds tokenizer time; 6M >> the ~800KB needed)")
+    ap.add_argument("--train-rows", type=int, default=4096,
+                    help="rows in the TRAIN split per domain (raise for long soaks; needs enough "
+                         "--max-chars to supply train+val+probe+heldout rows)")
     args = ap.parse_args()
+    splits = _splits_with_train(args.train_rows)
 
     # MINER-FACING vs COORDINATOR-ONLY split of the output tree (F1). Only <out>/miner is ever
     # shipped to a miner; <out>/coord (probe + heldout) stays on the coordinator box.
@@ -111,7 +206,7 @@ def main():
         with open(src, "r", encoding="utf-8", errors="replace") as f:
             text = f.read(args.max_chars)
         arr, written, used = build_domain(tok, text, args.seq, miner_dir, coord_dir, domain,
-                                          cfg.vocab_size)
+                                          cfg.vocab_size, splits=splits)
         print("\n[%s] %s -> %d chars -> %d rows of %d tokens (used %d rows)"
               % (domain, src, len(text), arr.shape[0], args.seq, used))
         for name, shape, path in written:
@@ -122,13 +217,22 @@ def main():
         # that reorders the carve cannot silently leak the heldout set into training.
         seen = set()
         off = 0
-        for name, n in SPLITS:
+        for name, n in splits:
             rng = range(off, off + n)
             assert not (seen & set(rng)), "split overlap in %s at %s" % (domain, name)
             seen |= set(rng)
             off += n
         print("   splits disjoint: OK (%d rows total, no row in two splits)" % len(seen))
-    print("\nSHIP ONLY: %s  (train + val -- miner-facing)" % miner_dir)
+    # DATA MANIFEST (W5 corpus-over-WAN): now that every domain's id files are on disk, fingerprint
+    # the MINER-FACING dir so a publisher can content-address them and a contributor can sha-verify
+    # each download. F1 STRUCTURAL: write_data_manifest is handed miner_dir ALONE (never coord_dir),
+    # so it physically cannot enumerate probe/heldout -- the secret split can never appear in a
+    # manifest that ships to a miner.
+    domains = [d.strip() for d in args.domains.split(",") if d.strip()]
+    manifest, manifest_path = write_data_manifest(miner_dir, domains, args.seq, args.train_rows)
+    print("\nDATA MANIFEST: %s  (%d miner files fingerprinted, v%d)"
+          % (manifest_path, len(manifest["files"]), manifest["v"]))
+    print("SHIP ONLY: %s  (train + val + data_manifest.json -- miner-facing)" % miner_dir)
     print("NEVER SHIP: %s  (probe + heldout -- coordinator's SECRET gate pool + goal metric; a miner"
           "\n            that obtains these can train on the whole pool and defeat the gate)" % coord_dir)
     return 0

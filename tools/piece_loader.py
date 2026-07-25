@@ -208,6 +208,29 @@ def assigned_expert_ids(manifest, piece_ids):
     return out
 
 
+def claimable_expert_ids(manifest, piece_ids, config):
+    """assigned_expert_ids() filtered to the coordinates that are REAL on an instantiated model --
+    the set a node may legitimately be asked to train. Returns a SORTED LIST (not a set), because
+    callers use it to build a positional slot list and a set's iteration order is not stable.
+
+    Two filters, both measured 2026-07-25 against D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb:
+
+      * L >= first_k_dense_replace -- layer 0 is a DENSE MLP, it has no routed experts.
+      * L <  num_hidden_layers     -- the shard manifest also carries the MTP/nextn layer's 64
+        experts (see assigned_expert_ids' note), and Glm4MoeLiteForCausalLM never instantiates it.
+        Handing one of those to the lane host raised a naked `IndexError: index 47 is out of range`.
+
+    On that manifest the filter drops exactly 64 of the 3008 manifest coordinates, leaving 2944
+    = 46 real MoE layers x 64 experts. It also matters per-piece: piece 588 straddles layers 46/47
+    so 1 of its 5 coordinates is unreal, and pieces 589-601 are 100% MTP -- a node given one of
+    those has NO real experts, and used to boot completely clean and then train nothing at all.
+    Callers should treat an empty result as fatal for that reason."""
+    n_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
+    return sorted((L, E) for (L, E) in assigned_expert_ids(manifest, piece_ids)
+                  if dense <= L < n_layers)
+
+
 # ------------------------------------------------------------------------------------------- config helpers
 def _resolve_config(shard_dir, manifest, config_dir=None):
     """Load the Glm4MoeLiteConfig for this shard set. Priority: explicit config_dir -> config.json next to the

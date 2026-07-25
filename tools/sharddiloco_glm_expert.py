@@ -363,20 +363,143 @@ def heldout_ce(model, ids):
 
 
 # ================================================================================ the GLM lane host
+class MissingBaseSnapshot(RuntimeError):
+    """A slot was gated with no pre-round base snapshot (`_base_slots[e]` missing/None). A NAMED
+    subclass so the traceback says what is wrong instead of surfacing as a TypeError from numpy
+    indexing three frames deeper -- see GlmExpertLaneHost._repair_base_slot for how it happens."""
+
+
 class GlmExpertLaneHost:
     """Maps GLM (layer, expert) units onto the shardDiLoCo lane's per-expert `experts[]` slots and
     supplies the numpy<->torch `eval_expert` bridge the lane's shard_merge_round calls. All merge/gate
     math stays in numpy inside the lane; this host only reads/writes the model's fused expert slices."""
 
-    def __init__(self, model, cfg, slots):
+    def __init__(self, model, cfg, slots, claimable=None, max_active=None):
         self.model = model
         self.cfg = cfg
         self.slots = [(int(L), int(E)) for (L, E) in slots]     # slot index -> (layer, expert)
         self.I = cfg.moe_intermediate_size
         self._base_slots = None                                 # frozen pre-round base (all slots)
+        # ---- SHARD CLAIM: index<->coordinate map + the bounded ACTIVE set -----------------------
+        # `slots` is APPEND-ONLY and an index is NEVER reused or shifted. That is not tidiness, it is
+        # a correctness requirement: the coordinator persists the merged slot as a bare int in every
+        # accepted record (`slot=int(e_idx)`, sharddiloco_glm_coordinator.py:559) and a contributor's
+        # replay writes weights back by that int (apply_accepted -> write_slot, contributor.py:570).
+        # Compacting the list on eviction would silently re-point every historical accepted record at
+        # a DIFFERENT expert -- cross-expert weight corruption that no test or hash would catch until
+        # the model was already wrong. So eviction only clears the materialized numpy state (the thing
+        # that actually costs RAM); the index->coordinate mapping is kept forever, which is free.
+        self._idx = {}
+        for i, le in enumerate(self.slots):
+            self._idx.setdefault(le, i)
+        self.active = set(range(len(self.slots)))
+        # The set of coordinates this node may host AT ALL. None = unchecked (tiny-model tests).
+        # For a real GLM this must be the node's genuinely-resident set, because piece_loader
+        # allocates the fused expert params FULL WIDTH for a resident layer (all 64 rows) and fills
+        # only the resident ones: a non-resident row of a resident layer is therefore writable and
+        # silently INERT -- zero weights with the router pinned to -inf (piece_loader.py:366-385).
+        # A miner claiming one would train, publish, and be gate-rejected forever with nothing in any
+        # log explaining why. Refusing the claim up front is the only cheap defence.
+        self._claimable = None if claimable is None else {(int(L), int(E)) for (L, E) in claimable}
+        self.max_active = None if max_active is None else int(max_active)
+
+    # ------------------------------------------------------------------ shard-claim slot registry
+    def index_of(self, L, E):
+        """Slot index for coordinate (L,E), or None if it was never registered."""
+        return self._idx.get((int(L), int(E)))
+
+    def is_claimable(self, L, E):
+        """True iff this node may host (L,E) at all (see _claimable in __init__)."""
+        return True if self._claimable is None else (int(L), int(E)) in self._claimable
+
+    def claimable_coords(self):
+        """Sorted list of hostable coordinates, or None when unchecked."""
+        return None if self._claimable is None else sorted(self._claimable)
+
+    def register(self, L, E):
+        """Make coordinate (L,E) live and return its stable slot index. Idempotent: an already-known
+        coordinate returns its existing index (and is re-activated if it had been evicted), so the
+        coordinator can call this on EVERY contribution without special-casing the first one.
+
+        Raises ValueError if (L,E) is not hostable, and RuntimeError if activating it would exceed
+        max_active -- the caller turns that into "wait", never a silent drop, because a silently
+        dropped claim is indistinguishable to the miner from a rejected delta."""
+        L, E = int(L), int(E)
+        if not self.is_claimable(L, E):
+            raise ValueError("coordinate (L%d,E%d) is not hostable by this node" % (L, E))
+        i = self._idx.get((L, E))
+        if i is None:
+            if self.max_active is not None and len(self.active) >= self.max_active:
+                raise RuntimeError("max_active_slots=%d reached; cannot admit (L%d,E%d) yet"
+                                   % (self.max_active, L, E))
+            i = len(self.slots)
+            self.slots.append((L, E))
+            self._idx[(L, E)] = i
+            self.active.add(i)
+            self._repair_base_slot(i)
+            return i
+        if i not in self.active:
+            if self.max_active is not None and len(self.active) >= self.max_active:
+                raise RuntimeError("max_active_slots=%d reached; cannot re-admit (L%d,E%d) yet"
+                                   % (self.max_active, L, E))
+            self.active.add(i)
+        self._repair_base_slot(i)
+        return i
+
+    def _repair_base_slot(self, i):
+        """Keep `_base_slots` -- the pre-round snapshot eval_expert restores from -- in step with a
+        registry that GROWS and re-activates mid-event.
+
+        `begin_round` sizes _base_slots to the slot list as it stood when the event began, and `evict`
+        punches a None hole. A coordinate registered or re-admitted AFTER that left the list short or
+        holed, so eval_expert's `write_slot(e, self._base_slots[e])` hit an IndexError, or wrote None
+        (-> "TypeError: 'NoneType' object is not subscriptable"), INSIDE the merge -- which
+        apply_delta_gated does not wrap, so the coordinator process died mid-merge.
+
+        Snapshotting here is exact, not a patch-up: nothing has merged into a slot that was just
+        registered or re-admitted this event, so its CURRENT weights ARE its pre-round base. Copies,
+        because read_slot returns numpy views over the model's storage. No-op before the first
+        begin_round (_base_slots is None -> there is no round to be consistent with)."""
+        if self._base_slots is None:
+            return
+        while len(self._base_slots) < len(self.slots):
+            self._base_slots.append(None)
+        self._base_slots[i] = {k: v.copy() for k, v in self.read_slot(i).items()}
+
+    def evict(self, idx):
+        """Release slot idx's WORKING state. Returns True if it had been active.
+
+        Eviction loses nothing that matters: an accepted delta was already merged into the model's
+        fused weights, so the model IS the store. What goes away is only the fp32 numpy the
+        coordinator materializes per active slot each event. The index and its coordinate survive
+        (see __init__), so a later claim of the same coordinate resumes on the SAME index and every
+        historical accepted record still points where it did."""
+        idx = int(idx)
+        if idx not in self.active:
+            return False
+        self.active.discard(idx)
+        if self._base_slots is not None and idx < len(self._base_slots):
+            self._base_slots[idx] = None
+        return True
+
+    def is_active(self, idx):
+        return int(idx) in self.active
 
     def _fused(self, L):
-        exp = self.model.model.layers[L].mlp.experts
+        layers = self.model.model.layers
+        if not (0 <= int(L) < len(layers)):
+            # L == num_hidden_layers is the MTP/nextn layer: it exists in the shard manifest but
+            # Glm4MoeLiteForCausalLM never instantiates it, so the bare index raised a naked
+            # IndexError. Say which coordinate space is real instead.
+            raise IndexError("layer %d is not instantiated (model has %d layers; the MTP/nextn "
+                             "layer is in the shard manifest but never built)" % (int(L), len(layers)))
+        exp = layers[int(L)].mlp.experts
+        if not (hasattr(exp, "base") or hasattr(exp, "gate_up_proj")):
+            # A fully non-resident MoE layer carries a _DeadExperts placeholder (piece_loader.py:361)
+            # with no weight tensors at all, so the old code died on AttributeError deep inside a
+            # read_slot. This node simply does not hold this layer.
+            raise AttributeError("layer %d holds no resident experts on this node (placeholder %s); "
+                                 "load the piece that covers it" % (int(L), type(exp).__name__))
         return exp.base if hasattr(exp, "base") else exp
 
     def read_slot(self, idx):
@@ -409,18 +532,31 @@ class GlmExpertLaneHost:
     def canonical_experts(self):
         """The lane's `experts` argument: list of {gate,up,down} numpy dicts, one per slot. These are
         MUTATED IN PLACE by shard_merge_round on accept (base += outer*delta), exactly mirroring
-        expert_shard_train.apply_canonical_to_fused on the real fused weights."""
-        return [self.read_slot(i) for i in range(len(self.slots))]
+        expert_shard_train.apply_canonical_to_fused on the real fused weights.
+
+        EVICTED slots come back as None rather than being dropped, so the list stays positional and
+        `experts[e]` keeps meaning slot e. shard_merge_round only ever touches `experts[e]` for an e
+        that appears in the contributions (neurahash/diloco_merge.py:931-941), and a contribution can
+        only exist for a registered+active slot, so the holes are never dereferenced by the merge.
+        This is what makes the per-event materialization cost O(active) instead of O(ever-seen)."""
+        return [self.read_slot(i) if i in self.active else None
+                for i in range(len(self.slots))]
 
     def begin_round(self, experts):
         """Snapshot the pre-round base of every slot so eval_expert can gate each slot INDEPENDENTLY
         against a fixed base (the model holds pre-round base for all non-active slots throughout)."""
-        self._base_slots = [{k: v.copy() for k, v in e.items()} for e in experts]
+        self._base_slots = [None if e is None else {k: v.copy() for k, v in e.items()}
+                            for e in experts]
 
     def sync_from_canonical(self, experts):
-        """After a round, write the (possibly accepted) canonical experts back into the model."""
+        """After a round, write the (possibly accepted) canonical experts back into the model.
+
+        Skips evicted slots (None). Positional by index -- `experts` must be the list
+        canonical_experts() returned, never a compacted copy, or slot i would be written with
+        another expert's weights."""
         for i, e in enumerate(experts):
-            self.write_slot(i, e)
+            if e is not None:
+                self.write_slot(i, e)
 
     def make_eval_expert(self, meter, seq_len):
         """Return eval_expert(e, cand, pX, pY) -> held-out CE float. Writes `cand` into slot e, runs a
@@ -428,9 +564,23 @@ class GlmExpertLaneHost:
         and books the forward FLOPs on `meter` (D3). Non-active slots stay at pre-round base -> each
         delta is gated independently, matching the lane's per-expert design."""
         def eval_expert(e, cand, pX, pY):
+            # FAIL LOUD AND NAMED, never write None: a missing snapshot used to surface as
+            # "TypeError: 'NoneType' object is not subscriptable" from inside write_slot, three frames
+            # deep in the merge and unwrapped by apply_delta_gated -> coordinator dead with a message
+            # that named neither the slot nor the cause (see _repair_base_slot).
+            base = None
+            if self._base_slots is not None and 0 <= int(e) < len(self._base_slots):
+                base = self._base_slots[int(e)]
+            if base is None:
+                raise MissingBaseSnapshot(
+                    "slot %d has no pre-round base snapshot: _base_slots is %s (len=%s), so this "
+                    "delta cannot be gated against the base it was trained on. begin_round() must "
+                    "run after every register()/evict() that changes the slot list for this event."
+                    % (int(e), "None" if self._base_slots is None else "present",
+                       "n/a" if self._base_slots is None else len(self._base_slots)))
             self.write_slot(e, cand)
             ce = heldout_ce(self.model, pX)
-            self.write_slot(e, self._base_slots[e])       # restore -> model back to pre-round base
+            self.write_slot(e, base)                     # restore -> model back to pre-round base
             meter.add_verify(len(pX))
             return ce
         return eval_expert

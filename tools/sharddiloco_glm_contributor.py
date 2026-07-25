@@ -39,6 +39,7 @@ Usage (real GLM, plan step S4):
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -117,6 +118,213 @@ def parse_slots(s):
     if not out:
         raise SystemExit("[glm-node] --slots must be a non-empty list like 1:0,1:1")
     return out
+
+
+def parse_coord(s):
+    """'1:3' -> (1, 3). The shard-claim address: a GLM (layer, expert) COORDINATE."""
+    txt = str(s).strip()
+    L, sep, E = txt.partition(":")
+    if not sep:
+        raise SystemExit("[glm-node] --expert must look like L:E (e.g. 1:3), got %r" % txt)
+    try:
+        return int(L), int(E)
+    except ValueError:
+        raise SystemExit("[glm-node] --expert must look like L:E with integers, got %r" % txt)
+
+
+def coord_data_slot(L, E):
+    """The `slot` argument to pass to _ids_path / node_ids / coord_secret_ids when work is addressed by
+    COORDINATE rather than by position.
+
+    Why this has to exist. `_ids_path` picks a data domain as `doms[slot % len(doms)]`, and the miner's
+    TRAIN shard and the coordinator's SECRET PROBE pool must land on the same domain or every delta is
+    gated against text from a domain it never trained on -- a systematic reject with no error anywhere.
+    Under positional addressing both sides happened to pass the same list index. Once the miner names a
+    coordinate and the coordinator assigns its own registry index, those two integers are unrelated, so
+    the domain has to come from the coordinate itself.
+
+    Returning E reproduces today's LIVE mapping exactly -- (1,0) -> code, (1,1) -> gutenberg, the same
+    domains slots 0 and 1 resolve to now -- so the frozen probe/heldout pools (c0d4cbd) keep their
+    meaning and the before/after held-out CE stays comparable."""
+    return int(E)
+
+
+def fmt_coords(coords, limit=8):
+    """'1:0, 1:1, ... (+N more)' -- compact coordinate list for a startup log line."""
+    if coords is None:
+        return "unchecked"
+    head = ", ".join("%d:%d" % (int(L), int(E)) for (L, E) in list(coords)[:limit])
+    extra = len(coords) - limit
+    return head + ((" (+%d more)" % extra) if extra > 0 else "")
+
+
+def node_claimable_coords(args):
+    """The coordinates THIS node can genuinely host, or None in tiny mode / when the manifest is
+    unavailable (then claims are unchecked, as before).
+
+    This is the guard against the worst failure mode in the lane. piece_loader allocates a resident
+    layer's fused expert params FULL WIDTH -- all 64 rows -- and fills only the rows its pieces cover,
+    masking the rest of the router to -inf (piece_loader.py:366-385, measured 2026-07-25). So a
+    coordinate this node does NOT hold is still writable and reads back as zeros: a miner claiming one
+    would train happily, publish, and be gate-rejected forever, with nothing in any log to say why.
+    Refusing the claim at startup is the only cheap defence."""
+    # Only a REAL GLM run has a shard manifest to check against. tiny mode -- and any caller passing a
+    # partial namespace (the async lane's dirty-namespace test does exactly that) -- means "we cannot
+    # tell", which must be UNCHECKED, not fatal: refusing to start because we could not find a manifest
+    # we never needed would be a self-inflicted outage.
+    if getattr(args, "mode", None) != "glm":
+        return None
+    if not getattr(args, "shard_dir", None) or getattr(args, "piece", None) is None:
+        return None
+    try:
+        import piece_loader
+        man = piece_loader.load_manifest(args.shard_dir, require_files=False)
+        cfg = _resolve_claim_config(args)
+        return piece_loader.claimable_expert_ids(man, [int(args.piece)], cfg)
+    except ImportError:
+        return None
+    except Exception as ex:                                          # noqa: BLE001
+        return _raise_claim_probe(ex)
+
+
+def _raise_claim_probe(ex):
+    raise SystemExit("[glm-node] cannot determine this node's claimable coordinates from "
+                     "--shard-dir/--piece (%s: %s). Fix the shard dir, or pass --expert only after "
+                     "confirming the piece covers it." % (type(ex).__name__, ex))
+
+
+def _resolve_claim_config(args):
+    """Just enough config for the claimability filter: num_hidden_layers + first_k_dense_replace. Read
+    from config.json directly so this stays a cheap JSON read -- no model, no torch, no GPU."""
+    import types
+    for d in (getattr(args, "config_dir", None), getattr(args, "shard_dir", None)):
+        if not d:
+            continue
+        p = os.path.join(d, "config.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                c = json.load(f)
+            return types.SimpleNamespace(
+                num_hidden_layers=int(c.get("num_hidden_layers", 0)),
+                first_k_dense_replace=int(c.get("first_k_dense_replace", 0)))
+    raise SystemExit("[glm-node] no config.json under --config-dir or --shard-dir; cannot tell which "
+                     "layers are real MoE layers, so a claim cannot be validated")
+
+
+def pick_start_coord(claimable, identity):
+    """Deterministic starting coordinate derived from the miner's IDENTITY.
+
+    Shard claim has no registry and no lock, so two miners must not both start at coordinate 0 by
+    default. Hashing the wallet address spreads independent miners across the claimable space with
+    zero coordination -- a stranger just runs the miner and lands somewhere. Duplicate work is
+    WASTEFUL, NOT INCORRECT (both deltas are gated; the better one wins), which is why this is a hash
+    and not a lease: a lease needs a registry, and a registry needs to be trusted. Mirrors the
+    existing hash-of-address precedent in derive_glm_miner_name."""
+    if not claimable:
+        raise SystemExit("[glm-node] no claimable coordinates to start from")
+    h = int(hashlib.sha256(str(identity).encode()).hexdigest(), 16)
+    return tuple(claimable[h % len(claimable)])
+
+
+def next_claim_coord(claimable, current):
+    """The coordinate to claim after `current`, cycling through the claimable set in order.
+
+    This is the owner's "finish one then start the 2nd one" -- sweeping the space is just
+    claim -> work -> plateau -> release -> claim next. Returns None when the set has only this one
+    coordinate (nothing to advance to, so the caller should stay put rather than churn)."""
+    coords = [tuple(c) for c in claimable or []]
+    if len(coords) <= 1:
+        return None
+    cur = tuple(current)
+    if cur not in coords:
+        return coords[0]
+    return coords[(coords.index(cur) + 1) % len(coords)]
+
+
+def record_touched_coord(rec, coord):
+    """Did this accepted record MERGE `coord`? Reads the per-coordinate `slot_roots` map the
+    coordinator stamps for exactly the one slot each event moved -- so this is a precise "the
+    coordinator processed MY expert at this event" signal, which the top-level `slot` int (the
+    coordinator's own registry index) is not."""
+    return ("%d_%d" % (int(coord[0]), int(coord[1]))) in (rec.get("slot_roots") or {})
+
+
+def event_judged_us(rec, published_base_event):
+    """F5a: could this accepted record possibly be a VERDICT on a delta of ours -- i.e. was one of our
+    deltas in flight when the coordinator committed it? True iff we have published at least once and the
+    record's event is >= the base_event of our last publish.
+
+    Why the plateau counter needs it. `reject_streak` used to increment for ANY event whose `slot_roots`
+    named our coordinate and whose accepted rows did not name us -- which includes events that never
+    judged us at all: a co-claimant winning the same coordinate, our own record being dropped for
+    lineage/staleness/validate reasons, and above all records that PREDATE our first publish. A fresh
+    miner joining a running campaign folds the entire history in ONE catch-up pass, so the streak blew
+    straight past --advance-after (default 3) and it abandoned its coordinate before publishing once.
+    `published_base_event` None (nothing published yet) -> False: nothing can have judged us. Pure."""
+    if published_base_event is None:
+        return False
+    try:
+        return int(rec.get("event")) >= int(published_base_event)
+    except (TypeError, ValueError):
+        return False                                     # undateable record: never counts as a verdict
+
+
+def resolve_claim(args, slots, log=print, identity=None):
+    """Resolve which GLM coordinate this miner works on, from --expert L:E (shard claim) or the
+    DEPRECATED --slot index. Returns (L, E, i, source).
+
+    `i` is only this miner's LOCAL index into its own `slots` list -- the position it reads and writes
+    weights at. A shard-claim coordinator resolves work by the (layer, expert) coordinate on the wire
+    and assigns its own registry index, so the two integers no longer have to agree. `slots` is
+    EXTENDED in place when a claimed coordinate is not already in it, because the lane host is built
+    over this list and can only touch a coordinate it contains."""
+    claimable = node_claimable_coords(args)
+    if getattr(args, "expert", None):
+        L, E = parse_coord(args.expert)
+        src = "--expert"
+        if args.slot is not None:
+            log("[glm-contrib] NOTE: --slot %d ignored; --expert %s:%s wins (--slot is deprecated)"
+                % (int(args.slot), L, E))
+    elif args.slot is None and not os.environ.get("NEURAHASH_SD_EXPERT") and claimable:
+        # Nothing was asked for -> SPREAD. A stranger who just runs the miner must not collide with
+        # every other default-configured miner on coordinate 0.
+        L, E = pick_start_coord(claimable, identity if identity is not None else "anonymous")
+        src = "wallet-hash (auto-spread)"
+    else:
+        idx = int(os.environ.get("NEURAHASH_SD_EXPERT", "0") if args.slot is None else args.slot)
+        if not (0 <= idx < len(slots)):
+            raise SystemExit("[glm-contrib] --slot %d out of range for --slots %s" % (idx, args.slots))
+        L, E = slots[idx]
+        src = "--slot (deprecated)"
+    # Order matters: an EMPTY claimable set means the piece covers only the MTP/nextn layer, and it
+    # needs its own message -- reporting "piece 0 does not hold (L1,E0)" for a piece that holds nothing
+    # at all sends the reader looking for the wrong problem.
+    if claimable is not None and not claimable:
+        raise SystemExit("[glm-contrib] --piece %s holds NO real experts (it covers only the MTP/nextn "
+                         "layer, which the model never instantiates). Pick another piece." % args.piece)
+    if claimable is not None and (L, E) not in claimable:
+        shown = ", ".join("%d:%d" % c for c in claimable[:16]) or "(none)"
+        raise SystemExit(
+            "[glm-contrib] REFUSING to claim (L%d,E%d): --piece %s does not hold it, so this node "
+            "would train an INERT expert -- writable, never routed, rejected forever, silently. "
+            "Claimable here: %s%s. Load the piece that covers (L%d,E%d) instead."
+            % (L, E, args.piece, shown, (" ... (%d total)" % len(claimable)) if len(claimable) > 16 else "",
+               L, E))
+    if (L, E) in slots:
+        i = slots.index((L, E))
+    else:
+        i = len(slots)
+        slots.append((L, E))            # the host is built over `slots`; it must contain our claim
+    return L, E, i, src
+
+
+def claim_all_coords(args, slots):
+    """The coordinate set a miner may sweep: its claimable set when known, else just `slots`.
+
+    A miner that advances on plateau must stay inside the coordinates it genuinely holds, or it walks
+    straight into the inert-slot trap (writable, never routed, rejected forever, silent)."""
+    c = node_claimable_coords(args)
+    return [tuple(x) for x in (c if c else slots)]
 
 
 def add_common_args(ap):
@@ -509,12 +717,52 @@ def model_root(host):
     against a phantom base."""
     h = hashlib.sha256()
     for i in range(len(host.slots)):
-        d = host.read_slot(i)
-        L, E = host.slots[i]
-        h.update(("L%dE%d|" % (L, E)).encode())
-        for k in sorted(d):
-            h.update(k.encode())
-            h.update(np.ascontiguousarray(d[k], dtype=np.float32).tobytes())
+        _slot_digest_into(h, host, i)
+    return h.hexdigest()
+
+
+def _slot_digest_into(h, host, idx):
+    """Feed ONE slot's coordinate tag + canonical fp32 weights into `h`. Factored out of model_root so
+    model_root and slot_root cannot drift apart -- they must agree on what a slot's identity IS."""
+    d = host.read_slot(idx)
+    L, E = host.slots[idx]
+    h.update(("L%dE%d|" % (L, E)).encode())
+    for k in sorted(d):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(d[k], dtype=np.float32).tobytes())
+
+
+def slot_root(host, idx):
+    """SHARD CLAIM: the lineage fingerprint of ONE coordinate, not of the whole slot list.
+
+    Why this exists. `model_root` hashes EVERY slot in `host.slots` in list order, and the
+    coordinator rejects a contribution whose `base_root` does not equal its own root at that event
+    (_lineage_ok). That coupling makes dynamic slot registration impossible: the moment the
+    coordinator admits a new coordinate its global root changes, and every miner already training --
+    on untouched, perfectly valid weights -- is dropped as `wrong-lineage-root`.
+
+    Per-coordinate roots break the coupling, and they are strictly MORE precise for this lane, whose
+    whole premise is that each expert's LoRA trains against a FROZEN trunk with no cross-expert
+    dependency: what actually matters is "did this miner train against MY current weights for THIS
+    expert", and another expert moving is irrelevant to that question.
+
+    Two side benefits (2026-07-25):
+      * O(1) PER CALL: one coordinate instead of n_slots. What that has NOT yet bought is an O(1)
+        round path -- the O(n_slots) `model_root` calls are still there, and this docstring used to
+        overclaim. Measured: model_root costs 0.0211 s per slot and is called ~3x/event
+        coordinator-side, 1x/round miner-side, and once PER FOLDED RECORD on replay -- at 64 slots a
+        1345-record replay is ~30 min of pure hashing; at 2944 slots ~23 h. STILL O(n_slots) today:
+        the round-path model_root in _run_async (its FATAL-DRIFT check) and the async no-progress
+        guard, the coordinator's own model_root/root_hist bookkeeping, replica_root_ok's global
+        fallback for a record with no slot_roots, and the `range(len(host.slots))` snapshot loops in
+        _fold_accepted_checked and resume_to_root. Retiring those is separate work; what slot_root
+        removes today is the per-coordinate LINEAGE coupling, not the hashing bill.
+      * A node only hashes a coordinate it actually holds, so a wide claimable set no longer requires
+        whole-model residency, and two nodes whose shard manifests were cut at different --shard-gb
+        (piece id -> coordinate differs, and nothing cross-verifies it) no longer disagree on the
+        root of a coordinate they both hold."""
+    h = hashlib.sha256()
+    _slot_digest_into(h, host, idx)
     return h.hexdigest()
 
 
@@ -534,7 +782,47 @@ def base_digest(model, max_numel=50_000_000):
     return h.hexdigest()
 
 
-def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None, own_slot=None):
+def _resolve_accepted_slot(host, item, log=None):
+    """Map one accepted-record row onto THIS node's slot index, or None if we cannot host it.
+
+    Coordinate first (`layer`/`glm_expert`), raw `slot` index second. The fallback is only correct for
+    pre-Shard-Claim records, where every node derived its slot list from the same `--slots` string and
+    the indices therefore matched; a coordinate-bearing record must NEVER be applied by raw index."""
+    if item.get("layer") is not None and item.get("glm_expert") is not None:
+        try:
+            coord = (int(item["layer"]), int(item["glm_expert"]))
+        except (TypeError, ValueError):
+            if log:
+                log("[glm-node] SKIP accepted delta: non-integer coordinate %r" % (item.get("layer"),))
+            return None
+        idx = host.index_of(*coord)
+        if idx is None:
+            # Normal on a shard-claim network: another miner's coordinate that this node does not hold.
+            # Nothing to fold -- our copy of that expert is not resident, so there is nothing to diverge.
+            if log:
+                log("[glm-node] skip accepted delta for (L%d,E%d): not resident here" % coord)
+            return None
+        return idx
+    try:
+        idx = int(item["slot"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return idx if 0 <= idx < len(host.slots) else None
+
+
+def accepted_names_me(record, miner):
+    """Did the coordinator ACCEPT this miner's delta in `record`? The verdict the miner could not see.
+
+    Before shard claim a miner had no way to distinguish "my delta lost the gate" from "another miner
+    won my slot" from "the accepted record never arrived": apply_accepted matched only on the slot and
+    ignored `miner` entirely. The accepted rows have always carried `miner` (the coordinator stamps it),
+    so the signal existed -- nothing read it. The plateau rule (K consecutive rejects -> release the
+    coordinate and claim the next) is built on this."""
+    return any(str(it.get("miner")) == str(miner) for it in (record.get("accepted") or []))
+
+
+def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None, own_slot=None,
+                   skipped=None, folded_slots=None):
     """Replay the coordinator's merge locally: for each accepted delta, in the coordinator's order,
     base += outer*delta. The delta is re-FETCHED BY CID from the lane, so the contributor applies the
     exact fp16-roundtripped bytes the coordinator gated on (bit-identical to
@@ -563,11 +851,39 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
                 self-abort the whole replica (rc 8). None -> legacy re-gate-EVERY-slot behaviour.
     When ce_fn is None the replay is UNCONDITIONAL and bit-identical to the coordinator's merge (the
     model_root replication invariant the pointer asserts each round, and what the unit test checks).
-    Returns the count of deltas actually FOLDED (a rejected delta is not counted)."""
+    Returns the count of deltas actually FOLDED (a rejected delta is not counted).
+
+    F2 (SHARD CLAIM, 2026-07-25) -- `skipped`: rows this node CANNOT PLACE (a coordinate it does not hold,
+    or an unusable coordinate/slot field) are appended here, NEVER to `rejected`. On a shard-claim network
+    "not resident here" is the NORMAL case -- miners deliberately hold different coordinates -- and nothing
+    can diverge in an expert we do not have. Routing it through `rejected` made _fold_accepted_checked
+    classify it as `poison`, catch_up_accepted return abort 8, and _run_async exit rc8 "forged/poisoned
+    record" on the FIRST accepted record for another miner's coordinate; the same call from the
+    coordinator's _resume_from_lane stopped the resume replay at the first dynamically-registered
+    coordinate and rolled the campaign back to the frozen base. `rejected` is now strictly the local
+    re-gate + shape-guard channel (the two signals that really do mean "do not trust this record").
+    `skipped` None -> the rows are simply skipped, as before.
+
+    F3 -- `folded_slots`: if given (a set), every slot index actually FOLDED by this call is added to it, so
+    replica_root_ok can require that each one was ADVERTISED in `slot_roots` and verified. Without that,
+    a forged record could move a resident coordinate while advertising only a non-resident (or resident but
+    untouched) one and be accepted with no verification at all."""
     n = 0
     own = None if own_slot is None else int(own_slot)
     for item in record.get("accepted", []):
-        slot = int(item["slot"])
+        # SHARD CLAIM: resolve by COORDINATE when the record carries one. The `slot` field is the
+        # COORDINATOR's registry index; once miners address work by (layer, expert) that index is not
+        # ours, so folding by it would apply the delta to a different expert -- or IndexError. Fall back
+        # to the raw index for pre-Shard-Claim records, where the two indices did coincide.
+        slot = _resolve_accepted_slot(host, item, log=log)
+        if slot is None:
+            # F2: NOT a rejection -- there is nothing here to reject. We cannot place this row (another
+            # miner's coordinate, or an unusable coordinate/slot field), so no weight of ours moves and
+            # nothing of ours can diverge. Report it on the `skipped` channel; `rejected` stays reserved
+            # for the re-gate and shape failures that actually mean "distrust this record".
+            if skipped is not None:
+                skipped.append(dict(item, reason="unknown-coordinate"))
+            continue
         outer = float(item.get("outer", 0.7))
         d = lane.get_delta(item["cid"])
         # Same wire-agnostic materialisation the coordinator does. This replay MUST reproduce the
@@ -608,6 +924,8 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
                         "%.5f -> %.5f (> +%.5f) -- forged/poisoned accepted record?"
                         % (slot, base_ce, new_ce, allow))
                 continue
+        if folded_slots is not None:
+            folded_slots.add(int(slot))            # F3: what replica_root_ok must find advertised
         n += 1
     if log:
         log("[glm-node] applied %d accepted delta(s) for round %s" % (n, record.get("round")))
@@ -1085,6 +1403,11 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
       * own-slot re-gate tripped     -> (False, 'poison', rejected): caller aborts rc8 (severity unchanged).
       * post-fold root != advertised -> (False, 'lineage', []): the record is NOT on our latched lineage;
         EVERY slot is restored exactly (rollback), so the base is byte-identical to before this call.
+        F3: "advertised" now also means COVERED -- every coordinate this fold actually moved has to have
+        its own `slot_roots` entry, and that entry has to validate. A record that moves a coordinate it
+        never advertised is off-lineage by construction and rolls back here.
+    A row this node cannot place (another miner's coordinate) is NOT poison -- see apply_accepted's
+    `skipped` channel (F2). It is counted nowhere and changes nothing, which is the whole point.
     Clean fold -> (True, 'ok', []). Snapshots all slots up front (DEEP-copied: read_slot returns numpy VIEWS
     that share storage with the model, so apply_accepted's in-place copy_ would otherwise mutate the snapshot
     too and make the rollback a no-op). Mirrors the coordinator's _lineage_ok wrong-lineage-root drop,
@@ -1092,19 +1415,108 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
     as before (no false reject)."""
     snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}     # DEEP copy -> real rollback
             for j in range(len(host.slots))]
-    rejected = []
-    apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=own_slot)
+    rejected, skipped, folded = [], [], set()
+    apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=own_slot,
+                   skipped=skipped, folded_slots=folded)
     if rejected:
         return False, "poison", rejected                          # caller handles rc8 (do not advance)
-    want = rec.get("model_root")
-    if want is not None and model_root(host) != str(want):
+    if not replica_root_ok(host, rec, folded=folded):
         for j, d in enumerate(snap):
             host.write_slot(j, d)                                 # UNFOLD everything: off-lineage, fail-closed
         return False, "lineage", []
     return True, "ok", []
 
 
-def resume_to_root(host, lane, target_root, log, max_records=200000):
+def replica_root_ok(host, rec, folded=None):
+    """Did our local replay reproduce what the coordinator advertised? True also when there is nothing
+    to check (a record with neither root, which the async coordinator never emits).
+
+    SHARD CLAIM: prefer the PER-COORDINATE roots. The global `model_root` is a hash over the whole slot
+    list, so a replica can only ever match it if it holds the coordinator's EXACT slot set in the same
+    order. On a shard-claim network miners deliberately hold different coordinates, so the global check
+    would fail for every one of them and, being fail-closed, would freeze every replica's frontier
+    permanently. Checking only the coordinates we actually hold keeps the invariant that matters -- our
+    copy of expert X is bit-identical to the coordinator's -- without asserting anything about experts we
+    were never given.
+
+    F3 (SECURITY, 2026-07-25) -- `folded`: the slot indices this fold ACTUALLY MOVED (apply_accepted's
+    folded_slots). Every one of them MUST have an advertised `slot_roots` entry, and that entry must
+    validate; a folded coordinate with no entry FAILS CLOSED. Checking only the intersection of
+    "advertised" and "resident" was bypassable with PUBLIC data on an UNSIGNED lane: a forged accepted
+    record whose delta targets a resident but NOT-own coordinate, advertising either a non-resident
+    coordinate (checked == 0 -> True) or a resident-but-untouched one (its already-published root still
+    matches), folded with no verification whatsoever -- measured 0.0 -> 9000.0 weights on a 9e3-magnitude
+    delta. The own-slot re-gate does not cover it (the target is not own_slot) and the lane's PUT token is
+    a shared PUBLIC demo token, so the attack is unauthenticated. `folded` None -> the old behaviour
+    (advertised-and-resident only), for callers that do not track it."""
+    sr = rec.get("slot_roots")
+    if isinstance(sr, dict) and sr:
+        advertised = {}                                    # resident slot idx -> advertised root
+        for key, want in sr.items():
+            L, _, E = str(key).partition("_")
+            try:
+                idx = host.index_of(int(L), int(E))
+            except ValueError:
+                continue                                   # unparseable key: not ours to judge
+            if idx is None:
+                continue                                   # coordinate not resident here -> nothing to verify
+            advertised[int(idx)] = want
+        for idx, want in advertised.items():
+            if slot_root(host, idx) != str(want):
+                return False
+        for idx in (folded or ()):
+            if int(idx) not in advertised:
+                return False                               # F3: moved but never advertised -> fail closed
+        # Either every advertised coordinate we hold verified, or none of the advertised coordinates are
+        # ours -- and in the latter case (F3) nothing of ours was folded either, so there is nothing to
+        # verify. Falling through to the global root here would reintroduce the freeze this function
+        # exists to prevent.
+        return True
+    want = rec.get("model_root")
+    return want is None or model_root(host) == str(want)
+
+
+def global_root_comparable(host, dec):
+    """SHARD CLAIM: is the coordinator's GLOBAL model_root even COMPARABLE to ours?
+
+    Only when it hashes the SAME slot set. `model_root` digests every coordinate in `host.slots`, so
+    two nodes that deliberately hold different coordinates -- the entire premise of shard claim --
+    can never produce the same digest no matter how bit-identical their shared experts are. Comparing
+    it anyway reads as "base MISMATCH", drags a healthy miner into a resume replay it can never
+    finish, and (being fail-closed downstream) ends in a rollback + a permanent lineage stall.
+
+    The pointer hands us the coordinator's slot set for free: the v2 `rounds` map is keyed "L_E" for
+    every slot it has active (sharddiloco_glm_coordinator._slot_key / _build_pointer). Equal key sets
+    -> the global root IS a meaningful comparison; anything else -> only the per-coordinate roots are
+    (replica_root_ok). A pre-v2 pointer carries no map, so return True and behave EXACTLY as before.
+
+    Accepts either the decoded pointer (dm.sd_pointer_decode -> `slot_rounds`) or a raw v2 pointer
+    dict (`rounds`); both key names are read so a caller cannot silently disable the check by passing
+    the other shape. Pure."""
+    if not isinstance(dec, dict):
+        return True
+    rounds = dec.get("slot_rounds")
+    if rounds is None:
+        rounds = dec.get("rounds")
+    if not rounds:
+        return True                                  # pre-v2 / empty map: nothing to compare against
+    theirs = {str(k) for k in rounds}
+    ours = {"%d_%d" % (int(L), int(E)) for (L, E) in host.slots}
+    return theirs == ours
+
+
+def pointer_slot_count(dec):
+    """How many coordinates the pointer says the coordinator has active (0 for a pre-v2 pointer).
+    Split out so the startup diagnostic can name the number without re-deriving the key lookup."""
+    if not isinstance(dec, dict):
+        return 0
+    rounds = dec.get("slot_rounds")
+    if rounds is None:
+        rounds = dec.get("rounds")
+    return len(rounds or {})
+
+
+def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None):
     """CONTRIBUTOR-SIDE RESUME SYMMETRY: replay accepted records until our base reproduces the
     coordinator's advertised genesis root, so a RESUMED coordinator can accept our work.
 
@@ -1123,10 +1535,27 @@ def resume_to_root(host, lane, target_root, log, max_records=200000):
     FAIL-CLOSED: if the target is unreachable, EVERY slot is restored to the pre-replay snapshot,
     so we are byte-identical to the frozen base and the caller may proceed (its contributions will
     be lineage-dropped, which is the honest signal) rather than training on a half-folded base.
-    Returns (n_applied, reached)."""
+    Returns (n_applied, reached).
+
+    SHARD CLAIM (`own_coord=(L, E)`): target OUR OWN COORDINATE instead of the global root. The
+    global root is a hash over the coordinator's whole slot list, so on a shard-claim network -- where
+    the coordinator registers coordinates we do not hold -- it is a root no replay of ours can ever
+    reproduce, and this loop would fold all 1345 records and then roll everything back. With
+    own_coord the stop condition is the one the lineage guard actually checks (coordinator
+    _lineage_ok, base_slot_root): the most recent record that ADVERTISED a `slot_roots` entry for our
+    coordinate has been folded, and our local slot_root equals that advertised value. `own_coord=None`
+    keeps the global behaviour byte-identical."""
     if not target_root or model_root(host) == str(target_root):
         return 0, True
     target = str(target_root)
+    coord_key, own_idx = None, None
+    if own_coord is not None:
+        coord_key = "%d_%d" % (int(own_coord[0]), int(own_coord[1]))
+        own_idx = host.index_of(int(own_coord[0]), int(own_coord[1]))
+        if own_idx is None:                                      # not resident -> no per-coordinate target
+            log("[glm-contrib] resume: coordinate (L%d,E%d) is not registered locally -- staying on "
+                "the frozen base" % (int(own_coord[0]), int(own_coord[1])))
+            return 0, False
     try:
         man = lane.manifest()
     except Exception as e:                                       # noqa: BLE001
@@ -1142,6 +1571,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000):
     snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}
             for j in range(len(host.slots))]                     # DEEP copy: read_slot returns VIEWS
     applied = 0
+    coord_want, coord_hit = None, False       # newest advertised root for own_coord + did we reproduce it
     for e in events[:int(max_records)]:
         entry = man.get(accepted_name(e))
         if not entry:
@@ -1154,19 +1584,42 @@ def resume_to_root(host, lane, target_root, log, max_records=200000):
         if not ok:
             continue                                             # off-lineage record: already rolled back
         applied += 1
-        if model_root(host) == target:
-            log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s)"
-                % (target[:12], applied))
-            return applied, True
+        if coord_key is None:
+            if model_root(host) == target:
+                log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s)"
+                    % (target[:12], applied))
+                return applied, True
+            continue
+        # Per-coordinate target: only a FOLDED record that advertised our coordinate can move it, and
+        # the LAST such record is the coordinator's current state for it -- so keep replaying (a later
+        # record may advance our coordinate again) and judge the newest advertisement at the end.
+        adv = (rec.get("slot_roots") or {}).get(coord_key)
+        if adv is None:
+            continue
+        coord_want = str(adv)
+        coord_hit = (slot_root(host, own_idx) == coord_want)
+    if coord_key is not None and coord_hit:
+        log("[glm-contrib] resume: reached the coordinator's root for coordinate %s (%s..) after %d "
+            "record(s); the global root is not comparable on a shard-claim network"
+            % (coord_key, coord_want[:12], applied))
+        return applied, True
     for j, d in enumerate(snap):                                 # UNREACHABLE -> full rollback
         host.write_slot(j, d)
+    if coord_key is not None:
+        log("[glm-contrib] resume: could NOT reach the coordinator's root for coordinate %s (%s, %d "
+            "record(s) tried); rolled back to the frozen base -- our contributions will be "
+            "lineage-dropped until the coordinator's base for this coordinate is reachable"
+            % (coord_key, "advertised %s.." % coord_want[:12] if coord_want else
+               "no record advertised it", applied))
+        return 0, False
     log("[glm-contrib] resume: could NOT reach the advertised root %s.. (%d record(s) tried); "
         "rolled back to the frozen base -- our contributions will be lineage-dropped until the "
         "coordinator's base is reachable" % (target[:12], applied))
     return 0, False
 
 
-def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log):
+def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log,
+                      folded=None):
     """The non-blocking accepted-record catch-up of _run_async, FACTORED OUT so the dead-run lineage guard
     is unit-testable against a dirty namespace. Fold every visible accepted record in (last_applied,
     frontier] IN ORDER via _fold_accepted_checked, which fail-CLOSES on an off-lineage record: the frontier
@@ -1198,6 +1651,12 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             break                                            # frontier held; never fold past an off-lineage record
         last_applied = e
         applied_any = True
+        if folded is not None:
+            # SHARD CLAIM: hand the caller the records we actually folded, so it can read the
+            # coordinator's VERDICT on its own contributions (accepted_names_me + record_touched_coord)
+            # and decide whether its expert has plateaued. Appending rather than changing the return
+            # arity keeps every existing caller and test working.
+            folded.append(rec)
     if skipped_at is not None:
         log("[glm-contrib %s] LINEAGE-SKIP: accepted record at event %d does not extend our latched "
             "lineage (local model_root != its advertised root) -- a previous run's leftover in the "
@@ -1207,18 +1666,30 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
 
 
 def async_should_abort_no_progress(local_root, pointer_root, applied_any, seconds_since_progress,
-                                   round_wait):
+                                   round_wait, comparable=True):
     """Async lane no-progress abort decision (alpha 2.0 #146, reuses rc6 semantics). Root mismatch is
     NORMAL mid-flight -- another slot advanced between our reads -- so a mismatch ALONE never aborts
     (this is the deliberate departure from the v1 sync rc7 drift-abort). We abort ONLY when the
     coordinator advertises a root we cannot reach AND we have folded no accepted record for
     `round_wait` seconds, i.e. the missing records are unreconstructable rather than merely late.
     Rules, in order:
+      * comparable False     -> False  (F6: the two roots hash DIFFERENT slot sets -- see below).
       * applied_any True     -> False  (any progress this tick resets the timer -> never abort now).
       * falsy pointer_root   -> False  (coordinator advertises no root -> nothing to be stuck against).
       * local == pointer root -> False (fully caught up -> not stuck).
       * else                 -> True iff seconds_since_progress >= round_wait.
-    Pure: no clock read (the caller passes the elapsed time), no I/O."""
+    Pure: no clock read (the caller passes the elapsed time), no I/O.
+
+    F6 (SHARD CLAIM, 2026-07-25) -- `comparable` (caller passes global_root_comparable(host, dec)): this
+    guard compares GLOBAL model_roots, and `model_root` digests the whole slot list. A shard-claim miner
+    holds a different slot set from the coordinator BY CONSTRUCTION, so `local == pointer` is
+    unsatisfiable for it and its ONLY protection against a false rc6 was folding some record within
+    --round-wait (default 300 s) -- one quiet 5-minute window killed every miner on the network. When the
+    roots are not comparable the mismatch carries no information at all, so the guard is skipped;
+    per-coordinate roots (replica_root_ok / the lineage guard) are authoritative there. Default True keeps
+    the pre-shard-claim behaviour byte-identical whenever the slot sets DO match."""
+    if not comparable:
+        return False
     if applied_any:
         return False
     if not pointer_root:
@@ -1229,7 +1700,7 @@ def async_should_abort_no_progress(local_root, pointer_root, applied_any, second
 
 
 def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid, sig, train_flops,
-                               delta_bytes, steps, tokens, address=None):
+                               delta_bytes, steps, tokens, address=None, base_slot_root=None):
     """Assemble the async-lane contribution record: today's signed record EXTENDED with the alpha-2
     telemetry the coordinator (W2) reads -- base_event (the event this delta was trained against; the
     r-number in the contrib name MEANS this), base_root (our local model_root), steps (inner steps
@@ -1239,7 +1710,12 @@ def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid
 
     `address` (open admission, additive): a keyless miner stamps its CLAIMED wallet address here for
     transparency; the coordinator TRUSTS only the address recovered from `sig`, never this field. None
-    (keyed / flag-off) -> the key is OMITTED, byte-identical to before."""
+    (keyed / flag-off) -> the key is OMITTED, byte-identical to before.
+
+    `base_slot_root` (SHARD CLAIM, additive): the root of THIS COORDINATE only (N.slot_root). A
+    Shard-Claim coordinator judges lineage on it and ignores the global `base_root`, which is what lets
+    it register and evict coordinates without dropping everyone mid-flight. `base_root` is still sent
+    so a pre-Shard-Claim coordinator keeps working unchanged; None omits the new key entirely."""
     rec = dict(
         miner=miner, expert=int(i), layer=int(L), glm_expert=int(E),
         base_round=int(base_event),          # v1-compat alias: the r-number == base_event
@@ -1250,6 +1726,8 @@ def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid
     )
     if address is not None:
         rec["address"] = str(address)
+    if base_slot_root is not None:
+        rec["base_slot_root"] = str(base_slot_root)
     return rec
 
 
@@ -1320,6 +1798,18 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                                 # silently drops) the previous record. Never resets within a run.
     last_progress_t = time.time()
     rounds_done = 0             # OUR OWN published contributions -- this is what --max-rounds counts here
+    # SHARD CLAIM: claim-and-advance state. `reject_streak` counts CONSECUTIVE events where the
+    # coordinator merged OUR coordinate and did not accept our delta (see accepted_names_me --
+    # before this, a miner literally could not tell a rejection from a lost race or a missing record).
+    reject_streak = 0
+    # F5a: the base_event of our LAST publish. Until we have published something, no accepted record can
+    # be a verdict on us (event_judged_us), so folding a running campaign's history never moves the streak.
+    last_pub_base_event = None
+    advance_after = int(getattr(args, "advance_after", 0) or 0)
+    claim_coords = claim_all_coords(args, list(host.slots))
+    log("[glm-contrib %s] shard claim: %d coordinate(s) claimable here, advance_after=%s"
+        % (miner, len(claim_coords),
+           ("%d consecutive rejects" % advance_after) if advance_after else "OFF (never advance)"))
     log("[glm-contrib %s] ASYNC cadence (v2 lane, #146): non-blocking; train continuously, never wait "
         "on a barrier. --max-rounds=%d counts our own contributions." % (miner, args.max_rounds))
     # -- alpha 3.0 Objective 2: periodic corpus re-sync baseline. OFF unless NEURAHASH_GLM_DATA_RESYNC;
@@ -1330,15 +1820,24 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # genesis root is NOT the frozen base and nothing we train can be accepted until we reach it.
     # Root-targeted replay, fail-closed (rolls back to the frozen base when unreachable). A normal
     # from-base coordinator advertises our own root, so this is a no-op single comparison there.
+    # -- SHARD CLAIM (2026-07-25): the comparison below is only meaningful when the coordinator hashes
+    # the SAME slot set we do. Once it can REGISTER a coordinate we do not hold, its global root is
+    # unreachable by construction and this check would report "base MISMATCH" on every healthy miner,
+    # then burn a full replay that must end in a rollback. global_root_comparable gates it.
     try:
         _ptr0 = lane.read_pointer()
-        _root0 = dm.sd_pointer_decode(_ptr0).get("model_root") if _ptr0 else None
+        _dec0 = dm.sd_pointer_decode(_ptr0) if _ptr0 else None
+        _root0 = _dec0.get("model_root") if _dec0 else None
     except Exception:                                            # noqa: BLE001 -- pointer races are normal
-        _root0 = None
-    if _root0 and str(_root0) != model_root(host):
+        _dec0, _root0 = None, None
+    if _root0 and not global_root_comparable(host, _dec0):
+        log("[glm-contrib %s] shard claim: skipping the global-root comparison (coordinator has %d "
+            "active coordinate(s), we hold %d) -- per-coordinate roots are authoritative here"
+            % (miner, pointer_slot_count(_dec0), len(host.slots)))
+    elif _root0 and str(_root0) != model_root(host):
         log("[glm-contrib %s] base MISMATCH vs coordinator genesis (ours=%s.. theirs=%s..) -- "
             "attempting resume replay" % (miner, model_root(host)[:12], str(_root0)[:12]))
-        resume_to_root(host, lane, _root0, log)
+        resume_to_root(host, lane, _root0, log, own_coord=(L, E))
 
     _resync_on = _data_resync_enabled(os.environ)
     _prev_data_record = _read_data_record(lane) if _resync_on else None
@@ -1357,8 +1856,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             _prev_data_record, _refreshed = glm_data_periodic_resync(
                 lane, args.data_dir, _prev_data_record, log=log)
             if _refreshed:
-                train_ids = node_ids(args, i, "train")
-                val_ids = node_ids(args, i, "val")
+                train_ids = node_ids(args, coord_data_slot(L, E), "train")
+                val_ids = node_ids(args, coord_data_slot(L, E), "val")
                 regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
         try:
@@ -1391,17 +1890,75 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         except Exception:                                        # noqa: BLE001
             time.sleep(args.poll)
             continue
+        _folded = []
         last_applied, applied_any, _abort = catch_up_accepted(
-            host, lane, man, last_applied, dec.get("event"), regate_ce, i, miner, log)
+            host, lane, man, last_applied, dec.get("event"), regate_ce, i, miner, log, folded=_folded)
         if _abort is not None:
             return _abort                                        # rc8: poisoned own-slot delta (unchanged)
         if applied_any:
             last_progress_t = time.time()
 
+        # -- (1b) SHARD CLAIM: read the coordinator's verdict on OUR expert and advance when plateaued.
+        # A record whose slot_roots names our coordinate means the coordinator MERGED our expert at that
+        # event; if our miner id is not in its accepted rows, our delta lost the gate. K consecutive
+        # losses = this expert has stopped yielding for us, so release it and claim the next one. This is
+        # the owner's "finish one, store it, start the next": storing is a no-op because an accepted
+        # delta is already merged into the model, so the model IS the store.
+        for _rec in _folded:
+            if not record_touched_coord(_rec, (L, E)):
+                continue                                         # some other expert's event
+            if not event_judged_us(_rec, last_pub_base_event):
+                continue                                         # F5a: predates our work -> not a verdict
+            if accepted_names_me(_rec, miner):
+                reject_streak = 0
+            else:
+                reject_streak += 1
+        if advance_after and reject_streak >= advance_after:
+            nxt = next_claim_coord(claim_coords, (L, E))
+            if nxt is None:
+                log("[glm-contrib %s] plateaued on (L%d,E%d) after %d consecutive gate rejects, but this "
+                    "node holds no other coordinate to claim -- staying put." % (miner, L, E, reject_streak))
+                reject_streak = 0
+            else:
+                try:
+                    ni = host.register(*nxt)
+                except (ValueError, RuntimeError) as ex:
+                    log("[glm-contrib %s] cannot advance to (L%d,E%d): %s -- staying on (L%d,E%d)"
+                        % (miner, nxt[0], nxt[1], ex, L, E))
+                    reject_streak = 0
+                else:
+                    log("[glm-contrib %s] PLATEAU on (L%d,E%d) after %d consecutive rejects -> RELEASE, "
+                        "CLAIM (L%d,E%d) [local slot %d]. Sweeping: %d coordinate(s) claimable here."
+                        % (miner, L, E, reject_streak, nxt[0], nxt[1], ni, len(claim_coords)))
+                    L, E, i = nxt[0], nxt[1], ni
+                    # Re-read this coordinate's data shard and rebind the re-gate closure over the new
+                    # val split -- the same mid-loop reload the corpus-resync path already performs.
+                    train_ids = node_ids(args, coord_data_slot(L, E), "train")
+                    val_ids = node_ids(args, coord_data_slot(L, E), "val")
+                    regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+                    reject_streak = 0
+                    last_pub_base_event = None       # F5a: nothing of OURS is in flight on this coordinate
+                    # F5b: the freshly claimed coordinate's local weights are the FROZEN BASE. If anyone
+                    # already trained it, our base_slot_root can never match the coordinator's and EVERY
+                    # later contribution is dropped `wrong-lineage-slot-root` forever, silently --
+                    # catch_up_accepted only scans (last_applied, frontier], so the historical records that
+                    # moved this coordinate are never replayed. Bring it up to the coordinator's state now,
+                    # targeted at THIS coordinate (the global root is not reachable on a shard-claim
+                    # network) and fail-closed: unreachable -> rolled back to the frozen base, which is the
+                    # honest signal, not a half-folded base.
+                    _n_res, _reached = resume_to_root(host, lane, pointer_root, log, own_coord=nxt)
+                    log("[glm-contrib %s] post-advance catch-up for (L%d,E%d): folded %d record(s), "
+                        "coordinator root %s" % (miner, L, E, _n_res,
+                                                 "REACHED" if _reached else "NOT reached (frozen base)"))
+
         # -- (2) root mismatch is NORMAL mid-flight; abort ONLY on prolonged no-progress (rc6). -------
+        # F6: and ONLY when the two roots are even comparable. A shard-claim miner holds a different slot
+        # set from the coordinator by construction, so local == pointer is unsatisfiable and this guard
+        # would rc6 every healthy miner after one quiet --round-wait window.
         root = model_root(host)
         if async_should_abort_no_progress(root, pointer_root, applied_any,
-                                          time.time() - last_progress_t, args.round_wait):
+                                          time.time() - last_progress_t, args.round_wait,
+                                          comparable=global_root_comparable(host, dec)):
             log("[glm-contrib %s] FATAL: no accepted-record progress for %.0fs while local model_root="
                 "%s.. cannot reach coordinator root=%s.. (missing records are unreconstructable, not "
                 "merely late)." % (miner, args.round_wait, root[:12], str(pointer_root)[:12]))
@@ -1454,11 +2011,13 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
         record = build_async_contrib_record(miner, i, L, E, base_event, root, ecid, sig, train_flops,
                                              delta_bytes, steps, tokens,
-                                             address=(wallet.address if wallet is not None else None))
+                                             address=(wallet.address if wallet is not None else None),
+                                             base_slot_root=slot_root(host, i))
         pub_name = async_publish_name(base_event, miner, publish_k)   # F-Q1: unique name per publish
         lane.put_json_named(pub_name, record)
         publish_k += 1
         rounds_done += 1
+        last_pub_base_event = int(base_event)      # F5a: from here on, events >= this can judge us
         log("[glm-contrib %s] async round %d: %s slot %d (L%d,E%d) in %.1fs, best_val_ce=%.5f, "
             "base_event=%d published as %s expert_cid=%s.. delta=%dB base_root=%s.. steps=%d tokens=%d"
             % (miner, rounds_done, "GARBAGE (adversarial control)" if args.garbage else
@@ -1475,8 +2034,16 @@ def main(argv=None):
     ap.add_argument("--miner", default=os.environ.get("NEURAHASH_SD_MINER"),
                     help="miner id. Keyed: defaults to 'miner0'. KEYLESS (no --key): IGNORED -- the id is "
                          "derived from the wallet address ('glm-'+addr[2:10]) so the coordinator can bind it")
-    ap.add_argument("--slot", type=int, default=int(os.environ.get("NEURAHASH_SD_EXPERT", "0")),
-                    help="lane slot index this miner OWNS (maps to --slots[slot])")
+    ap.add_argument("--expert", default=os.environ.get("NEURAHASH_SD_COORD"),
+                    help="the GLM expert COORDINATE this miner claims, as L:E (e.g. 1:3). This is the "
+                         "shard-claim address: any coordinate this node holds is claimable, whether or "
+                         "not the coordinator has ever seen it, so a stranger no longer has to guess a "
+                         "free index. Overrides --slot when both are given.")
+    ap.add_argument("--slot", type=int, default=None,
+                    help="DEPRECATED positional index into --slots, kept so <=v3.3.2 miners and scripts "
+                         "keep working. Prefer --expert L:E: an index only means something relative to a "
+                         "slot list the coordinator fixed at startup, which is exactly what shard claim "
+                         "removes. Defaults to NEURAHASH_SD_EXPERT, else 0.")
     ap.add_argument("--key", default=None)
     ap.add_argument("--key-file", default=None)
     ap.add_argument("--wallet-file", dest="wallet_file", default=None,
@@ -1503,6 +2070,13 @@ def main(argv=None):
                     help="lora (default) ships the LoRA factors -- 67.7x smaller than the dense "
                          "delta they materialise to, and the only wire the shared lane accepts; "
                          "dense ships the materialised weight delta (18.87 MB/round, LAN only)")
+    ap.add_argument("--advance-after", dest="advance_after", type=int,
+                    default=int(os.environ.get("NEURAHASH_SD_ADVANCE_AFTER", "3")),
+                    help="SHARD CLAIM: after this many CONSECUTIVE gate rejects on the claimed expert, "
+                         "declare it plateaued, release it and claim the next coordinate this node "
+                         "holds. That is the sweep -- claim, work, plateau, release, claim next. "
+                         "0 disables advancing (stay on one coordinate forever, pre-shard-claim "
+                         "behaviour).")
     ap.add_argument("--garbage", action="store_true",
                     help="ADVERSARIAL control: publish a correctly-SIGNED but harmful random delta "
                          "(sharddiloco_glm_expert.garbage_delta) that the secret-probe gate must REJECT")
@@ -1516,10 +2090,9 @@ def main(argv=None):
     use_glm_lane_names()
     key, wallet = _resolve_identity(args, log=_flush)
     slots = parse_slots(args.slots)
-    i = int(args.slot)
-    if not (0 <= i < len(slots)):
-        raise SystemExit("[glm-contrib] --slot %d out of range for --slots %s" % (i, args.slots))
-    L, E = slots[i]
+    L, E, i, _claim_src = resolve_claim(
+        args, slots, log=_flush,
+        identity=(wallet.address if wallet is not None else (args.miner or "miner0")))
     # KEYLESS: the miner id IS the wallet-address derivation (the coordinator binds the name to the recovered
     # key, so any other name is rejected). KEYED: --miner / NEURAHASH_SD_MINER, else the legacy 'miner0'.
     if wallet is not None:
@@ -1531,9 +2104,10 @@ def main(argv=None):
     else:
         miner = args.miner or "miner0"
     lane = H.ContentLane(args.url, args.token)
-    _flush("[glm-contrib %s] UP owns slot %d = GLM (L%d,E%d) | identity=%s mode=%s lane=%s (all-outbound)"
-           % (miner, i, L, E, ("keyed" if key is not None else "keyless " + wallet.address),
-              args.mode, args.url))
+    _flush("[glm-contrib %s] UP claims GLM (L%d,E%d) via %s | local_slot=%d domain_slot=%d | "
+           "identity=%s mode=%s lane=%s (all-outbound)"
+           % (miner, L, E, _claim_src, i, coord_data_slot(L, E),
+              ("keyed" if key is not None else "keyless " + wallet.address), args.mode, args.url))
 
     if args.mode != "tiny":
         # W6 corpus-over-WAN: fetch+verify this miner's ids files BEFORE anything reads them.
@@ -1547,8 +2121,8 @@ def main(argv=None):
     _flush("[glm-contrib %s] base ready: model_root=%s.. base_digest=%s.. seq=%d"
            % (miner, model_root(host)[:12], base_digest(model)[:12], seq))
 
-    train_ids = node_ids(args, i, "train")
-    val_ids = node_ids(args, i, "val")
+    train_ids = node_ids(args, coord_data_slot(L, E), "train")
+    val_ids = node_ids(args, coord_data_slot(L, E), "val")
 
     # wait for the coordinator's first pointer
     ptr, t0 = None, time.time()
@@ -1676,7 +2250,8 @@ def main(argv=None):
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
         record = dict(miner=miner, expert=int(i), layer=int(L), glm_expert=int(E), base_round=int(rnd),
                       expert_cid=ecid, trunk_cid=None, sig=sig, train_flops=float(train_flops),
-                      trunk_bytes=0, delta_bytes=delta_bytes, base_root=root)
+                      trunk_bytes=0, delta_bytes=delta_bytes, base_root=root,
+                      base_slot_root=slot_root(host, i))     # SHARD CLAIM: per-coordinate lineage
         if wallet is not None:
             record["address"] = wallet.address                  # keyless: claimed address (coordinator trusts recovered)
         rname = contrib_name(rnd, miner)

@@ -847,6 +847,20 @@ class SecretRotatedProbe:
         self._seed = int(seed)
         self._size = int(size)
 
+    def ensure_pool(self, expert, pool):
+        """SHARD CLAIM: attach a gate pool for a slot that did not exist at construction time.
+
+        The coordinator can now admit a (layer,expert) coordinate mid-run, and `batch` would raise a
+        bare KeyError for it. Idempotent: an existing pool is never replaced, because rotating a live
+        slot's pool mid-campaign would silently change the yardstick its deltas are gated against."""
+        e = int(expert)
+        if e not in self._pools:
+            self._pools[e] = pool
+        return self._pools[e]
+
+    def has_pool(self, expert):
+        return int(expert) in self._pools
+
     def batch(self, expert, rnd):
         X, y = self._pools[int(expert)]
         rng = np.random.default_rng(self._seed + int(rnd))   # ROTATES every outer round
@@ -889,8 +903,10 @@ def shard_merge_round(trunk, experts, contributions, eval_expert, probe, meter, 
 
     Returns {accepts, rejects, staled, minted, trunk_merged, per_expert:[{miner, expert, accepted,
     base_val, merged_val, gain, verify_flops, train_flops, gain_per_flop, delta_norm}]}. `minted` = sum
-    of accepted held-out gains (D3 pay-per-MEASURED-gain); each row's gain_per_flop = gain / (train +
-    verify FLOPs). `staled` = contributions aged out by the max-staleness policy (counted in rejects)."""
+    of accepted PROBE gains -- the GATE signal, NOT the pay signal. The secret probe decides ACCEPT;
+    to PAY, reprice per_expert against the held-out GOAL METRIC via attribute_minted() once the round's
+    held-out CE is known (F4; memory pouw-verified-not-useful -- verified != useful). each row's
+    gain_per_flop = gain / (train + verify FLOPs). `staled` = aged out by max-staleness (in rejects)."""
     from neurahash.training_layer import outer_aggregate   # lazy: keep this module's import graph thin
     if momentum is None:
         momentum = {}
@@ -953,6 +969,41 @@ def shard_merge_round(trunk, experts, contributions, eval_expert, probe, meter, 
                                gain_per_flop=gpf, delta_norm=verdict.get("delta_norm")))
     return dict(accepts=accepts, rejects=rejects, staled=staled, minted=minted,
                 trunk_merged=trunk_merged, per_expert=per_expert)
+
+
+def attribute_minted(per_expert, heldout_gain):
+    """F4 -- PAY THE GOAL METRIC, not the secret-probe proxy (memory pouw-verified-not-useful).
+
+    shard_merge_round GATES + accepts each expert delta on the SECRET rotated probe, and its `minted`
+    is the sum of accepted PROBE gains. But a positive probe-gain does NOT imply the reported held-out
+    goal metric improved: on a live run a round minted +0.0065 on the probe while held-out CE got WORSE
+    (+0.0012). This project's deepest lesson -- verified != useful -- was recurring in the PAY path.
+
+    So the coordinator pays the round's ACTUAL held-out improvement instead. Given
+    `heldout_gain` = max(0, prev_heldout_ce - new_heldout_ce) (computed by the coordinator, which owns
+    the held-out pool), this redistributes it across the ACCEPTED rows of `per_expert` in proportion to
+    each row's probe-gain (`gain`), writes the result to a new per-row `paid` field (0.0 on rejected
+    rows), and returns the round's total paid. Net effect: a round whose probe-gain is positive but
+    whose held-out did NOT improve (heldout_gain <= 0) pays 0. The gate signal (`gain`) is left intact
+    on every row, so both the gate signal and the paid amount are reported per slot.
+
+    PURE: mutates ONLY the `paid` key on the passed rows; touches no weights. `heldout_gain` is clamped
+    at 0. If (defensively) the accepted rows carry no positive probe-gain to weight by, the gain is
+    split equally across them."""
+    hg = max(0.0, float(heldout_gain))
+    for pe in per_expert:
+        pe["paid"] = 0.0
+    accepted = [pe for pe in per_expert if pe.get("accepted")]
+    if hg <= 0.0 or not accepted:
+        return 0.0
+    wsum = sum(max(0.0, float(pe.get("gain", 0.0))) for pe in accepted)
+    total = 0.0
+    for pe in accepted:
+        w = max(0.0, float(pe.get("gain", 0.0)))
+        share = (w / wsum) if wsum > 0.0 else (1.0 / len(accepted))
+        pe["paid"] = hg * share
+        total += pe["paid"]
+    return total
 
 
 # ============================================================ shardDiLoCo streaming-subset sync (#126)

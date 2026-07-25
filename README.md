@@ -110,11 +110,24 @@ address (`glm-<addr[2:10]>`), so nobody can impersonate you and no operator can 
 
 ```bash
 python tools/sharddiloco_glm_contributor.py --mode glm \
-  --slot <n> \
   --shard-dir <glm-shards> --config-dir <glm-config> \
   --data-dir <empty-dir> --domains daily \
   --url <content-store-url> --token <store-token> --device cuda
 ```
+
+**You do not pick a slot number any more.** Omit the expert entirely and the miner derives its
+starting coordinate from a hash of its own wallet address, so independent miners spread across the
+expert space with no registry and no coordination. To choose one yourself, name the GLM
+**coordinate** — layer and expert — rather than a position in somebody's list:
+
+```bash
+  --expert 1:3          # GLM layer 1, expert 3
+```
+
+Which coordinates you can claim is decided by `--piece` (each piece holds 5 experts). Ask for one
+your GPU does not hold and the miner refuses at startup and prints the ones it can host — see
+[Alpha 3.4.0](#alpha-340-2026-07-25--shard-claim-pick-an-expert-finish-it-move-to-the-next) for why
+that check exists.
 
 Everything heavy is fetched and verified for you: the GLM base shards come from the public bundle
 (see [BUNDLE.md](BUNDLE.md)), an **empty `--data-dir` self-fills** with the advertised corpus
@@ -135,6 +148,8 @@ proven live the day this shipped: keyless strangers' mints settled as
 | `NEURAHASH_GLM_DATA_RESYNC=1` | v3: a running miner picks up a newly published corpus with no restart (fail-closed) |
 | `NEURAHASH_VRAM_MANAGER=on` | elastic VRAM: shed/grow training layers around whatever else uses your GPU |
 | `NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC` | hard per-process GPU memory ceiling |
+| `NEURAHASH_SD_COORD=L:E` | v3.4: the expert COORDINATE to claim (same as `--expert`). Unset = derive it from your wallet address |
+| `NEURAHASH_SD_ADVANCE_AFTER=N` | v3.4: consecutive gate rejects before releasing the expert and claiming the next (default 3; `0` never advances) |
 
 ### G1 train-role — RLVR rollouts (v3.2, capacity-gated)
 
@@ -234,6 +249,40 @@ hanging your machine. The static VRAM cap (`NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_
 hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory rather than total. Opt-in,
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
+
+## Alpha 3.4.0 (2026-07-25) — Shard Claim: pick an expert, finish it, move to the next
+
+Until this release the miner needed `--slot <n>`: a **positional index** into a list of experts the
+coordinator fixed when it started. Two consequences, both fatal for anyone joining from outside. A
+stranger had no way to know which `n` was free — and the claimable set could never be larger than
+whatever the operator declared at launch. The effect was not subtle: our own campaign ran **445
+events across exactly two experts** — the two the operator happened to name at startup — while five
+different miner identities came and went, every one of them competing for those same two slots.
+
+Work is now addressed by **coordinate** — a GLM `layer:expert` pair — and the coordinator registers a
+coordinate **on your first valid contribution, whether or not it has ever seen it before.** There is
+no list to be admitted to.
+
+- **Finish one, move to the next.** After `--advance-after` consecutive gate rejects (default 3) the
+  miner calls that expert plateaued, releases it, and claims the next coordinate it holds. Each
+  expert's LoRA trains against a frozen trunk with no cross-expert dependency, so sweeping the space
+  is just: claim, work, plateau, release, claim next.
+- **Spreading needs no coordination.** With no `--expert`, your starting coordinate is a hash of your
+  own wallet address. Two miners landing on the same expert is wasteful, not incorrect — both deltas
+  are gated and the better one wins.
+- **A claim you cannot host is refused at startup**, with the list of coordinates you can. This check
+  matters more than it reads: a non-resident expert row is *writable and silently inert* — zero
+  weights with the router pinned to `-inf` — so claiming one would have trained happily and been
+  rejected forever, with nothing in any log to explain why.
+- **The coordinator is bounded.** `--max-active-slots` caps how many coordinates are live at once;
+  over the cap a claim is deferred and retried, never silently dropped.
+- `--slot <n>` still works, unchanged, for existing setups. It is deprecated.
+
+**What this does not claim.** It does not make the model smarter. The training shard is currently
+2,048 tokens against a 32,768-token held-out pool, and *that* — not the number of experts — is why
+held-out CE has been flat at 7.66078. Removing the joining blocker is the structural fix; growing the
+corpus is the next lever for quality, and we would rather say so than let a release note imply a
+result we have not measured.
 
 ## Alpha 3.3.2 (2026-07-25) — a recoverable error no longer kills the miner
 

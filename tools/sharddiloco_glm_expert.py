@@ -466,6 +466,13 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     LoRAExperts = _lora_experts_cls()
     layer = model.model.layers[L]
     base = layer.mlp.experts
+    # Defensive UNWRAP: if a previous call died between the wrap below and its restore, this layer
+    # still holds a LoRAExperts. Wrapping a wrapper explodes on `base.hidden_dim` (fused experts have
+    # it, the wrapper does not) and kills the miner for good. The `finally` below is the real fix;
+    # this handles a model object that arrives already-poisoned from an older code path.
+    while isinstance(base, LoRAExperts):
+        base = base.base
+        layer.mlp.experts = base
     le = LoRAExperts(base, {E: 0}, r=r, alpha=alpha)
     layer.mlp.experts = le
     le.enabled_nodes = {0}
@@ -493,26 +500,34 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
             le.outer = prev
 
     fwd = glm_fwd_flops_per_example(cfg, train_ids.shape[1])
-    best_val, best_snap = _sel_val(), _snap()
     n_ex = 0
-    for step in range(1, H + 1):
-        idx = np.random.default_rng(1000 + seed * 7919 + step).integers(0, len(train_ids), size=batch)
-        ids = torch.as_tensor(train_ids[idx]).to(next(model.parameters()).device)
-        model.train()
-        out = model(input_ids=ids, labels=ids)
-        opt.zero_grad()
-        out.loss.backward()
-        opt.step()
-        n_ex += len(ids)
-        if meter is not None:
-            meter.add_train(len(ids))
-        if step % 8 == 0:
-            v = _sel_val()
-            if v < best_val:
-                best_val, best_snap = v, _snap()
-    _restore(best_snap)
-    delta = _materialize_canonical(le, E)
-    layer.mlp.experts = base                     # detach LoRA -> plain fused model for the coordinator
+    # The restore below MUST run even when training raises. MEASURED 2026-07-25 on the live 5090:
+    # a CUDA OOM at round 27 was caught by the contributor's designed self-heal ("round SKIPPED --
+    # freeing cache + pausing, will retry next round"), but the exception escaped this function with
+    # the layer still wrapped; the next round re-entered here, read the leaked wrapper as `base`, and
+    # died on `base.hidden_dim`. The miner never came back. So every recoverable training error --
+    # OOM, NaN, a bad batch -- turned the recovery path into a permanent kill.
+    try:
+        best_val, best_snap = _sel_val(), _snap()
+        for step in range(1, H + 1):
+            idx = np.random.default_rng(1000 + seed * 7919 + step).integers(0, len(train_ids), size=batch)
+            ids = torch.as_tensor(train_ids[idx]).to(next(model.parameters()).device)
+            model.train()
+            out = model(input_ids=ids, labels=ids)
+            opt.zero_grad()
+            out.loss.backward()
+            opt.step()
+            n_ex += len(ids)
+            if meter is not None:
+                meter.add_train(len(ids))
+            if step % 8 == 0:
+                v = _sel_val()
+                if v < best_val:
+                    best_val, best_snap = v, _snap()
+        _restore(best_snap)
+        delta = _materialize_canonical(le, E)
+    finally:
+        layer.mlp.experts = base                 # detach LoRA -> plain fused model for the coordinator
     train_flops = 3.0 * fwd * n_ex               # forward + backward (D3 convention)
     # `lora` is the SAME contribution as `delta`, 68x smaller: delta == materialize_from_lora(lora).
     # Returned alongside rather than instead so callers choose the wire without changing this kernel.

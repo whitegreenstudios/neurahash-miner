@@ -235,6 +235,33 @@ hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory ra
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
 
+## Alpha 3.3.2 (2026-07-25) — a recoverable error no longer kills the miner
+
+**Everyone should upgrade.** Every release up to and including v3.3.1 had a fault that turned any
+*recoverable* training error into a permanent shutdown. Measured on our own 5090 the same day:
+
+```
+[glm-contrib] round SKIPPED: CUDA OOM under memory pressure -- freeing cache + pausing,
+              will retry next round
+[glm-contrib] VRAM recovered (1 unit(s)) -- resuming after 4 wait(s)
+...next round...
+AttributeError: 'LoRAExperts' object has no attribute 'hidden_dim'
+```
+
+The self-heal worked exactly as designed — paused, waited for VRAM, resumed — and then the miner
+died anyway and stayed dead for ~18 hours, earning nothing. Cause: the local trainer swaps a LoRA
+wrapper into the layer it is training and only swapped it back **on success**, so an escaping error
+left the wrapper installed; the next round tried to wrap the wrapper. The swap-back is now in a
+`finally`, and a model that arrives already wrapped (from an older build) is unwrapped instead of
+crashing. Four regression tests reproduce the exact live failure and fail on the old code.
+
+If you run a card you also game or work on, this is the difference between a miner that survives
+your GPU usage and one that quietly stops paying you.
+
+**Coordinator resume is now on by default** (operators only — the miner side shipped in v3.3.1).
+A restart continues the campaign instead of silently resetting it to the frozen base; measured on
+one lane minutes apart, held-out CE 10.40 resumed to 8.64. Opt out with `--no-resume`.
+
 ## Alpha 3.3.1 (2026-07-25) — the pipeline actually generates, and miners can rejoin a resumed run
 
 **If you ran v3.3.0's pipeline, upgrade.** Its stages loaded the frozen trunk but **zero experts**,

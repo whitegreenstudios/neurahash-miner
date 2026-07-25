@@ -12,8 +12,11 @@ SPLIT DISCIPLINE (mirrors `sharddiloco_harness.domain_splits`): four DISJOINT ro
   val     - the miner's own save-best signal   -> MINER-FACING dir (<out>/miner), public to the miner
   probe   - the COORDINATOR's secret gate pool -> COORDINATOR-ONLY dir (<out>/coord)
   heldout - the reported goal metric           -> COORDINATOR-ONLY dir (<out>/coord)
-Rows are chunked contiguously and then the four ranges are carved out by index, so no row can
-appear in two splits and no token overlaps a boundary.
+Each DOCUMENT (corpus line) is assigned to a split by a hash of its content and each split is
+tokenized separately, so a document keeps its split however the corpus is later rebuilt and no row
+can straddle two splits. probe + heldout are additionally FROZEN once written (--refresh-coord-
+splits to re-cut): the goal metric's yardstick must not move under a daily corpus refresh, or
+"held-out CE improved" compares two different exams.
 
 PROBE-POOL SECRECY IS A HARD OPERATIONAL REQUIREMENT. The per-round rotation (dm.SecretRotatedProbe
 draws a fresh subset each round) does NOT protect against a miner who obtains the whole probe POOL:
@@ -70,15 +73,22 @@ def split_of_document(doc, splits=SPLITS, buckets=SPLIT_BUCKETS):
     "generalization" if the model never trained on the held-out text. That has to hold across
     corpus refreshes, not just within one prep.
 
-    The previous scheme carved splits by POSITION out of one flat token stream
-    (`arr[off:off+n]` per split). Combined with `daily_corpus_extract.py --roll`, which rebuilds a
-    CUMULATIVE window each day, that meant every refresh re-cut the same growing pool at fixed
-    offsets: a row held out yesterday could land in train today, silently, with every mechanical
-    check still green. That is the exact failure this project was founded on (memory
-    `pouw-verified-not-useful`: ~900 rounds paid while held-out validation worsened).
+    The previous scheme carved splits by POSITION out of one flat token stream (`arr[off:off+n]`
+    per split), which had a MEASURED defect: the stream was sliced with no regard for document
+    boundaries, so a document sitting on a boundary supplied two splits at once. With small
+    fixtures a single document supplied train, val, probe AND heldout; at production sizes it is
+    the three documents on the internal boundaries, one of them shared between the coordinator's
+    secret probe pool and the goal metric.
 
-    Assigning by content hash instead makes split membership permanent -- growing or reordering the
-    corpus adds documents to each split but never MOVES one between splits. Ratios follow the
+    (Recorded because it was checked and found FALSE: position-carving did NOT migrate held-out
+    rows into training across daily refreshes. `daily_corpus_extract.roll_domain` walks
+    `_dates_back` newest-first and dedups by first occurrence, so a refresh PREPENDS -- old content
+    only moves to later offsets or falls off the end, never earlier into the train region. Two
+    tests written to demonstrate that migration both passed on the unfixed code.)
+
+    Assigning by content hash makes split membership permanent -- growing or reordering the corpus
+    adds documents to each split but never MOVES one between splits -- so the invariant holds by
+    construction rather than by an accident of roll ordering that nothing tested. Ratios follow the
     configured row counts, so the mix is unchanged.
     """
     total = float(sum(n for _, n in splits))
@@ -91,7 +101,8 @@ def split_of_document(doc, splits=SPLITS, buckets=SPLIT_BUCKETS):
     return splits[-1][0]
 
 
-def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, splits=SPLITS):
+def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, splits=SPLITS,
+                 freeze_coord=True):
     """Tokenize + write one domain's splits. Documents are lines (the corpus roll files are
     line-per-document), assigned to splits by content hash and tokenized SEPARATELY, so no row can
     straddle two splits -- the old flat-stream chunking let a held-out row carry the tail of a
@@ -105,6 +116,21 @@ def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, split
 
     written, parts, used = [], [], 0
     for name, n in splits:
+        # probe + heldout are the GOAL METRIC's yardstick. Freeze them: once written they are never
+        # regenerated, so held-out CE stays comparable across every corpus refresh for the life of a
+        # campaign. Without this, a daily refresh silently REPLACES the held-out set -- documents
+        # keep their split, but `mine` is in roll order (newest first) and we take the first n rows,
+        # so today's documents push yesterday's out. Day-to-day CE would then compare two different
+        # exams and "the model got smarter" would be unfalsifiable. Pass --refresh-coord-splits to
+        # deliberately re-cut them, which STARTS A NEW CAMPAIGN's baseline.
+        dst = coord_dir if name in COORD_ONLY else miner_dir
+        path = os.path.join(dst, "ids_%s_%s.npy" % (domain, name))
+        if name in COORD_ONLY and freeze_coord and os.path.exists(path):
+            part = np.load(path)
+            written.append((name, part.shape, path + "  [FROZEN: kept, not re-cut]"))
+            parts.append(part)
+            used += int(part.shape[0])
+            continue
         mine = by_split.get(name, [])
         ids = tok("\n".join(mine), add_special_tokens=False)["input_ids"] if mine else []
         have = len(ids) // seq
@@ -118,10 +144,8 @@ def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, split
         if int(part.max()) >= vocab_size:
             raise SystemExit("domain %s: token id %d >= vocab_size %d"
                              % (domain, part.max(), vocab_size))
-        # probe + heldout are the coordinator's SECRET gate pool + goal metric: they land in a
-        # coordinator-only dir that is never shipped to a miner (F1). train + val are miner-facing.
-        dst = coord_dir if name in COORD_ONLY else miner_dir
-        path = os.path.join(dst, "ids_%s_%s.npy" % (domain, name))
+        # (dst/path resolved above; probe + heldout land in the coordinator-only dir, never
+        # shipped to a miner -- F1.)
         np.save(path, part)
         written.append((name, part.shape, path))
         parts.append(part)
@@ -179,6 +203,10 @@ def main():
     ap.add_argument("--seq", type=int, default=32)
     ap.add_argument("--max-chars", type=int, default=6_000_000,
                     help="chars read per domain (bounds tokenizer time; 6M >> the ~800KB needed)")
+    ap.add_argument("--refresh-coord-splits", dest="refresh_coord", action="store_true",
+                    help="RE-CUT the frozen probe/heldout pools. This moves the goal metric's "
+                         "yardstick, so held-out CE before and after are NOT comparable -- use it "
+                         "only when deliberately starting a new campaign baseline.")
     ap.add_argument("--train-rows", type=int, default=4096,
                     help="rows in the TRAIN split per domain (raise for long soaks; needs enough "
                          "--max-chars to supply train+val+probe+heldout rows)")
@@ -206,7 +234,8 @@ def main():
         with open(src, "r", encoding="utf-8", errors="replace") as f:
             text = f.read(args.max_chars)
         arr, written, used = build_domain(tok, text, args.seq, miner_dir, coord_dir, domain,
-                                          cfg.vocab_size, splits=splits)
+                                          cfg.vocab_size, splits=splits,
+                                          freeze_coord=not args.refresh_coord)
         print("\n[%s] %s -> %d chars -> %d rows of %d tokens (used %d rows)"
               % (domain, src, len(text), arr.shape[0], args.seq, used))
         for name, shape, path in written:

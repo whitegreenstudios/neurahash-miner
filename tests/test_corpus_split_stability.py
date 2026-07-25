@@ -4,16 +4,22 @@ Held-out cross-entropy is this project's goal metric. It only means "generalizat
 never trained on the held-out text -- and that has to hold ACROSS corpus refreshes, not merely
 within one prep.
 
-FOUND 2026-07-25 (not yet shipped to any live run): glm_wan_prep_data carved splits by POSITION out
-of one flat token stream, while tools/daily_corpus_extract.py --roll rebuilds a CUMULATIVE window
-each day. Every refresh therefore re-cut a growing pool at fixed offsets, so a row held out
-yesterday could become training data today -- silently, with every mechanical check green. That is
-the failure this project was founded on (memory pouw-verified-not-useful: ~900 rounds paid while
-held-out validation worsened). A fresh corpus was deliberately NOT published on 2026-07-25 because
-of this.
+MEASURED 2026-07-25. glm_wan_prep_data tokenized the whole corpus into ONE flat stream and sliced it
+at fixed row offsets with no regard for document boundaries, so a document sitting on a boundary
+supplied two splits at once -- with these fixtures, one document supplied train, val, probe AND
+heldout. test_no_document_supplies_two_splits FAILS on that build.
 
-test_documents_never_migrate_between_splits is the one that matters: it FAILS on the old
-position-based carve and passes on content-addressed assignment.
+A CLAIM THAT WAS CHECKED AND FOUND FALSE, recorded so nobody re-derives it: position-carving did
+NOT migrate held-out rows into training across daily refreshes. roll_domain walks `_dates_back`
+newest-first and dedups by first occurrence, so a refresh PREPENDS -- old content only moves to
+later offsets or falls off the end, never earlier into the train region. Two tests written to
+demonstrate that migration both PASSED on the unfixed code. A test that passes on the broken code
+is a refutation, not weak evidence.
+
+What content-addressed assignment buys is that the invariant holds BY CONSTRUCTION instead of by an
+accident of roll ordering nothing tested (test_split_membership_survives_a_rebuilt_roll), and that
+the goal metric's yardstick can be frozen (test_coord_splits_are_frozen_across_refreshes) so
+held-out CE stays comparable day to day -- without which "the model got smarter" is unfalsifiable.
 """
 import os
 import sys
@@ -154,3 +160,38 @@ def test_too_little_text_fails_loudly_rather_than_shrinking_a_split(tmp_path):
     with pytest.raises(SystemExit) as e:
         _prep(tmp_path, _docs("e", 3), "thin")
     assert "need" in str(e.value)
+
+
+def test_coord_splits_are_frozen_across_refreshes(tmp_path):
+    """THE GOAL METRIC NEEDS A FIXED YARDSTICK. Documents keep their split, but `mine` is in roll
+    order (newest first) and build_domain takes the FIRST n rows -- so without freezing, a daily
+    refresh replaces the held-out set with today's documents. Held-out CE would then compare two
+    different exams across days and "the model got smarter" becomes unfalsifiable, which is the
+    whole question this campaign exists to answer."""
+    day1 = _docs("a", 60)
+    miner1, coord = _prep(tmp_path, day1, "f1")
+    heldout_day1, probe_day1 = _rows(coord, "heldout"), _rows(coord, "probe")
+    train_day1 = _rows(miner1, "train")
+
+    # same coord dir, new corpus (newest first, as roll_domain builds it)
+    miner2 = tmp_path / "miner_f2"
+    miner2.mkdir()
+    P.build_domain(FakeTok(), "\n".join(_docs("b", 60) + day1), SEQ, str(miner2), str(coord),
+                   "daily", vocab_size=100000, splits=SMALL)
+
+    assert _rows(coord, "heldout") == heldout_day1, "the held-out yardstick must not move"
+    assert _rows(coord, "probe") == probe_day1, "the secret gate pool must not move"
+    assert _rows(miner2, "train") != train_day1, "train SHOULD pick up the new corpus"
+    assert not (heldout_day1 & _rows(miner2, "train"))
+
+
+def test_refresh_flag_re_cuts_deliberately(tmp_path):
+    """Starting a NEW campaign baseline is allowed -- it just has to be explicit."""
+    day1 = _docs("a", 60)
+    _, coord = _prep(tmp_path, day1, "r1")
+    before = _rows(coord, "heldout")
+    miner2 = tmp_path / "miner_r2"
+    miner2.mkdir()
+    P.build_domain(FakeTok(), "\n".join(_docs("z", 60) + day1), SEQ, str(miner2), str(coord),
+                   "daily", vocab_size=100000, splits=SMALL, freeze_coord=False)
+    assert _rows(coord, "heldout") != before, "--refresh-coord-splits must actually re-cut"

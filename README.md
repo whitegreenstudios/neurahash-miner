@@ -235,6 +235,35 @@ hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory ra
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
 
+## Alpha 3.3.1 (2026-07-25) — the pipeline actually generates, and miners can rejoin a resumed run
+
+**If you ran v3.3.0's pipeline, upgrade.** Its stages loaded the frozen trunk but **zero experts**,
+so a full-depth run emitted `!!!!!!!!` and every reward read 0.0 — with no error anywhere. Three
+causes, all fixed here and each now covered by a regression test:
+
+- The expert-piece selector read `p["name"]`; manifest records carry `p["piece"]` with inline
+  `experts` pairs. It matched nothing, so every stage ran trunk-only.
+- Hand-rolled weight placement could never work: GLM's experts are **fused**
+  (`Glm4MoeLiteNaiveMoe`), so there is no per-expert submodule to assign into. Stages now load
+  through `piece_loader.build_partial_model` — the same loader the CE lane trains on.
+- The rollout backend returned `text`/`token_ids` while the worker reads
+  `completion_text`/`completion_ids` **via `.get()` defaults** — a silent rename that discarded
+  every generation. Key names are now a tested contract.
+
+A stage also **refuses to serve** if any MoE layer it owns is non-resident or any owned parameter
+is still on meta, because an unfilled expert produces fluent-looking garbage silently. Per-token
+latency was poll-bound rather than compute-bound: the store backoff is now tunable
+(`NEURAHASH_PIPE_POLL_S` / `_POLL_MAX_S`), which measured **6.8 s/token → ~2.5 s/token**.
+
+**Rejoining a resumed run.** When a coordinator restarts and continues a previous campaign, its
+advertised base is no longer the frozen one. A miner now replays to reach that exact root and, if
+it cannot, rolls **every** slot back to the frozen base rather than train on a half-folded state.
+Without this a resumed coordinator rejects everything a miner produces.
+
+**Defaults that were quietly off are now on** — trustless quorum settlement, the truly-decoupled
+async cadence, daily-corpus auto-update, and keyless admission. Previously a plain clone got none
+of them unless you set environment variables. Opt out individually if you need the old behaviour.
+
 ## Alpha 3.3 (2026-07-24) — the fleet-hosted pipeline: one live model, held by miners together
 
 The missing half of G1 rollouts. The CE lane proved miners can each hold ~5 GB of GLM for

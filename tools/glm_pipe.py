@@ -76,8 +76,15 @@ class PipeBus:
     Fail-closed: recv verifies nothing beyond the store's own by-sha addressing (the store IS
     content-addressed, so a cid fetch returns the committed bytes or 404)."""
 
-    def __init__(self, lane, prefix=PIPE_PREFIX, poll_s=0.25, log=None):
-        self.lane, self.prefix, self.poll_s = lane, prefix, poll_s
+    # Per-hop latency is poll-bound, not compute-bound: every token pays (n_stages+1) advert polls.
+    # NEURAHASH_PIPE_POLL_S tunes the floor and MAX_BACKOFF the ceiling -- lower = faster tokens at
+    # the cost of more manifest GETs against the store.
+    MAX_BACKOFF_S = float(os.environ.get("NEURAHASH_PIPE_POLL_MAX_S", "0.75"))
+
+    def __init__(self, lane, prefix=PIPE_PREFIX, poll_s=None, log=None):
+        self.lane, self.prefix = lane, prefix
+        self.poll_s = float(os.environ.get("NEURAHASH_PIPE_POLL_S", "0.15")) \
+            if poll_s is None else poll_s
         self.log = log or (lambda m: None)
 
     @staticmethod
@@ -109,23 +116,27 @@ class PipeBus:
             if time.time() - t0 > timeout:
                 raise TimeoutError("pipe recv timeout on %s after %.0fs" % (name, timeout))
             time.sleep(delay)
-            delay = min(delay * 1.5, 2.0)
+            delay = min(delay * 1.5, self.MAX_BACKOFF_S)
 
 
 # ================================================================ stage model loading (torch)
 def _manifest_pieces_for_layers(shard_dir, lo, hi):
-    """Piece ids whose experts live in layers [lo, hi) -- pure metadata via piece_loader."""
+    """Piece ids whose experts live in layers [lo, hi) -- pure metadata via piece_loader.
+
+    SCHEMA (measured 2026-07-25 -- getting this wrong produced a silently EXPERT-LESS model that
+    generated pure garbage): each record is {"piece": "trunk"|"experts_<id>", "experts": "trunk"
+    | [[layer, expert], ...], ...}. The key is "piece", NOT "name", and the (layer, expert) pairs
+    are inline -- an unmatched filter here returns [] and the caller loads trunk weights ONLY."""
     import piece_loader as pl
     man = pl.load_manifest(shard_dir, require_files=False)
     need = []
     for p in man["pieces"]:
-        nm = p.get("name", "")
-        if not nm.startswith("experts_"):
+        nm = str(p.get("piece") or "")
+        pairs = p.get("experts")
+        if not nm.startswith("experts_") or not isinstance(pairs, list):
             continue
-        pid = int(nm.split("_", 1)[1])
-        ids = pl.assigned_expert_ids(man, [pid])
-        if any(lo <= int(L) < hi for (L, _e) in ids):
-            need.append(pid)
+        if any(lo <= int(L) < hi for (L, _e) in pairs):
+            need.append(int(nm.split("_", 1)[1]))
     return sorted(set(need))
 
 
@@ -136,54 +147,36 @@ def load_stage(shard_dir, config_dir, lo, hi, device="cpu", role="mid", dtype=No
 
     VRAM cap note: callers set the per-process cap BEFORE calling this (project rule)."""
     import torch
-    from accelerate import init_empty_weights
-    from accelerate.utils import set_module_tensor_to_device
-    from safetensors import safe_open
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig
+    import piece_loader as pl                                  # the lane's PROVEN loader
     log = log or (lambda m: None)
     cfg = AutoConfig.from_pretrained(config_dir, local_files_only=True)
-    dtype = dtype or torch.bfloat16
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(cfg)
-    model.eval()
 
     want_embed = (role == "first")
     want_head = (role == "head")
     keep = set(range(lo, hi)) if not want_head else set()
 
-    def want_key(k):
-        if k.startswith("model.embed_tokens."):
-            return want_embed
-        if k.startswith("model.norm.") or k.startswith("lm_head."):
-            return want_head
-        if k.startswith("model.layers."):
-            try:
-                return int(k.split(".")[2]) in keep
-            except (ValueError, IndexError):
-                return False
-        return False
-
-    loaded = 0
-    tpath = os.path.join(shard_dir, "trunk.safetensors")
-    if not os.path.exists(tpath):
-        tpath = os.path.join(shard_dir, "pieces", "trunk.safetensors")
-    with safe_open(tpath, framework="pt", device="cpu") as sf:
-        for k in sf.keys():
-            if want_key(k):
-                set_module_tensor_to_device(model, k, device, value=sf.get_tensor(k).to(dtype))
-                loaded += 1
-    if keep:
-        for pid in _manifest_pieces_for_layers(shard_dir, lo, hi):
-            ppath = os.path.join(shard_dir, "pieces", "experts_%d.safetensors" % pid)
-            with safe_open(ppath, framework="pt", device="cpu") as sf:
-                for k in sf.keys():
-                    if want_key(k):
-                        set_module_tensor_to_device(model, k, device,
-                                                    value=sf.get_tensor(k).to(dtype))
-                        loaded += 1
-    # rotary inv_freq is a computed (non-persisted) buffer -> re-init it for real on the device.
-    rot = model.model.rotary_emb
-    model.model.rotary_emb = type(rot)(config=cfg).to(device)
+    # WHY piece_loader and not a hand-rolled safetensors walk (measured 2026-07-25, twice):
+    # GLM's experts are FUSED (Glm4MoeLiteNaiveMoe) -- there is no
+    # `model.layers.N.mlp.experts.<e>.*` submodule to assign into, so
+    # set_module_tensor_to_device raises AttributeError('...has no attribute 0'). Worse, the
+    # attempt BEFORE that silently loaded trunk-only and served garbage. build_partial_model is
+    # the same code path the CE lane trains and the coordinator gates on -- the model-in-kind.
+    pieces = _manifest_pieces_for_layers(shard_dir, lo, hi) if keep else []
+    model, summ = pl.build_partial_model(shard_dir, pieces, device=device, config_dir=config_dir,
+                                         strip_mtp=True)
+    model.eval()
+    loaded = len(pieces)
+    resident = set(int(x) for x in (summ.get("resident_layers") or []))
+    # Only MoE layers need resident experts: the first `first_k_dense_replace` layers use a DENSE
+    # MLP that lives in the trunk, so they never appear in resident_layers (measured: layer 0).
+    n_dense = int(getattr(cfg, "first_k_dense_replace", 0) or 0)
+    missing = sorted(L for L in keep if L >= n_dense and L not in resident)
+    if missing:
+        raise RuntimeError(
+            "stage[%s] layers[%d:%d): piece_loader did NOT make layer(s) %s resident (got %s). "
+            "Refusing to serve: a non-resident MoE layer contributes nothing and the stage would "
+            "emit garbage silently." % (role, lo, hi, missing[:5], sorted(resident)[:8]))
     # CACHE REMAP (measured 2026-07-24: decode diverged 1.7 abs while prefill was bit-exact): a
     # mid-stage writes its K/V at ABSOLUTE layer indices, but DynamicCache.get_seq_length() reads
     # layer 0 -- which a mid-stage never fills -- so create_causal_mask sized the past as 0 on
@@ -201,7 +194,27 @@ def load_stage(shard_dir, config_dir, lo, hi, device="cpu", role="mid", dtype=No
     if not want_head:
         model.model.norm = torch.nn.Identity()
         model.lm_head = torch.nn.Identity()
-    log("stage[%s] layers[%d:%d) loaded %d tensors on %s" % (role, lo, hi, loaded, device))
+    # FAIL LOUD ON UNFILLED WEIGHTS. init_empty_weights leaves every un-materialized parameter on
+    # the META device; a meta MoE expert does NOT raise -- it silently contributes nothing, and the
+    # stage emits fluent-looking garbage. MEASURED 2026-07-25: a manifest-schema mismatch loaded
+    # trunk-only (321 tensors, ZERO experts) and a full 47-layer run generated '!!!!!!' for 128
+    # tokens with no error anywhere. Never ship a stage that cannot prove it is fully materialized.
+    meta = [n for n, p in model.named_parameters() if p.device.type == "meta"]
+    kept_meta = [n for n in meta
+                 if (n.startswith("model.layers.") and n.split(".")[2].isdigit()
+                     and int(n.split(".")[2]) in keep)
+                 or (want_embed and n.startswith("model.embed_tokens."))
+                 or (want_head and (n.startswith("model.norm.") or n.startswith("lm_head.")))]
+    if kept_meta:
+        raise RuntimeError(
+            "stage[%s] layers[%d:%d): %d parameter(s) THIS stage owns are still on meta (never "
+            "materialized) -- e.g. %s. Refusing to serve: an unfilled expert produces garbage "
+            "silently. Check the shard dir has the expert pieces for this range."
+            % (role, lo, hi, len(kept_meta), kept_meta[:3]))
+    log("stage[%s] layers[%d:%d) resident via %d expert piece(s) on %s "
+        "(experts=%s placeholders=%s; all owned params materialized)"
+        % (role, lo, hi, loaded, device, summ.get("n_resident_experts"),
+           summ.get("n_placeholder_experts")))
     return model, cfg
 
 
@@ -353,20 +366,25 @@ def make_pipeline_backend(lane, run, n_stages, shard_dir, config_dir, device="cp
                 ids = ids[-1024:]
             gen = torch.Generator(device="cpu").manual_seed(int(seed) & 0x7FFFFFFF)
             hidden = drv.prefill(stream, ids)
-            out_ids, logprob_sum = [], 0.0
+            out_ids, logps = [], []
             eos = tok.eos_token_id
             try:
                 for t in range(int(max_new_tokens)):
                     logits = drv.logits_for(hidden)[0, -1].float()
                     tid = _sample_token(logits, temperature, top_p, gen)
                     out_ids.append(int(tid))
-                    logprob_sum += float(torch.log_softmax(logits, dim=-1)[int(tid)].item())
+                    logps.append(float(torch.log_softmax(logits, dim=-1)[int(tid)].item()))
                     if eos is not None and int(tid) == int(eos):
                         break
                     hidden = drv.step(stream, t, int(tid))
             finally:
                 drv.finish(stream)
-            return {"text": tok.decode(out_ids, skip_special_tokens=True),
-                    "token_ids": out_ids, "logprob_sum": logprob_sum}
+            # KEY NAMES ARE THE CONTRACT (glm_rollout_worker.generate_rollouts reads these with
+            # .get() defaults -- a mismatch does NOT raise, it silently packs EMPTY completions and
+            # every reward reads 0.0. Measured 2026-07-25: a full 2.5h full-47 window produced 8
+            # real generations that were discarded exactly this way. Locked by a contract test.)
+            return {"completion_text": tok.decode(out_ids, skip_special_tokens=True),
+                    "completion_ids": out_ids, "sample_logprobs": logps,
+                    "n_tokens": len(out_ids)}
 
     return _PipeBackend()

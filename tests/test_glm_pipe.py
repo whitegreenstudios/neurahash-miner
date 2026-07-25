@@ -100,6 +100,69 @@ def test_run_stage_routes_and_tracks_positions(monkeypatch):
     assert calls[1] == {"pos0": 3, "n": 1, "ids": [[9]]}             # decode step continues at 3
 
 
+def test_pipeline_backend_return_shape_is_the_worker_contract():
+    """REGRESSION (measured 2026-07-25): the pipeline backend returned text/token_ids/logprob_sum
+    while generate_rollouts reads completion_text/completion_ids/sample_logprobs via .get() with
+    defaults -- so a full 2.5h full-47 window packed EMPTY completions and every reward read 0.0
+    with NO error anywhere. Two locks: (a) the exact shape must survive generate_rollouts, and
+    (b) the source must keep emitting the contract keys."""
+    import inspect
+    import glm_rollout_worker as W
+
+    shape = {"completion_text": "the answer is 42", "completion_ids": [7, 8, 9],
+             "sample_logprobs": [-0.1, -0.2, -0.3], "n_tokens": 3}
+
+    class _B:
+        def generate(self, prompt, **kw):
+            return dict(shape)
+
+    task = {"task_id": "t1", "domain": "math", "prompt": "q?", "gold": "42"}
+    outs = W.generate_rollouts(_B(), task, 2)
+    assert len(outs) == 2
+    for o in outs:
+        assert o["completion_text"] == "the answer is 42", "completion text was dropped"
+        assert o["completion_ids"] == [7, 8, 9], "completion ids were dropped"
+        assert o["n_tokens"] == 3 and o["sum_logprob"] < 0.0
+        assert o["reward"] == 1.0, "a correct answer must score 1.0 end-to-end"
+
+    src = inspect.getsource(GP.make_pipeline_backend)
+    for key in ("completion_text", "completion_ids", "sample_logprobs"):
+        assert '"%s"' % key in src, "pipeline backend stopped emitting %r" % key
+    for stale in ('"token_ids"', '"logprob_sum"'):
+        assert stale not in src, "pipeline backend re-introduced non-contract key %s" % stale
+
+
+def test_expert_piece_selector_reads_the_real_manifest_schema(tmp_path, monkeypatch):
+    """REGRESSION (measured 2026-07-25): the selector filtered on p["name"], but records carry
+    p["piece"] + inline p["experts"] pairs. It matched NOTHING, so every stage loaded trunk-only
+    (321 tensors, ZERO experts) and the full 47-layer run generated '!!!!!!' for 128 tokens with
+    no error. A selector that returns [] for a populated range is the bug -- assert it cannot."""
+    man = {"version": 1, "pieces": [
+        {"piece": "trunk", "experts": "trunk", "n_keys": 679},
+        {"piece": "experts_0", "experts": [[1, 0], [1, 1]], "n_keys": 15},
+        {"piece": "experts_1", "experts": [[2, 0], [3, 1]], "n_keys": 15},
+        {"piece": "experts_2", "experts": [[30, 0], [31, 1]], "n_keys": 15},
+    ]}
+    import piece_loader as pl
+    monkeypatch.setattr(pl, "load_manifest", lambda *a, **k: man)
+
+    assert GP._manifest_pieces_for_layers("x", 0, 4) == [0, 1], "experts in range were missed"
+    assert GP._manifest_pieces_for_layers("x", 23, 47) == [2]
+    assert GP._manifest_pieces_for_layers("x", 0, 47) == [0, 1, 2], "full range must cover all"
+    assert GP._manifest_pieces_for_layers("x", 10, 20) == [], "out-of-range must select nothing"
+    # the trunk record must never be read as an expert piece (int('trunk') would raise)
+    assert 0 not in GP._manifest_pieces_for_layers("x", 10, 20)
+
+
+def test_load_stage_refuses_unmaterialized_weights():
+    """The guard that makes the above bug LOUD: a stage owning meta (never-filled) params must
+    refuse to serve rather than silently emit garbage."""
+    import inspect
+    src = inspect.getsource(GP.load_stage)
+    assert 'device.type == "meta"' in src, "meta-parameter check disappeared from load_stage"
+    assert "RuntimeError" in src, "load_stage no longer RAISES on unmaterialized weights"
+
+
 def test_driver_prefill_step_finish_against_fake_stage():
     """PipeDriver against a threaded fake single-stage pump: names line up, last-position slicing
     works, finish publishes the done-advert."""

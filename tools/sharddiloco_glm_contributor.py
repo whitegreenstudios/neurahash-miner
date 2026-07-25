@@ -847,8 +847,13 @@ def _data_resync_enabled(env=None):
     """THE guard for the alpha-3.0 periodic re-sync (acceptance #4). Returns True iff
     NEURAHASH_GLM_DATA_RESYNC is an explicit opt-in (1/true/yes/on); unset or anything else -> False,
     and _run_async then never reaches the re-check (flag-off == alpha-2.0 byte-identical)."""
+    # DEFAULT ON since 2026-07-25 (owner directive). A miner that never picks up the daily corpus
+    # trains forever on stale data -- the opposite of what an open campaign needs. The re-sync is
+    # fail-closed (an unverifiable manifest keeps the old corpus) and was proven live on both
+    # miners mid-run with no restart. Opt out with NEURAHASH_GLM_DATA_RESYNC=0.
     e = os.environ if env is None else env
-    return (e.get("NEURAHASH_GLM_DATA_RESYNC", "") or "").strip().lower() in _RESYNC_OPT_IN
+    return (e.get("NEURAHASH_GLM_DATA_RESYNC", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
 
 
 def plan_data_resync(prev_record, new_record):
@@ -1099,6 +1104,68 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
     return True, "ok", []
 
 
+def resume_to_root(host, lane, target_root, log, max_records=200000):
+    """CONTRIBUTOR-SIDE RESUME SYMMETRY: replay accepted records until our base reproduces the
+    coordinator's advertised genesis root, so a RESUMED coordinator can accept our work.
+
+    WHY (measured live 2026-07-25): the coordinator gained --resume, which replays a previous run's
+    accepted records so a restart continues the campaign (held-out CE 10.40 from frozen base vs
+    8.64 resumed). But contributors rebuild from the FROZEN base and cannot reach a root produced
+    by records the new run has not published -- so EVERY contribution was dropped
+    wrong-lineage-root (1527 of them), one miner died 'unreconstructable', and the network accepted
+    ZERO work. Resuming one side only is strictly worse than not resuming. This is the other side.
+
+    ROOT-TARGETED, not event-bounded: the resumed coordinator republishes genesis at event 0, so
+    there is no event window to catch up on -- we fold the SAME historical records it folded, in
+    order, through the SAME verified fold (_fold_accepted_checked, which rolls back anything that
+    does not reproduce its own advertised root), and STOP the moment our root equals the target.
+
+    FAIL-CLOSED: if the target is unreachable, EVERY slot is restored to the pre-replay snapshot,
+    so we are byte-identical to the frozen base and the caller may proceed (its contributions will
+    be lineage-dropped, which is the honest signal) rather than training on a half-folded base.
+    Returns (n_applied, reached)."""
+    if not target_root or model_root(host) == str(target_root):
+        return 0, True
+    target = str(target_root)
+    try:
+        man = lane.manifest()
+    except Exception as e:                                       # noqa: BLE001
+        log("[glm-contrib] resume: manifest unavailable (%r) -- staying on the frozen base" % (e,))
+        return 0, False
+    prefix = ACCEPTED_NAME_FMT % 0
+    prefix = prefix[:prefix.rfind("0")]
+    events = sorted(int(n[len(prefix):]) for n in man
+                    if str(n).startswith(prefix) and str(n)[len(prefix):].isdigit())
+    if not events:
+        log("[glm-contrib] resume: no accepted records to replay -- staying on the frozen base")
+        return 0, False
+    snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}
+            for j in range(len(host.slots))]                     # DEEP copy: read_slot returns VIEWS
+    applied = 0
+    for e in events[:int(max_records)]:
+        entry = man.get(accepted_name(e))
+        if not entry:
+            continue
+        try:
+            rec = lane.get_json(entry["sha256"])
+        except Exception:                                        # noqa: BLE001
+            break
+        ok, _reason, _rej = _fold_accepted_checked(host, lane, rec, None, -1, log=None)
+        if not ok:
+            continue                                             # off-lineage record: already rolled back
+        applied += 1
+        if model_root(host) == target:
+            log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s)"
+                % (target[:12], applied))
+            return applied, True
+    for j, d in enumerate(snap):                                 # UNREACHABLE -> full rollback
+        host.write_slot(j, d)
+    log("[glm-contrib] resume: could NOT reach the advertised root %s.. (%d record(s) tried); "
+        "rolled back to the frozen base -- our contributions will be lineage-dropped until the "
+        "coordinator's base is reachable" % (target[:12], applied))
+    return 0, False
+
+
 def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log):
     """The non-blocking accepted-record catch-up of _run_async, FACTORED OUT so the dead-run lineage guard
     is unit-testable against a dirty namespace. Fold every visible accepted record in (last_applied,
@@ -1259,6 +1326,20 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # when off, _resync_on is False and NOTHING below (no lane read, no fetch, no reload) ever runs, so
     # this lane stays byte-identical to alpha 2.0. The seed record is the one the startup autosync just
     # verified against, so the first round's compare is a no-op (nothing changed yet).
+    # -- RESUME SYMMETRY (2026-07-25): if the coordinator booted with --resume, its advertised
+    # genesis root is NOT the frozen base and nothing we train can be accepted until we reach it.
+    # Root-targeted replay, fail-closed (rolls back to the frozen base when unreachable). A normal
+    # from-base coordinator advertises our own root, so this is a no-op single comparison there.
+    try:
+        _ptr0 = lane.read_pointer()
+        _root0 = dm.sd_pointer_decode(_ptr0).get("model_root") if _ptr0 else None
+    except Exception:                                            # noqa: BLE001 -- pointer races are normal
+        _root0 = None
+    if _root0 and str(_root0) != model_root(host):
+        log("[glm-contrib %s] base MISMATCH vs coordinator genesis (ours=%s.. theirs=%s..) -- "
+            "attempting resume replay" % (miner, model_root(host)[:12], str(_root0)[:12]))
+        resume_to_root(host, lane, _root0, log)
+
     _resync_on = _data_resync_enabled(os.environ)
     _prev_data_record = _read_data_record(lane) if _resync_on else None
     if _resync_on:

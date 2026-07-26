@@ -26,6 +26,8 @@ import ipaddress
 import json
 import os
 import sys
+import threading
+import time
 import types
 import urllib.parse
 
@@ -2028,12 +2030,18 @@ class TestF5bAdvanceLandsOnTheCoordinatorsBase:
 
     def test_the_advance_branch_is_actually_wired_to_it(self):
         """Wiring: the mechanism already existed (resume_to_root own_coord=) -- the defect was that the
-        PLATEAU/advance branch never called it."""
+        PLATEAU/advance branch never called it.
+
+        The register->catch-up pair moved into N.advance_claim with never-block V0 (the walk has to be
+        able to try more than one candidate), so the ORDER is asserted there; _run_async is checked for
+        calling it and for still clearing last_pub_base_event on the coordinate it lands on."""
         import inspect
-        src = inspect.getsource(N._run_async)
-        i_reg = src.index("host.register(*nxt)")
-        i_res = src.index("resume_to_root(host, lane, pointer_root, log, own_coord=nxt)")
+        walk = inspect.getsource(N.advance_claim)
+        i_reg = walk.index("host.register(*cand)")
+        i_res = walk.index("resume_to_root(host, lane, pointer_root, log, own_coord=cand")
         assert i_res > i_reg, "the catch-up must run AFTER the new coordinate is registered"
+        src = inspect.getsource(N._run_async)
+        assert "advance_claim(host, lane, claim_coords, (L, E), claim_identity" in src
         assert "last_pub_base_event = None" in src, "nothing of ours is in flight on the new coordinate"
     def test_the_replay_does_not_double_apply_what_we_already_folded(self):
         """The advance replays the WHOLE accepted history, including records we folded long ago. Those must
@@ -2393,13 +2401,17 @@ class TestFixBSweepOrderIsPerIdentity:
         assert got == N.claim_walk_order(self._C, "0xabc")[0]
 
     def test_the_contributor_loop_advances_with_its_wallet_identity(self):
-        """Wiring: a per-identity order that the sweep does not pass its identity to is decoration."""
+        """Wiring: a per-identity order that the sweep does not pass its identity to is decoration.
+
+        Never-block V0 replaced the single next_claim_coord() step with advance_claim(), which walks
+        the SAME claim_walk_order permutation (so it can skip a coordinate on cooldown instead of
+        stopping at it). The property guarded is unchanged: the sweep passes its own identity, and
+        that identity is the durable wallet address."""
         import inspect
         src = inspect.getsource(N._run_async)
-        # No closing paren in the match: --claim-by affinity appends `ranked=claim_ranked` to this call
-        # (TestClaimByFlag), so the argument list wraps. The property guarded is unchanged -- the sweep
-        # must pass its own identity -- and this is still the verbatim call prefix.
-        assert "next_claim_coord(claim_coords, (L, E), identity=claim_identity" in src
+        assert "advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked" in src
+        walk = inspect.getsource(N.advance_claim)
+        assert "claim_walk_order(claim_coords, identity, ranked=ranked)" in walk
         assert "claim_identity = wallet.address if wallet is not None else" in src, \
             "the identity must be the DURABLE wallet address, so a restart walks the same order"
 
@@ -4006,3 +4018,576 @@ class TestF8AdvanceOntoAColdCoordinate:
         i.e. by any leak that could really happen (memory v332-oom-death-and-resume-verdict)."""
         G = advance_model[0]
         assert G._lora_experts_cls() is G._lora_experts_cls()
+
+
+# ==================================================================================================
+# NEVER-BLOCK V0 (docs/NEVER_BLOCK_HANDOVER.md section 0-PRE + 7.1). THE MEASURED INCIDENT:
+# 2026-07-25 the 5090 plateaued on (L1,E50), released, claimed (L1,E0) -- and BLOCKED 23 MINUTES.
+# Process alive, "Responding: True", GPU 9%, nothing in any log. scratchpad/wan_miner5090.log:113 is
+# the last line that process ever wrote:
+#   [glm-contrib glm-1325009E] PLATEAU on (L1,E50) after 3 consecutive rejects -> RELEASE,
+#   CLAIM (L1,E0) [local slot 0]. Sweeping: 60 coordinate(s) claimable here.
+# There is NO `post-advance catch-up` line after it, while the three earlier advances in that same
+# run all printed one -- so it entered resume_to_root and never came out of a SINGLE call. That is
+# the refutation of the original "linear full-history replay" theory (0-PRE): the completed
+# catch-ups had tried only 7-17 records each.
+# ==================================================================================================
+class _StallingLane(_MiniLane):
+    """`_MiniLane` whose lane fetches BLOCK FOREVER while the miner is inside post-advance catch-up
+    for one nominated coordinate -- the incident, reproduced in-process and without CUDA.
+
+    The stall is armed by the caller flipping `in_resume`, so ONLY the catch-up path stalls: the
+    ordinary per-iteration `catch_up_accepted` scan keeps working, exactly as it did live (the miner
+    had been training and publishing happily for 40 rounds before this)."""
+
+    def __init__(self, host, stall_coords):
+        super().__init__(host)
+        self.stall_coords = {tuple(c) for c in stall_coords}
+        self.in_resume, self.resume_coord = False, None
+        self.stalled_calls = 0
+        self.never = threading.Event()          # NEVER set while the miner is running
+
+    def _pointer(self, root):
+        """A SHARD-CLAIM coordinator: it holds a coordinate we do NOT (`9_9`), so its global
+        model_root is unreachable for us by construction. That is the live 60-coordinate
+        configuration (scratchpad/wan_miner5090.log: "Sweeping: 60 coordinate(s) claimable here"),
+        and it is what makes resume_to_root's `model_root(host) == target_root` early return
+        (sharddiloco_glm_contributor.py:2525) unable to fire -- the runs that DID early-return had
+        only 5 claimable coordinates and therefore the coordinator's exact slot set."""
+        rounds = {"%d_%d" % (L, E): 0 for (L, E) in self._host.slots}
+        rounds["9_9"] = 1
+        self._names[N.GLM_POINTER_NAME] = self._put(self._dm.sd_pointer_encode(
+            self.event, rounds, "coordinator-global-root-%d" % self.event, False))
+
+    def release(self):
+        """Let the abandoned worker threads die at teardown (they are daemons, but tidy is cheap)."""
+        self.never.set()
+
+    def _maybe_stall(self):
+        if self.in_resume and tuple(self.resume_coord or ()) in self.stall_coords:
+            self.stalled_calls += 1
+            self.never.wait()                   # this call NEVER returns
+
+    def manifest(self):
+        self._maybe_stall()
+        return super().manifest()
+
+    def get_json(self, cid):
+        self._maybe_stall()
+        return super().get_json(cid)
+
+    def get_delta(self, cid):
+        self._maybe_stall()
+        return super().get_delta(cid)
+
+
+class TestV0NeverBlockOnCatchUp:
+    """THE GOAL METRIC, stated as a bound: a catch-up network call that never returns must not stop
+    the miner from starting a training round on ANOTHER coordinate.
+
+    RED on the pre-fix code: `resume_to_root` calls `lane.manifest()` straight through, so
+    `_run_async` never returns and this test has to be KILLED (measured: hung until a 180 s
+    subprocess timeout, 0 rounds published after the plateau).
+    GREEN after: the per-call deadline fires, the wall budget rolls back fail-closed, the coordinate
+    goes on cooldown, the walk advances, and round 2 is published on a DIFFERENT coordinate."""
+
+    MINER = "neverblock0"
+    COORDS = [(1, 0), (1, 1), (1, 2), (1, 3)]
+
+    @pytest.fixture(autouse=True)
+    def _quiet(self, monkeypatch):
+        monkeypatch.setattr(N, "_maybe_self_update", lambda log: None)
+        monkeypatch.delenv("NEURAHASH_GLM_DATA_RESYNC", raising=False)
+        # Small budgets so the TEST is fast; the bound under test is "some finite budget", not 180 s.
+        monkeypatch.setenv("NEURAHASH_SD_CATCHUP_BUDGET_S", "2.0")
+        monkeypatch.setenv("NEURAHASH_SD_CATCHUP_CALL_TIMEOUT_S", "1.0")
+        monkeypatch.setenv("NEURAHASH_SD_CATCHUP_STALL_S", "2.0")
+        monkeypatch.setenv("NEURAHASH_SD_COORD_COOLDOWN_S", "600")
+        monkeypatch.setenv("NEURAHASH_SD_COORD_COOLDOWN_EVENTS", "10")
+
+    def _drive(self, advance_model, monkeypatch):
+        G, model, cfg = advance_model
+        host = G.GlmExpertLaneHost(model, cfg, list(self.COORDS), claimable=list(self.COORDS))
+        args = types.SimpleNamespace(
+            mode="tiny", max_rounds=2, poll=0.0, round_wait=1e9, advance_after=1, garbage=False,
+            inner=2, lora_r=4, lr=1e-3, batch=4, outer=0.7, wire="lora", data_dir=".")
+        blocked = N.next_claim_coord(list(self.COORDS), (1, 0), identity=self.MINER)
+        assert blocked is not None and tuple(blocked) != (1, 0)
+        lane = _StallingLane(host, [tuple(blocked)])
+        # Arm the stall for exactly the window the miner is inside catch-up. The REAL resume_to_root
+        # still runs -- this only tells the fake lane when the call is coming from it.
+        real_resume = N.resume_to_root
+
+        def _traced(h, ln, *a, **kw):
+            lane.in_resume, lane.resume_coord = True, kw.get("own_coord")
+            try:
+                return real_resume(h, ln, *a, **kw)
+            finally:
+                lane.in_resume = False
+        monkeypatch.setattr(N, "resume_to_root", _traced)
+        logs = []
+        t0 = time.monotonic()
+        try:
+            rc = N._run_async(args, lane, host, model, cfg, G, b"k" * 16, 0, 1, 0, self.MINER,
+                              N.tiny_ids("train", slot=0)[:32], N.tiny_ids("val", slot=0)[:8],
+                              N.TINY["seq"], logs.append)
+        finally:
+            lane.release()
+        return rc, lane, logs, tuple(blocked), time.monotonic() - t0
+
+    def test_a_catchup_call_that_never_returns_does_not_stop_the_next_training_round(
+            self, advance_model, monkeypatch):
+        rc, lane, logs, blocked, elapsed = self._drive(advance_model, monkeypatch)
+        assert lane.stalled_calls >= 1, "the scenario never stalled a call -- it would prove nothing"
+        assert rc == 0, "\n".join(logs[-10:])
+        assert len(lane.published) == 2, [p.get("glm_expert") for p in lane.published]
+        second = (lane.published[1]["layer"], lane.published[1]["glm_expert"])
+        assert second != blocked, "the miner trained the coordinate whose catch-up hung"
+        assert second != (1, 0), "the miner never actually advanced off its plateaued coordinate"
+        assert elapsed < 120.0, "the whole run must be bounded, not merely finite (%.1fs)" % elapsed
+
+    def test_the_blocked_coordinate_is_named_and_put_on_cooldown(self, advance_model, monkeypatch):
+        """A miner that silently skips a coordinate is the same outage with nicer logs. The abort
+        reason and the cooldown have to be visible."""
+        _rc, _lane, logs, blocked, _el = self._drive(advance_model, monkeypatch)
+        hit = [ln for ln in logs if "COOLDOWN" in ln and ("L%d,E%d" % blocked) in ln]
+        assert hit, "\n".join(logs[-10:])
+        assert any(("catch-up" in ln and ("budget" in ln or "timeout" in ln)) for ln in logs), \
+            "the abort reason must say WHY, not just that it happened"
+
+
+class _HangLane:
+    """Every named call blocks until `release()`. The 23-minute incident, in one object."""
+
+    def __init__(self, hang=("manifest",), inner=None):
+        self.hang = set(hang)
+        self.never = threading.Event()
+        self.calls = []
+        self._inner = inner or {}
+
+    def release(self):
+        self.never.set()
+
+    def __getattr__(self, name):
+        def _call(*a, **kw):
+            self.calls.append(name)
+            if name in self.hang:
+                self.never.wait()
+            v = self._inner.get(name)
+            return v(*a, **kw) if callable(v) else v
+        return _call
+
+
+class _FakeClock:
+    """Injected monotonic clock: the budget/stall rules are TIME rules, and a test that sleeps to
+    exercise them is a slow flaky test that proves the same thing."""
+
+    def __init__(self, t=0.0):
+        self.t = float(t)
+
+    def __call__(self):
+        return self.t
+
+
+class TestV0CatchUpBounds:
+    """resume_to_root's three bounds, each in isolation. All of them exit through the SAME fail-closed
+    rollback the function already had -- the point of V0 is that nothing about lineage safety changes,
+    only that the wait is finite."""
+
+    @staticmethod
+    def _host():
+        return _CoordFakeHost([(1, 0)])
+
+    def test_a_manifest_that_never_returns_is_abandoned_not_awaited(self):
+        lane = _HangLane(hang=("manifest",))
+        out, said = {}, []
+        try:
+            t0 = time.monotonic()
+            applied, reached = N.resume_to_root(self._host(), lane, "target", said.append,
+                                                own_coord=(1, 0), budget_s=5.0,
+                                                call_timeout_s=0.3, outcome=out)
+            elapsed = time.monotonic() - t0
+        finally:
+            lane.release()
+        assert (applied, reached) == (0, False)
+        assert out["reason"] == "call-timeout" and out["aborted"] is True
+        assert elapsed < 3.0, "the call was awaited, not bounded (%.1fs)" % elapsed
+        assert any("BLOCKED reading the manifest" in s for s in said), said
+
+    def test_a_record_fetch_that_never_returns_rolls_back_fail_closed(self):
+        host = self._host()
+        real = _CoordFakeLane({1: {"1_0": "mine1"}})
+        lane = _HangLane(hang=("get_json",), inner={"manifest": real.manifest})
+        out = []
+        try:
+            applied, reached = N.resume_to_root(host, lane, "target", lambda *_a: None,
+                                                own_coord=(1, 0), budget_s=5.0, call_timeout_s=0.3,
+                                                outcome=(o := {}))
+            out.append(o)
+        finally:
+            lane.release()
+        assert (applied, reached) == (0, False)
+        assert out[0]["reason"] == "call-timeout"
+        assert host.writes == len(host.slots), "fail-closed: every slot restored, exactly as before"
+
+    def test_the_wall_budget_aborts_a_replay_that_is_moving_but_too_slow(self, monkeypatch):
+        """Option A of design 1.2: some replays make progress forever. B_wall is the backstop."""
+        clk = _FakeClock()
+        state = {"global": "base"}
+        TestResumeToOwnCoordinate._patch(monkeypatch, state)
+        real_fold = N._fold_accepted_checked
+
+        def slow_fold(*a, **kw):
+            clk.t += 10.0                                   # 10 s of wall clock per record
+            return real_fold(*a, **kw)
+        monkeypatch.setattr(N, "_fold_accepted_checked", slow_fold)
+        host = _CoordFakeHost([(1, 0)])
+        lane = _CoordFakeLane({e: {"2_9": "theirs%d" % e} for e in range(1, 9)})
+        out = {}
+        applied, reached = N.resume_to_root(host, lane, "unreachable", lambda *_a: None,
+                                            own_coord=(1, 0), budget_s=25.0, stall_s=1e9,
+                                            now=clk, outcome=out)
+        assert (applied, reached) == (0, False)
+        assert out["reason"] == "budget" and out["aborted"] is True
+        assert out["records"] == 3, "aborted at the first check past 25 s, not after all 8 records"
+        assert host.writes == len(host.slots), "fail-closed rollback, unchanged"
+
+    def test_the_no_fold_stall_aborts_even_inside_the_wall_budget(self, monkeypatch):
+        """Option B: a replay whose records all fail to fold is not progress, however long we wait."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+
+        def dead_fold(*_a, **_kw):
+            clk.t += 10.0
+            return False, "lineage", []                     # rolled back inside; nothing folded
+        monkeypatch.setattr(N, "_fold_accepted_checked", dead_fold)
+        host = _CoordFakeHost([(1, 0)])
+        lane = _CoordFakeLane({e: {"1_0": "mine%d" % e} for e in range(1, 9)})
+        out = {}
+        applied, reached = N.resume_to_root(host, lane, "unreachable", lambda *_a: None,
+                                            own_coord=(1, 0), budget_s=1e9, stall_s=25.0,
+                                            now=clk, outcome=out)
+        assert (applied, reached) == (0, False)
+        assert out["reason"] == "stall" and out["records"] == 0
+
+    def test_a_healthy_replay_is_not_touched_by_any_of_the_bounds(self, monkeypatch):
+        """The bounds must be invisible on the happy path, or they trade one outage for another."""
+        state = {"global": "base"}
+        TestResumeToOwnCoordinate._patch(monkeypatch, state)
+        host = _CoordFakeHost([(1, 0)])
+        lane = _CoordFakeLane({1: {"1_0": "mine1"}, 2: {"2_3": "theirs"}, 3: {"1_0": "mine2"}})
+        out = {}
+        applied, reached = N.resume_to_root(host, lane, "unreachable-global", lambda *_a: None,
+                                            own_coord=(1, 0), outcome=out)
+        assert (applied, reached) == (3, True)
+        assert out["reason"] == "ok" and out["aborted"] is False and host.writes == 0
+
+    def test_the_deadline_also_covers_the_delta_fetch_inside_the_fold(self):
+        """apply_accepted re-fetches every accepted delta by CID (`lane.get_delta`), so bounding only
+        get_json/manifest would leave the longest fetch on the path unbounded. _DeadlineLane wraps the
+        OBJECT for exactly that reason."""
+        lane = _HangLane(hang=("get_delta",))
+        bounded = N._DeadlineLane(lane, 0.3)
+        try:
+            with pytest.raises(N.CatchupTimeout):
+                bounded.get_delta("cid")
+        finally:
+            lane.release()
+        assert bounded.abandoned == 1
+
+    def test_the_deadline_never_outlives_the_remaining_wall_budget(self):
+        clk = _FakeClock()
+        lane = _HangLane(hang=("manifest",))
+        bounded = N._DeadlineLane(lane, 60.0, deadline=clk() + 5.0, now=clk)
+        clk.t += 6.0                                        # budget already spent
+        try:
+            with pytest.raises(N.CatchupTimeout):
+                bounded.manifest()
+        finally:
+            lane.release()
+        assert lane.calls == [], "no call should even be started once the budget is gone"
+
+    def test_the_live_lane_is_never_mutated_by_tightening_its_socket_timeout(self):
+        """The main loop's own manifest scan shares the lane object; tightening it in place would
+        change a call this function does not own."""
+        lane = types.SimpleNamespace(timeout=30.0, retries=6, ping=lambda: "pong")
+        bounded = N._DeadlineLane(lane, 5.0)
+        assert bounded.ping() == "pong"
+        assert (lane.timeout, lane.retries) == (30.0, 6), "the shared lane object was mutated"
+        assert bounded._lane is not lane and bounded._lane.timeout == 5.0
+        assert bounded._lane.retries == 2, "an abandoned call must die on its own, not retry 6 times"
+
+    def test_the_knobs_are_env_tunable_and_fail_soft(self, monkeypatch):
+        monkeypatch.setenv("NEURAHASH_SD_CATCHUP_BUDGET_S", "42.5")
+        monkeypatch.setenv("NEURAHASH_SD_CATCHUP_CALL_TIMEOUT_S", "not-a-number")
+        monkeypatch.delenv("NEURAHASH_SD_CATCHUP_STALL_S", raising=False)
+        assert N._catchup_budget_s() == 42.5
+        assert N._catchup_call_timeout_s() == N.CATCHUP_CALL_TIMEOUT_S, "garbage must not kill a miner"
+        assert N._catchup_stall_s() == N.CATCHUP_STALL_S
+
+
+class TestCoordCooldown:
+    """15 minutes OR 10 events, whichever is LATER (design 1.4). Both halves have to elapse: a quiet
+    lane must not expire a cooldown on wall clock alone, and a fast one must not expire it on events
+    alone."""
+
+    def _cd(self):
+        clk = _FakeClock()
+        return N.CoordCooldown(seconds=900.0, events=10, now=clk), clk
+
+    def test_wall_clock_alone_does_not_release_it(self):
+        cd, clk = self._cd()
+        cd.park((1, 5), event=100, reason="catch-up budget")
+        clk.t += 901.0
+        assert cd.blocked((1, 5), 100) is True, "10 events have not passed"
+        assert cd.blocked((1, 5), 110) is False
+
+    def test_events_alone_do_not_release_it(self):
+        cd, clk = self._cd()
+        cd.park((1, 5), event=100, reason="catch-up stall")
+        assert cd.blocked((1, 5), 999) is True, "15 minutes have not passed"
+        clk.t += 900.0
+        assert cd.blocked((1, 5), 999) is False
+
+    def test_an_unparked_coordinate_is_never_blocked_and_the_reason_survives(self):
+        cd, _clk = self._cd()
+        assert cd.blocked((1, 6), 0) is False and cd.reason((1, 6)) is None
+        cd.park((1, 6), event=3, reason="catch-up call-timeout")
+        assert cd.reason((1, 6)) == "catch-up call-timeout"
+        s, e = cd.left((1, 6), 3)
+        assert (round(s), e) == (900, 10)
+
+    def test_describe_names_every_still_parked_coordinate_for_the_heartbeat(self):
+        cd, _clk = self._cd()
+        cd.park((1, 1), event=0, reason="catch-up budget")
+        lines = cd.describe([(1, 0), (1, 1)], 0)
+        assert len(lines) == 1 and "(L1,E1)" in lines[0] and "catch-up budget" in lines[0]
+        assert lines[0].isascii(), "cp1252 console: log lines stay ASCII"
+
+
+class TestAdvanceClaimWalksPastBlockedCoordinates:
+    """1.4's fall-through guarantee, as a unit: the walk parks what blocks it and keeps going, and
+    reports None only when a WHOLE pass found nothing -- which is the 1.5 repair state, not a stall."""
+
+    COORDS = [(1, 0), (1, 1), (1, 2), (1, 3)]
+
+    class _Host:
+        def __init__(self, coords, refuse=()):
+            self.slots = [tuple(c) for c in coords]
+            self.refuse = {tuple(c) for c in refuse}
+            self.registered = []
+
+        def index_of(self, L, E):
+            t = (int(L), int(E))
+            return self.slots.index(t) if t in self.slots else None
+
+        def register(self, L, E):
+            if (int(L), int(E)) in self.refuse:
+                raise RuntimeError("max_active_slots=1 reached; cannot admit (L%d,E%d) yet" % (L, E))
+            self.registered.append((int(L), int(E)))
+            return self.index_of(L, E)
+
+    def _walk(self, monkeypatch, outcomes, refuse=(), cooldown=None, logs=None):
+        """outcomes: coord -> the `reason` resume_to_root should report for it."""
+        host = self._Host(self.COORDS, refuse=refuse)
+
+        def fake_resume(_h, _l, _root, _log, own_coord=None, outcome=None, **_kw):
+            reason = outcomes.get(tuple(own_coord), "unreachable")
+            if outcome is not None:
+                outcome.update(reason=reason, elapsed_s=1.0, records=0,
+                               aborted=reason in N._CATCHUP_ABORTED)
+            return 0, reason == "ok"
+        monkeypatch.setattr(N, "resume_to_root", fake_resume)
+        cd = cooldown or N.CoordCooldown(seconds=900.0, events=10, now=_FakeClock())
+        got = N.advance_claim(host, object(), list(self.COORDS), (1, 0), "wallet0", None, "root", 7,
+                              cd, (logs if logs is not None else []).append, "m0")
+        return got, host, cd
+
+    def test_a_blocked_candidate_is_parked_and_the_walk_continues(self, monkeypatch):
+        order = [c for c in N.claim_walk_order(self.COORDS, "wallet0") if c != (1, 0)]
+        logs = []
+        got, host, cd = self._walk(monkeypatch, {order[0]: "budget"}, logs=logs)
+        assert got is not None and got[0] == order[1], "the walk stopped at the blocked coordinate"
+        assert cd.blocked(order[0], 7) is True and "catch-up budget" in cd.reason(order[0])
+        assert cd.blocked(order[1], 7) is False, "a coordinate we landed on must not be parked"
+        assert any("COOLDOWN" in ln for ln in logs)
+
+    def test_an_honest_unreachable_root_is_NOT_a_block(self, monkeypatch):
+        """The pre-existing semantics: unreachable -> rolled back to the frozen base and we train
+        anyway, contributions lineage-dropped. Parking that would be a behaviour change, not a fix."""
+        order = [c for c in N.claim_walk_order(self.COORDS, "wallet0") if c != (1, 0)]
+        got, _host, cd = self._walk(monkeypatch, {order[0]: "unreachable"})
+        assert got[0] == order[0] and got[3] is False
+        assert cd.blocked(order[0], 7) is False
+
+    def test_a_refused_registration_is_parked_too_and_never_crashes_the_walk(self, monkeypatch):
+        order = [c for c in N.claim_walk_order(self.COORDS, "wallet0") if c != (1, 0)]
+        got, host, cd = self._walk(monkeypatch, {}, refuse=[order[0]])
+        assert got[0] == order[1] and order[0] not in host.registered
+        assert "register refused" in cd.reason(order[0])
+
+    def test_every_candidate_blocked_reports_the_repair_state_rather_than_looping(self, monkeypatch):
+        order = [c for c in N.claim_walk_order(self.COORDS, "wallet0") if c != (1, 0)]
+        got, _host, cd = self._walk(monkeypatch, {c: "call-timeout" for c in order})
+        assert got is None, "a full pass with nothing startable is the 1.5 repair state"
+        assert all(cd.blocked(c, 7) for c in order), "every one of them has to be parked"
+
+    def test_with_nothing_blocked_the_walk_lands_exactly_where_next_claim_coord_says(self,
+                                                                                     monkeypatch):
+        """Equivalence with the previous behaviour: when no coordinate is parked, advance_claim's
+        first (and only) candidate is next_claim_coord's answer. Without this the never-block change
+        could silently re-order the sweep, which is a different feature with its own measured
+        history (the 5090/4060 permanent collision, next_claim_coord's docstring)."""
+        got, _host, _cd = self._walk(monkeypatch, {})
+        want = N.next_claim_coord(list(self.COORDS), (1, 0), identity="wallet0")
+        assert got[0] == tuple(want)
+
+    def test_a_single_claimable_coordinate_still_means_stay_put(self, monkeypatch):
+        monkeypatch.setattr(N, "resume_to_root", lambda *a, **k: (0, True))
+        cd = N.CoordCooldown(seconds=1.0, events=1, now=_FakeClock())
+        assert N.advance_claim(self._Host([(1, 0)]), object(), [(1, 0)], (1, 0), "w", None, "r", 0,
+                               cd, lambda *_a: None, "m0") is None
+
+    def test_the_loop_refuses_to_train_while_every_coordinate_is_blocked(self):
+        """1.5(b) over 1.5(a), stated in the source: training a base we KNOW is off-lineage is the
+        ~900-rounds-paid-for-nothing failure with better uptime."""
+        import inspect
+        src = inspect.getsource(N._run_async)
+        assert "REPAIR MODE" in src and "repair_since" in src
+        i_rep = src.index("if repair_since is not None:")
+        i_train = src.index("_vram_pause_if_starved(log, miner=miner)")
+        assert i_rep < i_train, "the repair gate must come BEFORE the training step, or it is decoration"
+
+
+class _CountingFoldHost(_FoldHost):
+    """_FoldHost that counts read_slot, which is exactly the snapshot cost under test."""
+
+    def __init__(self, coords, shape=(2, 3)):
+        super().__init__(coords, shape=shape)
+        self.reads = 0
+
+    def read_slot(self, i):
+        self.reads += 1
+        return super().read_slot(i)
+
+
+class TestCowRollbackIsExactAndCheap:
+    """_fold_accepted_checked used to deep-copy EVERY resident slot before every fold so it could roll
+    back an off-lineage record. At the 60-coordinate residency that is ~1.05 GiB per record (one
+    coordinate's canonical {gate,up,down} triple is 18,874,493 B). Copy-on-write pays for the slots the
+    record actually moves instead -- but ONLY if the restore stays byte-identical, because that
+    rollback is the fail-closed guarantee that keeps un-gated weights out of the base."""
+
+    SHAPE = (4, 5)
+
+    def _loaded(self, n, cls=_FoldHost):
+        """A host whose slots all hold DISTINCT non-zero weights, so a missed restore cannot hide in
+        a field of zeros."""
+        coords = [(1, e) for e in range(n)]
+        host = cls(coords, shape=self.SHAPE)
+        rng = np.random.default_rng(11)
+        for j in range(n):
+            host.write_slot(j, {k: rng.standard_normal(self.SHAPE).astype(np.float32)
+                                for k in ("gate", "up", "down")})
+        return host, coords
+
+    @staticmethod
+    def _snapshot(host, n):
+        return {j: {k: v.copy() for k, v in host.read_slot(j).items()} for j in range(n)}
+
+    @staticmethod
+    def _offlineage(coord, cid="c0"):
+        """A record that MOVES `coord` but advertises a root our replay cannot produce -> lineage fail
+        -> rollback. This is the only path that rolls back, so it is the only one worth proving."""
+        return dict(accepted=[_row("m", coord, cid, slot=0)],
+                    slot_roots={"%d_%d" % coord: "a-root-our-fold-will-not-produce"},
+                    model_root="g")
+
+    def test_the_rollback_is_byte_identical_across_every_slot(self):
+        host, coords = self._loaded(6)
+        before = self._snapshot(host, len(coords))
+        lane = _FoldLane({"c0": _fold_shape(self.SHAPE, seed=5)})
+        ok, reason, _rej = N._fold_accepted_checked(host, lane, self._offlineage((1, 2)), None, -1,
+                                                    log=None)
+        assert (ok, reason) == (False, "lineage")
+        for j in range(len(coords)):
+            now = host.read_slot(j)
+            for k in ("gate", "up", "down"):
+                assert np.array_equal(now[k], before[j][k]), "slot %d key %s was not restored" % (j, k)
+                assert now[k].dtype == before[j][k].dtype
+
+    def test_that_assertion_is_load_bearing_the_fold_really_moved_the_slot(self, monkeypatch):
+        """Positive control: with the restore disabled the same test FAILS, so a green run above is
+        evidence of a working rollback and not of a fold that never wrote anything."""
+        host, coords = self._loaded(6)
+        before = self._snapshot(host, len(coords))
+        monkeypatch.setattr(N._CowSlots, "rollback", lambda self: 0)
+        lane = _FoldLane({"c0": _fold_shape(self.SHAPE, seed=5)})
+        N._fold_accepted_checked(host, lane, self._offlineage((1, 2)), None, -1, log=None)
+        assert not np.array_equal(host.read_slot(2)["gate"], before[2]["gate"])
+        assert np.array_equal(host.read_slot(3)["gate"], before[3]["gate"]), \
+            "only the moved slot should differ -- otherwise this control proves nothing"
+
+    def test_the_snapshot_cost_no_longer_scales_with_residency(self):
+        """The measured win: identical work on a 5-slot and a 60-slot host. Before this change the
+        60-slot fold deep-copied 60 slots (60 x 18,874,493 B = 1.05 GiB on a real GLM); now it copies
+        the one slot the record moves."""
+        small, _c = self._loaded(5, cls=_CountingFoldHost)
+        big, _c2 = self._loaded(60, cls=_CountingFoldHost)
+        small.reads = big.reads = 0
+        lane = _FoldLane({"c0": _fold_shape(self.SHAPE, seed=5)})
+        for h in (small, big):
+            N._fold_accepted_checked(h, lane, self._offlineage((1, 2)), None, -1, log=None)
+        assert big.reads == small.reads, "the snapshot still scales with residency (%d vs %d)" % (
+            big.reads, small.reads)
+        assert big.reads <= 6, "one moved slot should cost a handful of reads, got %d" % big.reads
+
+    def test_a_record_for_a_coordinate_we_do_not_hold_copies_nothing_at_all(self):
+        """The common case on a shard-claim network: 59 of 60 records move somebody else's expert."""
+        host, _c = self._loaded(60, cls=_CountingFoldHost)
+        host.reads = 0
+        rec = dict(accepted=[_row("stranger", (7, 7), "cX", slot=9)], slot_roots={"7_7": "theirs"},
+                   model_root="g")
+        ok, reason, _rej = N._fold_accepted_checked(host, _FoldLane({}), rec, None, -1, log=None)
+        assert (ok, reason) == (True, "ok")
+        assert host.reads == 0, "nothing resident moved, so nothing should have been copied"
+
+    def test_a_fold_that_RAISES_part_way_through_is_also_rolled_back(self):
+        """FAIL-CLOSED on a mid-fold failure. apply_accepted folds the accepted rows one at a time, so
+        a lane fetch that errors (or, since never-block V0, exceeds its deadline) on row 2 used to
+        leave row 1 in the base with no rollback whatsoever -- an unverified, off-lineage write. The
+        exception must still reach the caller; only the weights are restored."""
+        host, coords = self._loaded(4)
+        before = self._snapshot(host, len(coords))
+        d = _fold_shape(self.SHAPE, seed=5)
+
+        class _HalfLane(_FoldLane):
+            def get_delta(self, cid):
+                if cid == "cBOOM":
+                    raise N.CatchupTimeout("lane.get_delta did not return within 90.0s")
+                return super().get_delta(cid)
+        rec = dict(accepted=[_row("m", (1, 1), "c0", slot=0), _row("m", (1, 2), "cBOOM", slot=1)],
+                   slot_roots={"1_1": "x", "1_2": "y"}, model_root="g")
+        with pytest.raises(N.CatchupTimeout):
+            N._fold_accepted_checked(host, _HalfLane({"c0": d}), rec, None, -1, log=None)
+        for j in range(len(coords)):
+            for k in ("gate", "up", "down"):
+                assert np.array_equal(host.read_slot(j)[k], before[j][k]), \
+                    "slot %d survived a mid-fold failure un-rolled-back" % j
+
+    def test_a_clean_fold_still_keeps_its_result(self):
+        """Guard the other direction: copy-on-write must not roll back a record that VALIDATES."""
+        coords = [(1, 0), (1, 1)]
+        d = _fold_shape(self.SHAPE, seed=9)
+        host = _FoldHost(coords, shape=self.SHAPE)
+        want, _h = None, None
+        scratch = _FoldHost(coords, shape=self.SHAPE)
+        cur = scratch.read_slot(1)
+        scratch.write_slot(1, {k: cur[k] + 0.7 * d[k] for k in cur})
+        want = N.slot_root(scratch, 1)
+        rec = dict(accepted=[_row("m", (1, 1), "c0", slot=1)], slot_roots={"1_1": want},
+                   model_root="g")
+        ok, reason, _rej = N._fold_accepted_checked(host, _FoldLane({"c0": d}), rec, None, -1,
+                                                    log=None)
+        assert (ok, reason) == (True, "ok") and N.slot_root(host, 1) == want

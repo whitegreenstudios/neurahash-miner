@@ -53,12 +53,14 @@ stalled run 4 when it was the default:
       --data-dir D:/glm_wan --domains code,gutenberg --device cuda --batch 4
 """
 import argparse
+import copy
 import hashlib
 import json
 import os
 import re
 import secrets
 import sys
+import threading
 import time
 import urllib.request
 
@@ -876,7 +878,11 @@ def next_claim_coord(claimable, current, identity=None, ranked=None):
 
     `ranked` (--claim-by affinity) replaces that permutation with the ESFT affinity order, so "advance
     on plateau" becomes "drop to the NEXT-HIGHEST-affinity coordinate" rather than to the next hash
-    bucket -- see claim_walk_order and the ESFT block below."""
+    bucket -- see claim_walk_order and the ESFT block below.
+
+    NEVER-BLOCK V0: the async loop now advances through `advance_claim`, which walks the SAME order
+    but can keep going when a candidate is on cooldown -- this function is its first candidate, and
+    the specification of "next" that it must agree with (see the equivalence test)."""
     coords = [tuple(c) for c in claimable or []]
     if len(coords) <= 1:
         return None
@@ -2372,6 +2378,59 @@ def _clamp_base_event(last_applied, frontier):
     return f if b > f else b
 
 
+class _CowSlots:
+    """COPY-ON-WRITE rollback shim around a lane host: snapshot a slot the FIRST time it is about to
+    be written, never before.
+
+    WHY (measured 2026-07-26). _fold_accepted_checked used to deep-copy EVERY resident slot up front
+    so it could restore them if the fold turned out to be off-lineage. One GLM coordinate's canonical
+    {gate,up,down} triple is 18,874,493 B, so at the 60-coordinate residency that became the default
+    that is ~1.05 GiB copied PER FOLDED RECORD -- 12x the ~94 MB it cost when residency was 5 slots,
+    and paid on every record of every catch-up replay. An accepted record moves exactly ONE
+    coordinate (the coordinator stamps one `slot_roots` entry per event), and most records on a
+    shard-claim network move a coordinate this node does not even hold, so the copy was 59/60 waste.
+
+    EXACTNESS IS THE POINT, not the saving: this is the fail-closed guarantee that keeps un-gated,
+    off-lineage weights out of the base. It holds by construction rather than by argument -- every
+    mutation the fold can make goes through write_slot, we capture the pre-image before the first one
+    lands, and a slot that was never written is already byte-identical to its pre-call state, so
+    restoring it would be a no-op. Everything else is delegated, so the fold sees the real host.
+
+    Deliberately duck-typed (`__getattr__`), like every other host consumer in this module: the
+    coordinator's _resume_from_lane folds through the same function against its own host."""
+
+    def __init__(self, host):
+        self._host = host
+        self._saved = {}                         # slot idx -> pre-write DEEP copy
+
+    def __getattr__(self, name):
+        return getattr(self._host, name)
+
+    def read_slot(self, j):
+        return self._host.read_slot(j)
+
+    def write_slot(self, j, d):
+        j = int(j)
+        if j not in self._saved:
+            # DEEP copy: read_slot returns numpy VIEWS over the model's storage on a float32 CPU
+            # model (sharddiloco_glm_expert.GlmExpertLaneHost.read_slot), so the write below would
+            # otherwise mutate the snapshot too and make the rollback a silent no-op.
+            self._saved[j] = {k: np.array(v, copy=True)
+                              for k, v in self._host.read_slot(j).items()}
+        return self._host.write_slot(j, d)
+
+    @property
+    def touched(self):
+        """Slot indices this fold snapshotted, i.e. the ones a rollback has to restore."""
+        return sorted(self._saved)
+
+    def rollback(self):
+        """Restore every written slot to its pre-write bytes. Slots never written are untouched."""
+        for j, d in self._saved.items():
+            self._host.write_slot(j, d)
+        return len(self._saved)
+
+
 def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
     """Fold ONE coordinator accepted record, then VERIFY replica bit-exactness: our local model_root MUST
     equal the record's advertised model_root. That invariant is the whole reason model_root exists (see its
@@ -2385,21 +2444,32 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
         never advertised is off-lineage by construction and rolls back here.
     A row this node cannot place (another miner's coordinate) is NOT poison -- see apply_accepted's
     `skipped` channel (F2). It is counted nowhere and changes nothing, which is the whole point.
-    Clean fold -> (True, 'ok', []). Snapshots all slots up front (DEEP-copied: read_slot returns numpy VIEWS
-    that share storage with the model, so apply_accepted's in-place copy_ would otherwise mutate the snapshot
-    too and make the rollback a no-op). Mirrors the coordinator's _lineage_ok wrong-lineage-root drop,
+    Clean fold -> (True, 'ok', []). Mirrors the coordinator's _lineage_ok wrong-lineage-root drop,
     node-side. A record without an advertised model_root (never emitted by the async coordinator) is folded
-    as before (no false reject)."""
-    snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}     # DEEP copy -> real rollback
-            for j in range(len(host.slots))]
+    as before (no false reject).
+
+    The rollback snapshot is COPY-ON-WRITE (_CowSlots, 2026-07-26): a slot is deep-copied the first
+    time the fold is about to write it, instead of copying all of them up front. Byte-for-byte the
+    same restore -- a slot that was never written is already its own pre-call state -- at O(slots
+    this record moves) instead of O(residency), which at 60 resident coordinates was ~1.05 GiB copied
+    per folded record."""
+    cow = _CowSlots(host)
     rejected, skipped, folded = [], [], set()
-    apply_accepted(host, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected, own_slot=own_slot,
-                   skipped=skipped, folded_slots=folded)
+    try:
+        apply_accepted(cow, lane, rec, log=log, ce_fn=regate_ce, rejected=rejected,
+                       own_slot=own_slot, skipped=skipped, folded_slots=folded)
+    except BaseException:
+        # FAIL-CLOSED on a MID-FOLD failure. apply_accepted folds the accepted rows one at a time, so
+        # anything raising part-way (a lane fetch erroring, or -- since never-block V0 -- a fetch
+        # exceeding its deadline) used to leave the rows applied so far in the base with no rollback
+        # at all. Restore first, then re-raise: the caller decides what the failure means, but it
+        # never inherits a half-folded, unverified base.
+        cow.rollback()
+        raise
     if rejected:
         return False, "poison", rejected                          # caller handles rc8 (do not advance)
     if not replica_root_ok(host, rec, folded=folded):
-        for j, d in enumerate(snap):
-            host.write_slot(j, d)                                 # UNFOLD everything: off-lineage, fail-closed
+        cow.rollback()                                            # UNFOLD everything: off-lineage, fail-closed
         return False, "lineage", []
     return True, "ok", []
 
@@ -2493,7 +2563,218 @@ def pointer_slot_count(dec):
     return len(rounds or {})
 
 
-def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None):
+# ============================================================ NEVER-BLOCK V0 (catch-up is bounded)
+# docs/NEVER_BLOCK_HANDOVER.md 0-PRE + 7.1. MEASURED 2026-07-25: the 5090 plateaued on (L1,E50),
+# claimed (L1,E0) and BLOCKED 23 MINUTES -- process alive, "Responding: True", GPU 9%, nothing in any
+# log. scratchpad/wan_miner5090.log:113 (`PLATEAU ... CLAIM (L1,E0)`) is the last line that process
+# ever wrote, and there is NO `post-advance catch-up` line after it, while the three earlier advances
+# in the same run each printed one after trying only 7-17 records. So it was NOT accumulated
+# per-record replay cost: it entered resume_to_root and never came out of ONE call.
+#
+# Three bounds, in the order they bind:
+#   1. PER-CALL DEADLINE (_DeadlineLane) -- the actual root cause. ContentLane's `timeout` is a
+#      SOCKET timeout (urllib), so a connection that keeps trickling bytes never trips it and
+#      `r.read()` can block for as long as the peer keeps dribbling; and with retries=6 even a fully
+#      dead socket costs ~184 s per call. A wall budget on the loop cannot bound a call that never
+#      returns unless the call itself is interruptible, which urllib's is not -- hence the worker
+#      thread with a join deadline.
+#   2. WALL BUDGET + no-fold stall abort -- the backstop for "many calls, each individually fine".
+#   3. COOLDOWN + advance (CoordCooldown, advance_claim) -- on abort the miner does not sit there.
+CATCHUP_BUDGET_S = 180.0            # B_wall. See _catchup_budget_s for how this number was chosen.
+CATCHUP_CALL_TIMEOUT_S = 90.0       # per lane call inside catch-up; also capped by remaining budget
+CATCHUP_STALL_S = 30.0              # abort after this long with ZERO records folded
+COORD_COOLDOWN_S = 900.0            # 15 min ...
+COORD_COOLDOWN_EVENTS = 10          # ... or 10 pointer events, whichever is LATER
+_CATCHUP_ABORTED = ("budget", "stall", "call-timeout")   # reasons that mean BLOCKED, not "unreachable"
+
+
+def _env_num(name, default, cast, environ=None):
+    """One NEURAHASH_* numeric knob, fail-soft: an unset/blank/garbage value keeps `default` rather
+    than killing a miner over a typo in an env var."""
+    raw = ((environ if environ is not None else os.environ).get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _catchup_budget_s(environ=None):
+    """B_wall: the whole catch-up must finish inside this, or it fail-closes and the coordinate is
+    parked. NEURAHASH_SD_CATCHUP_BUDGET_S overrides.
+
+    CALIBRATION (2026-07-26, and honest about what could not be measured). U5 asks for
+    `max(120 s, 2 x p99)` over the distribution of SUCCESSFUL catch-up reach times. That p99 is
+    UNMEASURABLE from the artifacts we have: none of the 8 run logs in scratchpad/wan_*.log carries a
+    timestamp on any line, and no line reports an elapsed time for a resume -- n = 0 duration samples
+    (the corpus holds exactly ONE successful `resume:` line, wan_miner5090_run4.log:92, "after 30
+    record(s)", with no clock beside it). So the formula's FLOOR applies, 120 s, and it is raised to
+    180 s on the one measured anchor that does exist: memory glm-lane-manifest-throughput-bound
+    measured lane.manifest() at 23.79 s over an 11,051-object store, and the coordinator logs of
+    these runs report 19,438-23,503 objects at start, which puts ONE manifest call at ~42-51 s. 180 s
+    leaves >=3.5x headroom over that while still being 7.7x under the 23-minute incident. Every
+    catch-up now LOGS its own elapsed time, so the p99 this could not be calibrated from will exist
+    after the next run -- recalibrate then."""
+    return max(0.0, _env_num("NEURAHASH_SD_CATCHUP_BUDGET_S", CATCHUP_BUDGET_S, float, environ))
+
+
+def _catchup_call_timeout_s(environ=None):
+    """Per-lane-call deadline inside catch-up (NEURAHASH_SD_CATCHUP_CALL_TIMEOUT_S). Default 90 s =
+    ~1.8x the ~42-51 s a single manifest() costs at today's store size, so it bounds a hung call
+    without aborting a healthy slow one."""
+    return max(0.0, _env_num("NEURAHASH_SD_CATCHUP_CALL_TIMEOUT_S", CATCHUP_CALL_TIMEOUT_S, float,
+                             environ))
+
+
+def _catchup_stall_s(environ=None):
+    """Abort a catch-up that has folded NOTHING for this long (NEURAHASH_SD_CATCHUP_STALL_S). Timed
+    from the start of the RECORD LOOP, not from the call, so the one legitimately slow manifest()
+    cannot trip it."""
+    return max(0.0, _env_num("NEURAHASH_SD_CATCHUP_STALL_S", CATCHUP_STALL_S, float, environ))
+
+
+class CatchupTimeout(Exception):
+    """A lane call inside catch-up did not return within its deadline. Distinct from the transient
+    fetch failures the replay already tolerates, because it means BLOCKED, not "try again"."""
+
+
+class _DeadlineLane:
+    """Wrap a lane so EVERY call through it is bounded by a wall-clock deadline.
+
+    Why a thread and not a timeout argument: the calls on this path are urllib GETs inside
+    sharddiloco_harness.ContentLane, whose `timeout` is per-SOCKET-OPERATION. A peer that keeps
+    sending a byte now and then never trips it, so `r.read()` on the ~20 MB manifest of a
+    never-deleting store can block indefinitely -- and the fold path reaches the lane through
+    apply_accepted's `lane.get_delta(cid)` too, not only get_json/manifest, so bounding one named
+    method is not enough. Wrapping the OBJECT covers every fetch the fold path can reach.
+
+    The abandoned worker is a daemon, so it can never hold up process exit; and when the wrapped lane
+    exposes urllib-style knobs we hand the worker a SHALLOW CLONE with a tightened socket timeout and
+    at most 2 retries, so an abandoned call dies on its own instead of lingering on a trickling
+    socket. The clone is why the live lane's own timeout/retries are never mutated -- other threads
+    (the main loop's manifest scan) share that object."""
+
+    def __init__(self, lane, call_timeout_s, deadline=None, now=None):
+        self._now = now or time.monotonic
+        self._call_timeout = float(call_timeout_s)
+        self._deadline = deadline
+        self._lane = self._tighten(lane, self._call_timeout)
+        self.abandoned = 0                        # calls we walked away from (each leaked one thread)
+
+    @staticmethod
+    def _tighten(lane, call_timeout_s):
+        """A clone whose socket timeout cannot outlive our deadline by more than one retry. Returns
+        the lane UNCHANGED when it exposes no such knobs (every in-process test fake)."""
+        if not hasattr(lane, "timeout"):
+            return lane
+        try:
+            clone = copy.copy(lane)
+            clone.timeout = min(float(getattr(lane, "timeout", call_timeout_s) or call_timeout_s),
+                                max(1.0, call_timeout_s))
+            if hasattr(clone, "retries"):
+                clone.retries = max(1, min(int(getattr(lane, "retries", 1) or 1), 2))
+            return clone
+        except Exception:                                        # noqa: BLE001 -- never fail to bound
+            return lane
+
+    def remaining(self):
+        """Seconds left on the whole-catch-up deadline (None = no deadline set)."""
+        return None if self._deadline is None else (self._deadline - self._now())
+
+    def __getattr__(self, name):
+        # Never proxy our OWN internals. Without this, any access to `_lane` before __init__ finished
+        # (or a dunder probe from copy/pickle) recurses into __getattr__ forever.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        target = getattr(self._lane, name)
+        if not callable(target):
+            return target
+
+        def _bounded(*a, **kw):
+            budget = self._call_timeout
+            left = self.remaining()
+            if left is not None:
+                budget = min(budget, left)
+            if budget <= 0:
+                raise CatchupTimeout("no time left in the catch-up budget before lane.%s" % name)
+            box = {}
+
+            def _run():
+                try:
+                    box["v"] = target(*a, **kw)
+                except BaseException as ex:                      # noqa: BLE001 -- re-raised below
+                    box["e"] = ex
+            th = threading.Thread(target=_run, name="nh-catchup-%s" % name, daemon=True)
+            th.start()
+            th.join(budget)
+            if th.is_alive():
+                self.abandoned += 1
+                raise CatchupTimeout("lane.%s did not return within %.1fs" % (name, budget))
+            if "e" in box:
+                raise box["e"]
+            return box.get("v")
+        return _bounded
+
+
+class CoordCooldown:
+    """Coordinates parked after a catch-up abort or a refused registration, so the claim walk skips
+    them instead of retrying the same wall every advance.
+
+    "15 minutes OR 10 events, whichever is LATER" (design 1.4): a quiet lane must not expire a
+    cooldown just because no events happened, and a fast lane must not expire it just because 15
+    minutes of wall clock passed while the coordinator raced ahead -- so BOTH have to elapse. Pure
+    except for the injected clock, which is what makes it testable without sleeping."""
+
+    def __init__(self, seconds=None, events=None, now=None):
+        self._now = now or time.monotonic
+        self.seconds = COORD_COOLDOWN_S if seconds is None else float(seconds)
+        self.events = COORD_COOLDOWN_EVENTS if events is None else int(events)
+        self._parked = {}                        # coord -> dict(reason, until_t, until_event)
+
+    @staticmethod
+    def _key(coord):
+        return (int(coord[0]), int(coord[1]))
+
+    def park(self, coord, event, reason):
+        self._parked[self._key(coord)] = dict(
+            reason=str(reason), until_t=self._now() + self.seconds,
+            until_event=int(event or 0) + self.events)
+        return self._parked[self._key(coord)]
+
+    def blocked(self, coord, event):
+        p = self._parked.get(self._key(coord))
+        if p is None:
+            return False
+        if self._now() >= p["until_t"] and int(event or 0) >= p["until_event"]:
+            del self._parked[self._key(coord)]           # both halves elapsed -> claimable again
+            return False
+        return True
+
+    def reason(self, coord):
+        p = self._parked.get(self._key(coord))
+        return None if p is None else p["reason"]
+
+    def left(self, coord, event):
+        """(seconds_left, events_left) for a parked coordinate; (0.0, 0) if it is not parked."""
+        p = self._parked.get(self._key(coord))
+        if p is None:
+            return 0.0, 0
+        return max(0.0, p["until_t"] - self._now()), max(0, p["until_event"] - int(event or 0))
+
+    def describe(self, coords, event):
+        """One ASCII line per still-parked coordinate, for the repair-mode heartbeat."""
+        out = []
+        for c in coords:
+            if self.blocked(c, event):
+                s, e = self.left(c, event)
+                out.append("(L%d,E%d) %s [%.0fs / %d event(s) left]"
+                           % (int(c[0]), int(c[1]), self.reason(c), s, e))
+        return out
+
+
+def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
+                   budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None):
     """CONTRIBUTOR-SIDE RESUME SYMMETRY: replay accepted records until our base reproduces the
     coordinator's advertised genesis root, so a RESUMED coordinator can accept our work.
 
@@ -2521,9 +2802,34 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
     own_coord the stop condition is the one the lineage guard actually checks (coordinator
     _lineage_ok, base_slot_root): the most recent record that ADVERTISED a `slot_roots` entry for our
     coordinate has been folded, and our local slot_root equals that advertised value. `own_coord=None`
-    keeps the global behaviour byte-identical."""
+    keeps the global behaviour byte-identical.
+
+    NEVER-BLOCK V0 (2026-07-26, docs/NEVER_BLOCK_HANDOVER.md 0-PRE). Three bounds, all fail-CLOSED
+    through the SAME rollback this function already had -- no new rollback semantics:
+      * `call_timeout_s`: every lane call goes through _DeadlineLane, so no single fetch can hang
+        forever. This is the measured root cause of the 23-minute block.
+      * `budget_s` (B_wall): the whole replay aborts once elapsed exceeds it.
+      * `stall_s`: abort after this long with ZERO records folded (timed from the record loop, so a
+        legitimately slow manifest cannot trip it).
+    `outcome`, if a dict is passed, is filled in place with reason/elapsed_s/records/aborted -- the
+    caller needs to tell "BLOCKED, park this coordinate" (reason in _CATCHUP_ABORTED) apart from the
+    honest "unreachable" it has always tolerated. Return arity is unchanged: (n_applied, reached)."""
+    t0 = (now or time.monotonic)()
+    _now = now or time.monotonic
+    budget = _catchup_budget_s() if budget_s is None else float(budget_s)
+    stall = _catchup_stall_s() if stall_s is None else float(stall_s)
+    call_to = _catchup_call_timeout_s() if call_timeout_s is None else float(call_timeout_s)
+
+    def _done(reason, applied, reached, records=None):
+        # `records` is what the replay actually TRIED (it can be non-zero while `applied` is 0: a
+        # rollback returns 0 by long-standing convention). The caller's diagnostics want the former.
+        if outcome is not None:
+            outcome.update(reason=reason, elapsed_s=_now() - t0,
+                           records=int(applied if records is None else records),
+                           aborted=reason in _CATCHUP_ABORTED)
+        return applied, reached
     if not target_root or model_root(host) == str(target_root):
-        return 0, True
+        return _done("already-at-root", 0, True)
     target = str(target_root)
     coord_key, own_idx = None, None
     if own_coord is not None:
@@ -2532,40 +2838,61 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         if own_idx is None:                                      # not resident -> no per-coordinate target
             log("[glm-contrib] resume: coordinate (L%d,E%d) is not registered locally -- staying on "
                 "the frozen base" % (int(own_coord[0]), int(own_coord[1])))
-            return 0, False
+            return _done("not-registered", 0, False)
+    lane = _DeadlineLane(lane, call_to, deadline=t0 + budget, now=_now)
     try:
         man = lane.manifest()
+    except CatchupTimeout as e:
+        log("[glm-contrib] resume: BLOCKED reading the manifest after %.1fs (%s) -- staying on the "
+            "frozen base" % (_now() - t0, e))
+        return _done("call-timeout", 0, False)
     except Exception as e:                                       # noqa: BLE001
         log("[glm-contrib] resume: manifest unavailable (%r) -- staying on the frozen base" % (e,))
-        return 0, False
+        return _done("manifest-unavailable", 0, False)
     prefix = ACCEPTED_NAME_FMT % 0
     prefix = prefix[:prefix.rfind("0")]
     events = sorted(int(n[len(prefix):]) for n in man
                     if str(n).startswith(prefix) and str(n)[len(prefix):].isdigit())
     if not events:
         log("[glm-contrib] resume: no accepted records to replay -- staying on the frozen base")
-        return 0, False
+        return _done("no-records", 0, False)
     snap = [{k: np.array(v, copy=True) for k, v in host.read_slot(j).items()}
             for j in range(len(host.slots))]                     # DEEP copy: read_slot returns VIEWS
     applied = 0
+    aborted = None                            # never-block: 'budget' | 'stall' | 'call-timeout'
+    t_loop = last_fold_t = _now()             # the stall clock starts AFTER the manifest, not before
     coord_want, coord_hit = None, False       # newest advertised root for own_coord + did we reproduce it
     for e in events[:int(max_records)]:
+        if _now() - t0 > budget:
+            aborted = "budget"
+            break
+        if stall > 0 and (_now() - last_fold_t) > stall:
+            aborted = "stall"
+            break
         entry = man.get(accepted_name(e))
         if not entry:
             continue
         try:
             rec = lane.get_json(entry["sha256"])
+        except CatchupTimeout:
+            aborted = "call-timeout"
+            break
         except Exception:                                        # noqa: BLE001
             break
-        ok, _reason, _rej = _fold_accepted_checked(host, lane, rec, None, -1, log=None)
+        try:
+            ok, _reason, _rej = _fold_accepted_checked(host, lane, rec, None, -1, log=None)
+        except CatchupTimeout:                                   # a delta fetch INSIDE the fold hung
+            aborted = "call-timeout"
+            break
         if not ok:
             continue                                             # off-lineage record: already rolled back
         applied += 1
+        last_fold_t = _now()
         if coord_key is None:
             if model_root(host) == target:
-                log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s)"
-                    % (target[:12], applied))
-                return applied, True
+                log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s) "
+                    "in %.1fs" % (target[:12], applied, _now() - t0))
+                return _done("ok", applied, True)
             continue
         # Per-coordinate target: only a FOLDED record that advertised our coordinate can move it, and
         # the LAST such record is the coordinator's current state for it -- so keep replaying (a later
@@ -2575,24 +2902,95 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             continue
         coord_want = str(adv)
         coord_hit = (slot_root(host, own_idx) == coord_want)
-    if coord_key is not None and coord_hit:
+    if coord_key is not None and coord_hit and aborted is None:
         log("[glm-contrib] resume: reached the coordinator's root for coordinate %s (%s..) after %d "
-            "record(s); the global root is not comparable on a shard-claim network"
-            % (coord_key, coord_want[:12], applied))
-        return applied, True
+            "record(s) in %.1fs; the global root is not comparable on a shard-claim network"
+            % (coord_key, coord_want[:12], applied, _now() - t0))
+        return _done("ok", applied, True)
     for j, d in enumerate(snap):                                 # UNREACHABLE -> full rollback
         host.write_slot(j, d)
+    if aborted is not None:
+        # NEVER-BLOCK: the SAME fail-closed rollback as an unreachable root, but the caller is told
+        # this was a BOUND firing rather than an honest "the coordinator's base is not reproducible",
+        # so it parks the coordinate and advances instead of training into a wall.
+        log("[glm-contrib] resume: ABORTED catch-up for %s after %.1fs (%s, %d record(s) folded, "
+            "budget=%.0fs stall=%.0fs call-timeout=%.0fs); rolled back to the frozen base"
+            % (coord_key or ("root %s.." % target[:12]), _now() - t0, aborted, applied, budget,
+               stall, call_to))
+        return _done(aborted, 0, False, records=applied)
     if coord_key is not None:
         log("[glm-contrib] resume: could NOT reach the coordinator's root for coordinate %s (%s, %d "
-            "record(s) tried); rolled back to the frozen base -- our contributions will be "
+            "record(s) tried, %.1fs); rolled back to the frozen base -- our contributions will be "
             "lineage-dropped until the coordinator's base for this coordinate is reachable"
             % (coord_key, "advertised %s.." % coord_want[:12] if coord_want else
-               "no record advertised it", applied))
-        return 0, False
-    log("[glm-contrib] resume: could NOT reach the advertised root %s.. (%d record(s) tried); "
+               "no record advertised it", applied, _now() - t0))
+        return _done("unreachable", 0, False, records=applied)
+    log("[glm-contrib] resume: could NOT reach the advertised root %s.. (%d record(s) tried, %.1fs); "
         "rolled back to the frozen base -- our contributions will be lineage-dropped until the "
-        "coordinator's base is reachable" % (target[:12], applied))
-    return 0, False
+        "coordinator's base is reachable" % (target[:12], applied, _now() - t0))
+    return _done("unreachable", 0, False, records=applied)
+
+
+def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_root, event,
+                  cooldown, log, miner, plateau_rejects=0, budget_s=None, call_timeout_s=None,
+                  stall_s=None, now=None):
+    """NEVER-BLOCK 1.4: walk this identity's claim order from `current` to the first coordinate the
+    miner can actually START on, parking every one that BLOCKS it on the way.
+
+    Blocking means exactly two things, and neither of them is "the coordinator's base is
+    unreachable": (a) registration refused it (not hostable here, or no seat under
+    --max-active-slots), or (b) its catch-up hit one of the V0 bounds -- per-call deadline, wall
+    budget, or no-fold stall. An HONEST unreachable root is NOT blocking and never was: the fold
+    rolled back to the frozen base and the miner trains anyway, its contributions lineage-dropped,
+    which is the designed signal. Preserving that distinction is what keeps this change small.
+
+    Termination: the candidate list is one pass over a finite per-identity permutation of the
+    claimable set (claim_walk_order), current excluded, so the walk cannot cycle. Returns
+    ((L, E), local_idx, records_folded, reached) or None when the whole pass is blocked -- the
+    caller's 1.5 repair mode."""
+    order = claim_walk_order(claim_coords, identity, ranked=ranked)
+    cur = tuple(current)
+    if len(order) <= 1:
+        return None                              # nothing to advance TO (next_claim_coord agrees)
+    start = (order.index(cur) + 1) if cur in order else 0
+    cands = [c for c in (order[(start + k) % len(order)] for k in range(len(order))) if c != cur]
+    first = True
+    for cand in cands:
+        if cooldown.blocked(cand, event):
+            continue
+        try:
+            ni = host.register(*cand)
+        except (ValueError, RuntimeError) as ex:
+            cooldown.park(cand, event, "register refused (%s)" % (str(ex)[:60],))
+            log("[glm-contrib %s] cannot advance to (L%d,E%d): %s -- COOLDOWN and walking on"
+                % (miner, cand[0], cand[1], ex))
+            continue
+        if first:
+            log("[glm-contrib %s] PLATEAU on (L%d,E%d) after %d consecutive rejects -> RELEASE, "
+                "CLAIM (L%d,E%d) [local slot %d]. Sweeping: %d coordinate(s) claimable here."
+                % (miner, cur[0], cur[1], int(plateau_rejects), cand[0], cand[1], ni,
+                   len(claim_coords)))
+            first = False
+        else:
+            log("[glm-contrib %s] walking past a blocked coordinate -> CLAIM (L%d,E%d) [local slot "
+                "%d]" % (miner, cand[0], cand[1], ni))
+        outcome = {}
+        n_res, reached = resume_to_root(host, lane, pointer_root, log, own_coord=cand,
+                                        outcome=outcome, budget_s=budget_s,
+                                        call_timeout_s=call_timeout_s, stall_s=stall_s, now=now)
+        if outcome.get("aborted"):
+            cooldown.park(cand, event, "catch-up %s" % outcome.get("reason"))
+            log("[glm-contrib %s] COOLDOWN (L%d,E%d): catch-up %s after %.1fs -- parked for %.0fs / "
+                "%d event(s), advancing to the next claimable coordinate instead of blocking on it"
+                % (miner, cand[0], cand[1], outcome.get("reason"), outcome.get("elapsed_s", 0.0),
+                   cooldown.seconds, cooldown.events))
+            continue
+        log("[glm-contrib %s] post-advance catch-up for (L%d,E%d): folded %d record(s), coordinator "
+            "root %s (%.1fs)"
+            % (miner, cand[0], cand[1], n_res, "REACHED" if reached else "NOT reached (frozen base)",
+               outcome.get("elapsed_s", 0.0)))
+        return (cand[0], cand[1]), ni, n_res, reached
+    return None
 
 
 def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log,
@@ -2604,18 +3002,35 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
     never-deleting store) can never become our training base. Returns (last_applied, applied_any, abort):
     abort is None normally, or 8 when an own-slot delta tripped the local re-gate (rc8, unchanged). Emits at
     most ONE aggregate LINEAGE-SKIP line (never one per record). Non-blocking: no visible record ->
-    (unchanged, False, None) and the caller trains against the current base."""
+    (unchanged, False, None) and the caller trains against the current base.
+
+    NEVER-BLOCK V0: "non-blocking" was only true of the SCAN, not of the FETCHES inside it -- a
+    get_json (or the get_delta apply_accepted issues per accepted row) that never returned blocked
+    this loop exactly as it blocked resume_to_root. Every fetch here now carries the same per-call
+    deadline; a call that trips it takes the pre-existing transient-failure exit (stop the scan, train
+    against the current base, retry next tick), so the failure SEMANTICS are unchanged."""
     applied_any = False
     skipped_at = None
+    lane = _DeadlineLane(lane, _catchup_call_timeout_s())
     for e in scan_accepted_events_bounded(man, last_applied, frontier):
         entry = man.get(accepted_name(e))
         if not entry:
             break                                            # gap: stop -- never fold out of order
         try:
             rec = lane.get_json(entry["sha256"])
+        except CatchupTimeout as ex:
+            log("[glm-contrib %s] catch-up: BLOCKED fetching accepted event %d (%s) -- training "
+                "against the current base and retrying next tick" % (miner, e, ex))
+            break
         except Exception:                                    # noqa: BLE001
             break                                            # transient fetch fail -> retry next tick
-        ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=log)
+        try:
+            ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot,
+                                                          log=log)
+        except CatchupTimeout as ex:                         # a delta fetch INSIDE the fold hung
+            log("[glm-contrib %s] catch-up: BLOCKED fetching a delta of accepted event %d (%s) -- "
+                "training against the current base and retrying next tick" % (miner, e, ex))
+            break
         if reason == "poison":
             log("[glm-contrib %s] SECURITY: locally REJECTED %d accepted delta(s) at event %d "
                 "(regressed local held-out CE or mismatched shape). The pointer + accepted record "
@@ -2790,6 +3205,15 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # be a verdict on us (event_judged_us), so folding a running campaign's history never moves the streak.
     last_pub_base_event = None
     advance_after = int(getattr(args, "advance_after", 0) or 0)
+    # NEVER-BLOCK V0: coordinates whose catch-up hit a bound (or whose registration was refused) are
+    # parked here so the claim walk skips them, and `repair_since` is the 1.5(b) all-blocked state --
+    # loud, idle, and explicitly NOT training on a base we know the coordinator will reject.
+    cooldown = CoordCooldown(seconds=_env_num("NEURAHASH_SD_COORD_COOLDOWN_S", COORD_COOLDOWN_S,
+                                              float),
+                             events=_env_num("NEURAHASH_SD_COORD_COOLDOWN_EVENTS",
+                                             COORD_COOLDOWN_EVENTS, int),
+                             now=time.time)
+    repair_since, last_repair_log = None, 0.0
     claim_coords = claim_all_coords(args, list(host.slots))
     # The sweep ORDER is per-identity (see next_claim_coord): a shared +1 advance turned a one-off
     # collision between two miners into a permanent one. Same durable identity pick_start_coord used.
@@ -2920,43 +3344,67 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             else:
                 reject_streak += 1
         if advance_after and reject_streak >= advance_after:
-            nxt = next_claim_coord(claim_coords, (L, E), identity=claim_identity,
-                                   ranked=claim_ranked)
-            if nxt is None:
-                log("[glm-contrib %s] plateaued on (L%d,E%d) after %d consecutive gate rejects, but this "
-                    "node holds no other coordinate to claim -- staying put." % (miner, L, E, reject_streak))
-                reject_streak = 0
-            else:
-                try:
-                    ni = host.register(*nxt)
-                except (ValueError, RuntimeError) as ex:
-                    log("[glm-contrib %s] cannot advance to (L%d,E%d): %s -- staying on (L%d,E%d)"
-                        % (miner, nxt[0], nxt[1], ex, L, E))
-                    reject_streak = 0
+            # F5b: the freshly claimed coordinate's local weights are the FROZEN BASE. If anyone
+            # already trained it, our base_slot_root can never match the coordinator's and EVERY
+            # later contribution is dropped `wrong-lineage-slot-root` forever, silently --
+            # catch_up_accepted only scans (last_applied, frontier], so the historical records that
+            # moved this coordinate are never replayed. advance_claim brings it up to the
+            # coordinator's state, targeted at THIS coordinate (the global root is not reachable on a
+            # shard-claim network) and fail-closed. NEVER-BLOCK V0: that catch-up is now BOUNDED, and
+            # a coordinate whose catch-up hits a bound is parked and walked past instead of blocking
+            # the miner (measured 23-minute hang, docs/NEVER_BLOCK_HANDOVER.md 0-PRE).
+            landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked,
+                                   pointer_root, dec.get("event"), cooldown, log, miner,
+                                   plateau_rejects=reject_streak)
+            reject_streak = 0
+            if landed is None:
+                if len(claim_coords) <= 1:
+                    log("[glm-contrib %s] plateaued on (L%d,E%d) after %d consecutive gate rejects, "
+                        "but this node holds no other coordinate to claim -- staying put."
+                        % (miner, L, E, advance_after))
                 else:
-                    log("[glm-contrib %s] PLATEAU on (L%d,E%d) after %d consecutive rejects -> RELEASE, "
-                        "CLAIM (L%d,E%d) [local slot %d]. Sweeping: %d coordinate(s) claimable here."
-                        % (miner, L, E, reject_streak, nxt[0], nxt[1], ni, len(claim_coords)))
-                    L, E, i = nxt[0], nxt[1], ni
-                    # Re-read this coordinate's data shard and rebind the re-gate closure over the new
-                    # val split -- the same mid-loop reload the corpus-resync path already performs.
-                    train_ids = node_ids(args, coord_data_slot(L, E), "train")
-                    val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                    regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
-                    reject_streak = 0
-                    last_pub_base_event = None       # F5a: nothing of OURS is in flight on this coordinate
-                    # F5b: the freshly claimed coordinate's local weights are the FROZEN BASE. If anyone
-                    # already trained it, our base_slot_root can never match the coordinator's and EVERY
-                    # later contribution is dropped `wrong-lineage-slot-root` forever, silently --
-                    # catch_up_accepted only scans (last_applied, frontier], so the historical records that
-                    # moved this coordinate are never replayed. Bring it up to the coordinator's state now,
-                    # targeted at THIS coordinate (the global root is not reachable on a shard-claim
-                    # network) and fail-closed: unreachable -> rolled back to the frozen base, which is the
-                    # honest signal, not a half-folded base.
-                    _n_res, _reached = resume_to_root(host, lane, pointer_root, log, own_coord=nxt)
-                    log("[glm-contrib %s] post-advance catch-up for (L%d,E%d): folded %d record(s), "
-                        "coordinator root %s" % (miner, L, E, _n_res,
-                                                 "REACHED" if _reached else "NOT reached (frozen base)"))
+                    # 1.5(b) LOUD REPAIR, chosen over the owner-literal "train anyway": an
+                    # idle-but-loud miner costs 0 and is visible; a miner training a base it knows is
+                    # off-lineage burns watts to manufacture rejects and hides the outage. That is
+                    # this project's ~900-rounds-paid-for-nothing failure with better uptime.
+                    repair_since = repair_since or time.time()
+                    last_repair_log = 0.0
+            else:
+                (L, E), i, _n_res, _reached = landed
+                repair_since = None
+                # Re-read this coordinate's data shard and rebind the re-gate closure over the new
+                # val split -- the same mid-loop reload the corpus-resync path already performs.
+                train_ids = node_ids(args, coord_data_slot(L, E), "train")
+                val_ids = node_ids(args, coord_data_slot(L, E), "val")
+                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+                last_pub_base_event = None       # F5a: nothing of OURS is in flight on this coordinate
+        elif repair_since is not None:
+            # Cooldowns expire on wall clock AND events, so retry the walk every iteration: when
+            # every coordinate is parked this costs zero lane calls (advance_claim skips them all
+            # before it can register or fetch anything).
+            landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked,
+                                   pointer_root, dec.get("event"), cooldown, log, miner)
+            if landed is not None:
+                (L, E), i, _n_res, _reached = landed
+                log("[glm-contrib %s] REPAIR CLEARED after %.0fs: resuming on (L%d,E%d)"
+                    % (miner, time.time() - repair_since, L, E))
+                repair_since = None
+                train_ids = node_ids(args, coord_data_slot(L, E), "train")
+                val_ids = node_ids(args, coord_data_slot(L, E), "val")
+                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+                last_pub_base_event = None
+        if repair_since is not None:
+            # NO TRAINING while every claimable coordinate is blocked -- see 1.5(b) above. Say why,
+            # per coordinate, every 30 s: a silent idle miner and a healthy one look identical.
+            if time.time() - last_repair_log >= 30.0:
+                last_repair_log = time.time()
+                log("[glm-contrib %s] REPAIR MODE (%.0fs): every claimable coordinate is blocked, so "
+                    "NOT training -- %s" % (miner, time.time() - repair_since,
+                                            "; ".join(cooldown.describe(claim_coords,
+                                                                        dec.get("event"))) or
+                                            "no coordinate is claimable at all"))
+            time.sleep(max(float(args.poll or 0.0), 1.0))
+            continue
 
         # -- (2) root mismatch is NORMAL mid-flight; abort ONLY on prolonged no-progress (rc6). -------
         # F6: and ONLY when the two roots are even comparable. A shard-claim miner holds a different slot

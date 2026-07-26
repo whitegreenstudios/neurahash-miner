@@ -170,6 +170,242 @@ class TestNodePieceIds:
         assert N.node_piece_ids(_piece_args(shard_dir, pieces="", piece=3)) == [3]
 
 
+# ============================================ DEFAULT residency = FILL THE RESIDENT LAYER (no flags)
+# WHY: --pieces removed the ceiling only for an operator who already knows to type it. A stranger who
+# just runs the miner tomorrow got the SAME five coordinates that stalled run 4 -- 620 events, 7.5 h,
+# zero accepted merges. So the default itself has to fill the layer. It is free: MEASURED 2026-07-26
+# on the real model, --piece 0 = 5 coords / 2,764,301,056 params / 1.857 GiB, --pieces 0-11 = 60
+# coords / 2,764,301,056 params / 1.859 GiB. Identical parameter count, +0.002 GiB. Crossing a layer
+# is NOT free: experts_12 holds (1,60)..(1,63) PLUS (2,0), and that one coordinate materialises a
+# second full-width MoE layer (+603,979,776 params, +1.126 GiB) -- hence "never straddle by default".
+@pytest.fixture
+def live_shape_shard_dir(tmp_path):
+    """A manifest with the REAL manifest's SHAPE, small enough to be pure dict work: 64 experts per
+    layer, 5 experts per piece, layer 0 dense, and the last layer the MTP/nextn one the model never
+    instantiates. That reproduces exactly the geometry the finding turns on -- layer 1 is covered by
+    the twelve clean pieces 0..11 plus the STRADDLER experts_12 = (1,60)..(1,63) + (2,0) -- so these
+    tests assert the same boundary the live model does, without a 5.67 GB load.
+
+    Layer 2 is present and complete so a straddling ANCHOR has somewhere real to straddle into, and
+    piece 25 = (2,61)..(2,63) + (3,0),(3,1) straddles into the MTP layer, which must NOT count as a
+    straddle (an unreal layer is never instantiated, so it costs nothing)."""
+    coords = [[L, E] for L in (1, 2, 3) for E in range(64)]
+    pieces = {p: coords[5 * p:5 * p + 5] for p in range((len(coords) + 4) // 5)}
+    man = {"version": 1, "n_pieces": len(pieces) + 1,
+           "pieces": [{"piece": "trunk", "experts": []}]
+                     + [{"piece": "experts_%d" % p, "experts": e} for p, e in sorted(pieces.items())]}
+    (tmp_path / "model_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 3, "first_k_dense_replace": 1}), encoding="utf-8")
+    return str(tmp_path)
+
+
+def _default_args(shard_dir, expert=None):
+    """A --mode glm namespace with NEITHER piece flag set -- what a stranger's command line resolves
+    to now that argparse defaults --piece to None instead of 0."""
+    return _piece_args(shard_dir, pieces=None, piece=None, expert=expert)
+
+
+def _manifest_and_cfg(shard_dir):
+    return (PL.load_manifest(shard_dir, require_files=False),
+            types.SimpleNamespace(num_hidden_layers=3, first_k_dense_replace=1))
+
+
+class TestDefaultPieceIdsFillTheLayer:
+    """The rule, stated as arithmetic: fill every piece whose experts lie ENTIRELY inside the layer(s)
+    the anchor already makes resident, and exclude anything that would add a layer."""
+
+    def test_the_default_is_every_same_layer_piece_and_excludes_the_straddler(
+            self, live_shape_shard_dir):
+        """The exact piece list, not a count: 0..11 is layer 1's first 60 experts, and experts_12 is
+        left out because its (2,0) would materialise a whole second MoE layer for one coordinate."""
+        man, cfg = _manifest_and_cfg(live_shape_shard_dir)
+        ids, excluded = N.default_piece_ids(man, cfg, anchor=0)
+        assert ids == list(range(12))
+        assert excluded == [(12, [2])]
+
+    def test_the_default_coordinate_count_is_sixty(self, live_shape_shard_dir):
+        """60, not 5. The whole finding is the number: five coordinates is what a campaign exhausts
+        in 21 merges and then grinds on for 7.5 h with nothing left to claim."""
+        got = N.node_claimable_coords(_default_args(live_shape_shard_dir))
+        assert len(got) == 60
+        assert got[0] == (1, 0) and got[-1] == (1, 59)
+        assert all(L == 1 for (L, _) in got)                 # one layer: the free one
+
+    def test_the_default_needs_no_flags_at_all(self, live_shape_shard_dir):
+        assert N.node_piece_ids(_default_args(live_shape_shard_dir)) == list(range(12))
+        assert N.resolve_piece_selection(_default_args(live_shape_shard_dir))["source"] == "default"
+
+    def test_a_manifest_whose_layer_needs_only_two_pieces_fills_exactly_those(self, shard_dir):
+        """The rule is manifest-driven, not a hardcoded 0-11: on the tiny fixture layer 1 is pieces
+        0 and 1, so the default is [0, 1] -- and piece 2 (layer 2) is neither filled nor reported as
+        a straddler, because it shares no layer with the anchor at all."""
+        assert N.node_piece_ids(_default_args(shard_dir)) == [0, 1]
+        assert N.node_claimable_coords(_default_args(shard_dir)) == [(1, 0), (1, 1), (1, 2), (1, 3)]
+        assert N.resolve_piece_selection(_default_args(shard_dir))["excluded"] == []
+
+
+class TestExplicitFlagsStillWinUnchanged:
+    """The no-silent-change guard. Someone whose launch script says --piece 0 today must get exactly
+    today's five coordinates tomorrow; the new behaviour applies ONLY when neither flag was given."""
+
+    def test_piece_zero_explicitly_is_still_exactly_five_coordinates(self, live_shape_shard_dir):
+        args = _piece_args(live_shape_shard_dir, piece=0)
+        assert N.node_piece_ids(args) == [0]
+        assert N.node_claimable_coords(args) == [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4)]
+        assert N.resolve_piece_selection(args)["source"] == "--piece"
+
+    def test_pieces_explicitly_still_wins(self, live_shape_shard_dir):
+        args = _piece_args(live_shape_shard_dir, pieces="0-5")
+        assert N.node_piece_ids(args) == list(range(6))
+        assert len(N.node_claimable_coords(args)) == 30
+
+    def test_pieces_may_name_the_straddler_on_purpose(self, live_shape_shard_dir):
+        """Excluding the straddler is a DEFAULT, not a policy: 0-12 buys 65 coordinates for a second
+        layer, and an operator who wants that pays for it explicitly (measured +1.126 GiB)."""
+        args = _piece_args(live_shape_shard_dir, pieces="0-12")
+        assert N.node_piece_ids(args) == list(range(13))
+        got = N.node_claimable_coords(args)
+        assert len(got) == 65 and (2, 0) in got
+
+    def test_pieces_still_overrides_piece(self, live_shape_shard_dir):
+        assert N.node_piece_ids(_piece_args(live_shape_shard_dir, pieces="7", piece=0)) == [7]
+
+
+class TestStraddlingAnchor:
+    """A straddling ANCHOR is not a special case -- it is the same economics. experts_12 already
+    materialises BOTH layer 1 and layer 2 full-width just by loading, so filling both is still free,
+    and refusing to would leave rows of tensors already paid for permanently untrainable."""
+
+    def test_a_straddling_anchor_fills_both_of_its_layers(self, live_shape_shard_dir):
+        man, cfg = _manifest_and_cfg(live_shape_shard_dir)
+        ids, excluded = N.default_piece_ids(man, cfg, anchor=12)
+        assert ids == list(range(26))                # every piece whose real layers are within {1,2}
+        assert 12 in ids
+        assert excluded == []                        # nothing can straddle OUT of the last real layer
+        assert len(PL.claimable_expert_ids(man, ids, cfg)) == 128       # both layers, 64 each
+
+    def test_a_piece_straddling_only_into_the_mtp_layer_is_not_a_straddler(
+            self, live_shape_shard_dir):
+        """Piece 25 is (2,61)..(2,63) + (3,0),(3,1). Layer 3 is the MTP/nextn layer that
+        Glm4MoeLiteForCausalLM never instantiates, so including 25 adds no resident layer and no
+        claimable coordinate beyond layer 2's -- it must be filled, not excluded."""
+        man, cfg = _manifest_and_cfg(live_shape_shard_dir)
+        ids, _ = N.default_piece_ids(man, cfg, anchor=12)
+        assert 25 in ids
+        assert all(L in (1, 2) for (L, _) in PL.claimable_expert_ids(man, ids, cfg))
+
+    def test_an_anchor_with_no_real_layers_yields_only_itself(self, live_shape_shard_dir):
+        """Pieces 26+ here (589-601 live) are 100% MTP. The default must NOT quietly substitute some
+        other piece: resolve_claim's existing 'holds NO real experts' error is the right failure, and
+        it only fires if we hand back the anchor the operator's manifest actually pointed at."""
+        man, cfg = _manifest_and_cfg(live_shape_shard_dir)
+        assert N.default_piece_ids(man, cfg, anchor=30) == ([30], [])
+
+
+class TestBothRolesResolveTheSameDefault:
+    """THE LOCKSTEP GUARD. A miner that auto-expanded to 60 coordinates while the coordinator hosted 5
+    would simply be told `not hostable here` for 55 of them, which looks like a miner bug and is not.
+    The two roles cannot drift because there is exactly one implementation and the coordinator imports
+    it -- these assertions are what keep it that way if someone later adds a local copy."""
+
+    def test_the_coordinator_uses_this_module_s_resolver_object(self):
+        C = pytest.importorskip("sharddiloco_glm_coordinator")
+        assert C.N is N
+        assert C.N.resolve_piece_selection is N.resolve_piece_selection
+        assert C.N.default_piece_ids is N.default_piece_ids
+
+    def test_both_roles_resolve_the_same_ids_and_coordinates(self, live_shape_shard_dir):
+        C = pytest.importorskip("sharddiloco_glm_coordinator")
+        args = _default_args(live_shape_shard_dir)
+        assert C.N.node_piece_ids(args) == N.node_piece_ids(args) == list(range(12))
+        assert C.N.node_claimable_coords(args) == N.node_claimable_coords(args)
+        assert len(C.N.node_claimable_coords(args)) == 60
+
+    def test_the_coordinator_startup_line_is_built_from_the_shared_formatter(self):
+        """The log line both roles print is one function, so 'pieces_here=' cannot say one thing on
+        the coordinator and another on the miner."""
+        C = pytest.importorskip("sharddiloco_glm_coordinator")
+        assert C.N.fmt_piece_selection is N.fmt_piece_selection
+
+
+class TestTheDefaultIsVisibleAndOverridable:
+    """An operator must be able to SEE the choice and the excluded straddlers at startup. Run 4 is the
+    price of the opposite: no log line anywhere said 'your trainable universe is five coordinates'."""
+
+    def test_the_startup_line_names_the_pieces_the_count_and_the_excluded_straddler(
+            self, live_shape_shard_dir):
+        txt = N.fmt_piece_selection(_default_args(live_shape_shard_dir))
+        assert "12 piece(s)" in txt
+        assert "DEFAULT (no --pieces/--piece given)" in txt
+        assert "excluded straddler(s) 12" in txt and "ADD layer(s) 2" in txt
+
+    def test_an_explicit_selection_says_so_instead(self, live_shape_shard_dir):
+        assert "explicit --piece 0" in N.fmt_piece_selection(_piece_args(live_shape_shard_dir,
+                                                                         piece=0))
+        assert "explicit --pieces 0-3" in N.fmt_piece_selection(
+            _piece_args(live_shape_shard_dir, pieces="0-3"))
+
+    def test_a_refusal_message_does_not_invent_a_flag_the_operator_never_passed(
+            self, live_shape_shard_dir):
+        """Under the default there is no --piece on the command line, so the error must not tell the
+        reader to fix one. (2,0) is outside the default set here, which is the point of the message."""
+        with pytest.raises(SystemExit, match=r"the DEFAULT resident set"):
+            N.resolve_claim(_default_args(live_shape_shard_dir, expert="2:0"),
+                            N.parse_slots("1:0,1:1"), log=lambda *a: None)
+
+
+class TestTheArgparseWiringActuallyDefaultsToNone:
+    """The resolver can only see 'no flag given' if argparse stops substituting 0. This is the wiring
+    test: without it the whole default is dead code behind an always-present --piece 0."""
+
+    def test_no_piece_flag_parses_to_none_on_both_roles(self, monkeypatch):
+        for var in ("NEURAHASH_GLM_PIECE", "NEURAHASH_GLM_PIECES"):
+            monkeypatch.delenv(var, raising=False)
+        ap = argparse.ArgumentParser()
+        N.add_common_args(ap)
+        args = ap.parse_args([])
+        assert args.piece is None and args.pieces is None
+
+    def test_the_env_var_still_pins_a_single_piece(self, monkeypatch):
+        """NEURAHASH_GLM_PIECE is the same request typed elsewhere, so it counts as EXPLICIT and must
+        keep its old five-coordinate meaning rather than becoming an anchor to widen from."""
+        monkeypatch.delenv("NEURAHASH_GLM_PIECES", raising=False)
+        monkeypatch.setenv("NEURAHASH_GLM_PIECE", "3")
+        ap = argparse.ArgumentParser()
+        N.add_common_args(ap)
+        assert ap.parse_args([]).piece == 3
+
+    def test_an_explicit_piece_on_the_command_line_survives(self, monkeypatch):
+        for var in ("NEURAHASH_GLM_PIECE", "NEURAHASH_GLM_PIECES"):
+            monkeypatch.delenv(var, raising=False)
+        ap = argparse.ArgumentParser()
+        N.add_common_args(ap)
+        assert ap.parse_args(["--piece", "0"]).piece == 0
+
+
+class TestTheDefaultDegradesInsteadOfCrashing:
+    """fmt_piece_selection is printed by BOTH roles at startup, and a broken manifest already has one
+    loud owner (node_claimable_coords -> 'cannot determine this node's claimable coordinates'). Two
+    different crashes for one cause is worse than one, so resolution falls back to the anchor."""
+
+    def test_tiny_mode_keeps_the_single_anchor_piece(self):
+        args = types.SimpleNamespace(mode="tiny", shard_dir=None, config_dir=None,
+                                     piece=None, pieces=None)
+        assert N.node_piece_ids(args) == [N.DEFAULT_ANCHOR_PIECE]
+
+    def test_a_missing_manifest_falls_back_and_says_why(self, tmp_path):
+        args = types.SimpleNamespace(mode="glm", shard_dir=str(tmp_path), config_dir=None,
+                                     piece=None, pieces=None)
+        assert N.node_piece_ids(args) == [0]
+        assert "anchor piece 0 only" in N.fmt_piece_selection(args)
+
+    def test_a_namespace_predating_both_flags_still_means_unchecked(self):
+        """The async lane's dirty-namespace path passes a partial namespace; it cannot express a
+        selection, and [] is what keeps claims UNCHECKED exactly as before."""
+        assert N.node_piece_ids(types.SimpleNamespace(mode="glm", shard_dir="x")) == []
+
+
 class TestClaimableUnionAcrossPieces:
     """The actual unlock: claimable_here must be the UNION of the selected pieces' coordinates."""
 

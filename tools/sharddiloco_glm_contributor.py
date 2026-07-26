@@ -43,12 +43,13 @@ those two default to the public content lane, see add_common_args):
 Usage (tiny shakedown against a LOCAL store, plan step S3 -- loopback joins NOTHING public):
   C:/Python313/python.exe tools/sharddiloco_glm_contributor.py --miner miner0 --slot 0 \
       --key <hex16> --url http://127.0.0.1:8797 --token <tok> --mode tiny --slots 1:0,1:1
-Usage (real GLM, plan step S4). --pieces 0-11 makes 60 layer-1 coordinates claimable at a
-BYTE-IDENTICAL parameter count to --piece 0's five (MEASURED 2026-07-26; a resident layer's fused
-params are allocated full-width either way -- docs/SHARD_CLAIM_DESIGN.md C12). --piece 0 alone caps
-the whole campaign at 5 coordinates, which is what stalled run 4:
+Usage (real GLM, plan step S4). Pass NO piece flag and residency now fills the whole resident layer
+by itself: 60 claimable layer-1 coordinates at a BYTE-IDENTICAL parameter count to the old --piece 0
+five (MEASURED 2026-07-26; a resident layer's fused params are allocated full-width either way --
+docs/SHARD_CLAIM_DESIGN.md C12). --piece 0 still pins residency to 5 coordinates, which is what
+stalled run 4 when it was the default:
   ... --mode glm --shard-dir D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb \
-      --config-dir D:/hf_models/GLM-4.7-Flash-bf16 --pieces 0-11 --slots 1:0,1:1 \
+      --config-dir D:/hf_models/GLM-4.7-Flash-bf16 --slots 1:0,1:1 \
       --data-dir D:/glm_wan --domains code,gutenberg --device cuda --batch 4
 """
 import argparse
@@ -305,6 +306,180 @@ def parse_pieces(spec):
     return sorted(out)
 
 
+# ------------------------------------------------------------ DEFAULT residency: FILL the layer
+# The piece a node falls back to when the operator names none. It used to be the ONLY piece it would
+# load; it is now the ANCHOR whose layer(s) the default residency fills.
+DEFAULT_ANCHOR_PIECE = 0
+
+# (abspath(shard_dir), config_dir, anchor, manifest mtime_ns, manifest size) -> resolved default.
+# claim_all_coords runs the resolution once per plateau check, and the manifest read behind it is not
+# free (603 pieces); the stat in the key keeps the memo honest if the file is rewritten under us.
+_DEFAULT_PIECES_MEMO = {}
+
+
+def piece_layer_map(manifest, config=None):
+    """{expert-piece id -> frozenset of the REAL layer ids it covers}. Pure dict/int work, no torch.
+
+    "Real" means the layers an instantiated Glm4MoeLiteForCausalLM actually builds, i.e. exactly
+    piece_loader.claimable_expert_ids' two filters: layer 0 is a DENSE MLP with no routed experts, and
+    the shard manifest also carries the MTP/nextn layer (L == num_hidden_layers) that the model never
+    instantiates. A piece with NO real layer therefore maps to an EMPTY set -- on the live manifest
+    pieces 589-601 are 100% MTP -- which is what lets the default-residency rule below drop them
+    instead of paying disk for coordinates that can never train. `config=None` disables both filters
+    (every layer in the manifest counts), which is only useful for inspection."""
+    dense = n_layers = None
+    if config is not None:
+        dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
+        n_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    out = {}
+    for rec in manifest.get("pieces", ()) or ():
+        name = str(rec.get("piece", ""))
+        if not name.startswith("experts_"):
+            continue                                  # the trunk piece; always resident, never claimed
+        try:
+            pid = int(name.split("_", 1)[1])
+        except ValueError:
+            continue
+        layers = set()
+        for le in rec.get("experts", ()) or ():
+            L = int(le[0])
+            if config is None or dense <= L < n_layers:
+                layers.add(L)
+        out[pid] = frozenset(layers)
+    return out
+
+
+def default_piece_ids(manifest, config, anchor=DEFAULT_ANCHOR_PIECE):
+    """The pieces a node keeps resident when the operator names NEITHER --pieces nor --piece. Pure.
+
+    Returns (ids, excluded): `ids` is a sorted list that always contains `anchor`; `excluded` is a
+    sorted list of (piece id, [the layers it would ADD]) for the pieces this rule deliberately leaves
+    out, so the startup log can show the choice instead of hiding it.
+
+    THE RULE -- fill the anchor's layer(s), never add one. piece_loader allocates a resident layer's
+    fused expert params FULL WIDTH (all 64 rows) the moment ONE of its pieces loads
+    (piece_loader.py:389-408), so every other piece of that same layer only fills rows that already
+    exist. MEASURED 2026-07-26 on D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb: `--piece 0` = 5
+    coordinates at 2,764,301,056 params / 1.857 GiB resident, and pieces 0-11 = 60 coordinates at a
+    BYTE-IDENTICAL 2,764,301,056 params / 1.859 GiB. Twelve times the trainable universe for +0.002
+    GiB. Crossing a LAYER boundary is a different transaction: piece experts_12 holds (1,60)..(1,63)
+    PLUS (2,0), and that one coordinate materialises a SECOND full-width MoE layer (+603,979,776
+    params = 64 x 3 x 1536 x 2048, +1.126 GiB resident). So a straddler is EXCLUDED here and left to
+    the operator: filling a layer is free, buying one is a spending decision.
+
+    WHY IT IS THE DEFAULT and not just a documented flag (measured, run 4,
+    scratchpad/FINDING_five_coordinate_ceiling.md): a campaign whose nodes all took the single-piece
+    default had a trainable universe of FIVE coordinates, plateaued at held-out CE 6.51103, then ran
+    ~620 events over ~7.5 h with ZERO accepted merges while the miners made 129 PLATEAU -> RELEASE ->
+    CLAIM cycles across the same five. `--pieces` fixes that only for someone who already knows to
+    type it; a stranger joining tomorrow walks into the identical wall.
+
+    A piece that straddles only into the MTP layer is NOT a straddler here (its real layer set is the
+    one real layer), because that layer is never instantiated and so costs nothing.
+
+    ANCHOR THAT IS ITSELF A STRADDLER: its layer set is simply BOTH layers, and the rule is unchanged.
+    That is not a special case but the same economics -- the anchor has already materialised both
+    layers full-width just by loading, so filling both is still free, and refusing to would leave rows
+    of tensors we already paid for permanently untrainable. An anchor with NO real layers at all
+    (live pieces 589-601) yields just [anchor], so resolve_claim's existing "holds NO real experts"
+    error still fires instead of this function inventing a substitute nobody asked for."""
+    layers = piece_layer_map(manifest, config)
+    base = layers.get(int(anchor))
+    if not base:
+        return [int(anchor)], []
+    keep, excluded = [], []
+    for pid in sorted(layers):
+        cov = layers[pid]
+        if not cov:
+            continue                                  # MTP-only piece: real disk cost, zero claimable
+        if cov <= base:
+            keep.append(pid)
+        elif cov & base:
+            excluded.append((pid, sorted(cov - base)))
+    return keep, excluded
+
+
+def _default_pieces_for(args, anchor):
+    """(ids, excluded, layers, why) for the layer-filling default. NEVER raises.
+
+    Both roles print this in their startup log line, and a broken/absent manifest already has exactly
+    one loud owner (node_claimable_coords -> _raise_claim_probe, which fires on the very next call for
+    a real --mode glm run). Two different crashes for one cause is worse than one, so every failure
+    here degrades to the historical single-anchor residency and says so in `why`."""
+    shard_dir = getattr(args, "shard_dir", None)
+    if getattr(args, "mode", None) != "glm" or not shard_dir:
+        return ([int(anchor)], [], None,
+                "anchor piece %d only (no GLM shard manifest in this mode)" % anchor)
+    try:
+        st = os.stat(os.path.join(shard_dir, "model_manifest.json"))
+        key = (os.path.abspath(shard_dir), getattr(args, "config_dir", None), int(anchor),
+               st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _DEFAULT_PIECES_MEMO:
+        return _DEFAULT_PIECES_MEMO[key]
+    try:
+        import piece_loader
+        man = piece_loader.load_manifest(shard_dir, require_files=False)
+        cfg = _resolve_claim_config(args)
+        ids, excluded = default_piece_ids(man, cfg, anchor)
+        layers = sorted(piece_layer_map(man, cfg).get(int(anchor), ()))
+        out = (ids, excluded, layers,
+               "filled layer(s) %s from anchor piece %d"
+               % (",".join(str(L) for L in layers) or "(none real)", anchor))
+    except Exception as ex:                                          # noqa: BLE001
+        out = ([int(anchor)], [], None,
+               "anchor piece %d only (%s: %s)" % (anchor, type(ex).__name__, ex))
+    if key is not None:
+        _DEFAULT_PIECES_MEMO[key] = out
+    return out
+
+
+def resolve_piece_selection(args):
+    """How THIS node's resident piece set was chosen -- the ONE place either role resolves it.
+
+    Returns a dict: `ids` (sorted piece ids), `source` ('--pieces' | '--piece' | 'default' | 'none'),
+    `anchor`, `layers` (the real layers the anchor covers, or None when unknown), `excluded`
+    ([(piece id, [layers it would add])]) and `note` (one line of plain English for the startup log).
+
+    LOCKSTEP. The coordinator imports this module as N and calls the same function, which is the whole
+    reason it lives here: a miner that widened its residency alone would just be told `not hostable
+    here` for every coordinate the coordinator does not hold, and the two roles cannot drift if there
+    is only one implementation.
+
+    PRECEDENCE, deliberately in this order: an explicit --pieces wins, then an explicit --piece
+    (NEURAHASH_GLM_PIECES / NEURAHASH_GLM_PIECE are the same request typed elsewhere and count as
+    explicit), and ONLY when the operator named neither does the layer-filling default apply. So
+    `--piece 0` still means exactly the five coordinates it meant yesterday: the new default can never
+    silently change a launch command that already exists."""
+    spec = getattr(args, "pieces", None)
+    if spec is not None and str(spec).strip() != "":
+        return {"ids": parse_pieces(spec), "source": "--pieces", "anchor": None, "layers": None,
+                "excluded": [], "note": "explicit --pieces %s" % str(spec).strip()}
+    p = getattr(args, "piece", None)
+    if p is not None:
+        return {"ids": [int(p)], "source": "--piece", "anchor": int(p), "layers": None,
+                "excluded": [],
+                "note": "explicit --piece %d -- residency PINNED to that one piece, the "
+                        "layer-filling default is off" % int(p)}
+    if not hasattr(args, "piece") and not hasattr(args, "pieces"):
+        # A namespace predating both flags (the async lane's dirty-namespace test builds one). It
+        # cannot express a selection at all, and [] keeps claims UNCHECKED exactly as they were.
+        return {"ids": [], "source": "none", "anchor": None, "layers": None, "excluded": [],
+                "note": "no piece selection in this namespace"}
+    anchor = DEFAULT_ANCHOR_PIECE
+    ids, excluded, layers, why = _default_pieces_for(args, anchor)
+    note = "DEFAULT (no --pieces/--piece given), " + why
+    if excluded:
+        note += ("; excluded straddler(s) %s because each would ADD layer(s) %s -- a new layer is a "
+                 "full-width MoE slab (measured +1.126 GiB on GLM-4.7-Flash), not a free fill; pass "
+                 "--pieces to buy them"
+                 % (", ".join(str(pid) for pid, _ in excluded),
+                    ", ".join(str(L) for _, ls in excluded for L in ls)))
+    return {"ids": ids, "source": "default", "anchor": anchor, "layers": layers,
+            "excluded": excluded, "note": note}
+
+
 def node_piece_ids(args):
     """The expert pieces THIS node keeps resident -- the single place both roles resolve them.
 
@@ -316,22 +491,36 @@ def node_piece_ids(args):
     piece_loader already allocates a resident layer's fused params FULL WIDTH, so widening residency
     fills rows of tensors that are allocated either way.
 
-    --pieces wins when given; otherwise the DEPRECATED --piece is used exactly as before (same env
-    default, same single-element list), so every existing launch script is byte-for-byte unchanged."""
-    spec = getattr(args, "pieces", None)
-    if spec is not None and str(spec).strip() != "":
-        return parse_pieces(spec)
-    p = getattr(args, "piece", None)
-    return [] if p is None else [int(p)]
+    Selection and precedence live in resolve_piece_selection; this is the ids-only view of it."""
+    return resolve_piece_selection(args)["ids"]
 
 
 def fmt_pieces(args):
     """How this node's piece selection is NAMED in an error message -- the flag the operator actually
-    passed, so the fix they are told to make is the fix that applies to their command line."""
-    spec = getattr(args, "pieces", None)
-    if spec is not None and str(spec).strip() != "":
-        return "--pieces %s" % str(spec).strip()
-    return "--piece %s" % (getattr(args, "piece", None),)
+    passed, so the fix they are told to make is the fix that applies to their command line. When they
+    passed NOTHING, say that: telling a stranger to "fix --piece 0" when their command line contains
+    no --piece at all sends them hunting for something that is not there."""
+    sel = resolve_piece_selection(args)
+    if sel["source"] == "--pieces":
+        return "--pieces %s" % str(getattr(args, "pieces", None)).strip()
+    if sel["source"] == "--piece":
+        return "--piece %s" % (getattr(args, "piece", None),)
+    if sel["source"] == "none":
+        return "(no piece selection)"
+    return ("the DEFAULT resident set (%d piece(s): %s; no --pieces/--piece given)"
+            % (len(sel["ids"]), fmt_coord_pieces(sel["ids"]) or "(none)"))
+
+
+def fmt_piece_selection(args):
+    """The startup-log description of the resident piece set: WHAT was chosen and WHY, one line, on
+    BOTH roles.
+
+    An operator who disagrees with the default has to be able to see it and override it without
+    reading the source. Run 4 is the cost of the opposite: nothing in any log said "your trainable
+    universe is five coordinates" until a 7.5 h post-mortem went looking."""
+    sel = resolve_piece_selection(args)
+    return "%s (%d piece(s), %s)" % (fmt_coord_pieces(sel["ids"]) or "(none)",
+                                     len(sel["ids"]), sel["note"])
 
 
 def fmt_coord_pieces(piece_ids, limit=8):
@@ -965,20 +1154,31 @@ def add_common_args(ap):
     ap.add_argument("--config-dir", default=os.environ.get(
         "NEURAHASH_GLM_CONFIG_DIR", "D:/hf_models/GLM-4.7-Flash-bf16"),
         help="dir holding the model config.json, i.e. <fetch --dest>/config (mode=glm)")
-    # --pieces (plural) is the one that widens the CLAIMABLE universe; --piece is kept working
-    # verbatim so no existing launch script changes behaviour. See node_piece_ids for the measurement
-    # that motivated it (one piece == 5 coordinates == a campaign that ran out of work).
+    # Residency now defaults to FULL-LAYER (see default_piece_ids): giving NEITHER flag fills every
+    # piece whose experts lie entirely inside the layer(s) anchor piece 0 already makes resident, and
+    # excludes straddlers. Both flags still override it, so no existing launch script changes.
     ap.add_argument("--pieces", default=os.environ.get("NEURAHASH_GLM_PIECES") or None,
                     help="expert piece ids to keep resident: a single id, a comma list, or an "
-                         "INCLUSIVE range -- '0-12' makes all 64 experts of layer 1 claimable "
-                         "(one piece is only 5 coordinates). ALL selected experts stay resident on "
-                         "every node so contributor and coordinator route identically (plan risk 5); "
-                         "only the CLAIMED coordinate trains, so optimizer state does not scale. "
-                         "Overrides --piece when both are given. Env: NEURAHASH_GLM_PIECES.")
-    ap.add_argument("--piece", type=int, default=int(os.environ.get("NEURAHASH_GLM_PIECE", "0")),
-                    help="DEPRECATED single expert piece id, kept so existing scripts keep working "
-                         "unchanged. Prefer --pieces: one piece holds only 5 (layer, expert) "
-                         "coordinates, which is what capped the whole campaign at 5.")
+                         "INCLUSIVE range ('0-12'). DEFAULT WHEN NEITHER --pieces NOR --piece IS "
+                         "GIVEN: every piece whose experts lie ENTIRELY within the layer(s) anchor "
+                         "piece 0 already makes resident -- on the live GLM manifest that is pieces "
+                         "0-11 = 60 claimable coordinates at a BYTE-IDENTICAL parameter count to one "
+                         "piece's 5 (measured 2026-07-26: 2,764,301,056 params and ~1.86 GiB either "
+                         "way), because piece_loader allocates a resident layer's fused expert params "
+                         "FULL WIDTH regardless. Pieces that would pull in a NEW layer (straddlers: "
+                         "experts_12 holds (1,60)..(1,63) PLUS (2,0), a second full-width MoE slab at "
+                         "+1.126 GiB) are EXCLUDED from that default and named in the startup log -- "
+                         "filling a layer is free, buying one is a spending decision, so name them "
+                         "here to buy them. ALL selected experts stay resident on every node so "
+                         "contributor and coordinator route identically (plan risk 5); only the "
+                         "CLAIMED coordinate trains, so optimizer state does not scale. Overrides "
+                         "--piece when both are given. Env: NEURAHASH_GLM_PIECES.")
+    ap.add_argument("--piece", type=int, default=os.environ.get("NEURAHASH_GLM_PIECE") or None,
+                    help="DEPRECATED single expert piece id. Passing it PINS residency to that ONE "
+                         "piece (5 coordinates on the live manifest) and turns the layer-filling "
+                         "default OFF -- kept exactly so an existing launch script keeps its "
+                         "behaviour byte-for-byte. Unset, piece 0 is the ANCHOR the default fills "
+                         "around. Env: NEURAHASH_GLM_PIECE.")
     ap.add_argument("--device", default=os.environ.get("NEURAHASH_GLM_DEVICE", "cpu"),
                     help="torch device. REAL MINING NEEDS --device cuda; the 'cpu' default keeps "
                          "the test suite (and a --help on any box) off the GPU.")
@@ -1302,8 +1502,7 @@ def build_node_model(args, log=None, need_gib=None):
     check_residency(summ.get("n_resident_experts"), node_claimable_coords(args), piece_ids)
     model.eval()
     if log:
-        log("[glm-node] GLM piece(s) %s (%d) resident: %s"
-            % (fmt_coord_pieces(piece_ids), len(piece_ids), summ))
+        log("[glm-node] GLM pieces_here=%s resident: %s" % (fmt_piece_selection(args), summ))
     seq = _infer_seq(args)                      # from a split THIS role holds (never the secret one)
     return model, model.config, seq
 

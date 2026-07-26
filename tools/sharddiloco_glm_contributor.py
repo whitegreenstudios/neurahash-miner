@@ -2987,8 +2987,15 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                     model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
                     batch=args.batch, seed=rounds_done * 100 + i, sel_outer=args.outer)   # F5 select@gate
                 delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
-                steps = int(args.inner)                              # H inner steps executed
+                # Steps ACTUALLY taken, not the H we asked for: a step whose batch routed no token to
+                # our expert has no gradient and is skipped (sharddiloco_glm_expert.py). Publishing H
+                # regardless would inflate token_quality_weight(steps, tokens) -- pay for work not done.
+                steps = int(c.get("steps_trained", args.inner))
                 tokens = int(c.get("n_examples", 0)) * int(seq)      # rows*seq actually consumed
+                if int(c.get("steps_skipped", 0)):
+                    log("[glm-contrib %s] (L%d,E%d): %d of %d inner step(s) routed NO token to this "
+                        "expert and were skipped (no gradient exists for them); trained %d."
+                        % (miner, L, E, int(c["steps_skipped"]), int(args.inner), steps))
                 payload = c["lora"] if (args.wire == "lora" and c.get("lora")) else delta
         except Exception as _oom:                                    # noqa: BLE001
             if not _is_cuda_oom(_oom):

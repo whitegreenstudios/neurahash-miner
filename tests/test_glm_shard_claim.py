@@ -3759,3 +3759,250 @@ class TestRetryableRecordsStillMergeThroughTheLoop:
         assert not [ln for ln in logs if "LINEAGE-DROP" in ln and "later" in ln], \
             "\n".join([ln for ln in logs if "LINEAGE-DROP" in ln][:4])
         assert _goodput(logs)["lineage_dead_pregate"] == 0
+
+
+# ==================================================================================================
+# F8 (CRITICAL, 2026-07-26): the ADVANCE killed the miner. Live 4060, processes p61 and p62, both
+# rc=1 -- three published rounds on (L1,E45), PLATEAU -> RELEASE -> CLAIM the next coordinate, then
+#   File "tools/sharddiloco_glm_expert.py", line 680, in train_glm_expert_contribution
+#     out.loss.backward()
+#   RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+#
+# MECHANISM (measured, not assumed). LoRAExperts.forward injects the per-expert LoRA only for experts
+# that appear in this batch's `top_k_index`, and the trunk is frozen, so if the claimed expert gets no
+# token the loss depends on NOTHING that requires grad and backward() refuses it. The 4060 runs
+# --batch 4 x seq 32 = 128 token positions x top-4 of 64 experts = ~512 draws over the 60 experts its
+# pieces make routable, so a below-average expert missing an entire step is routine -- and the advance
+# is what lands a miner on a fresh, routing-BLIND coordinate (next_claim_coord walks a wallet-hash
+# permutation). It is NOT the inert-row trap: the coordinate the 4060 advanced to is (L1,E23)
+# (next_claim_coord over its 60 claimable coords for wallet 0x6217c0CB...), and a later process on the
+# same box trained and published that exact coordinate four times (coordinator events 48-53).
+# ==================================================================================================
+class _MiniLane:
+    """The ContentLane surface `_run_async` calls, in-process, plus a SCRIPTED coordinator: every
+    contribution the miner publishes is answered, at the next event, with an accepted record that
+    ADVERTISES the miner's coordinate and does not accept its delta. That is a gate rejection -- the
+    exact input `reject_streak` counts -- so `--advance-after` fires for real instead of being poked.
+
+    Deliberately not tests/test_sd_async_lane._InProcStore: that module imports the coordinator, and
+    this file must stay runnable from a contributor-only (public miner) checkout."""
+
+    def __init__(self, host):
+        import hashlib
+        import neurahash.diloco_merge as dm
+        self._sha, self._dm, self._host = hashlib, dm, host
+        self._blobs, self._names, self._n = {}, {}, 0
+        self.event, self.published = 0, []
+        self._pointer(N.model_root(host))
+
+    def _put(self, obj):
+        body = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+        cid = self._sha.sha256(body).hexdigest()
+        self._blobs[cid] = body
+        return cid
+
+    def _pointer(self, root):
+        rounds = {"%d_%d" % (L, E): 0 for (L, E) in self._host.slots}
+        self._names[N.GLM_POINTER_NAME] = self._put(
+            self._dm.sd_pointer_encode(self.event, rounds, root, False))
+
+    # -- ContentLane surface -----------------------------------------------------------------
+    def read_pointer(self):
+        return self.get_json(self._names[N.GLM_POINTER_NAME])
+
+    def manifest(self):
+        return {n: {"sha256": c} for n, c in self._names.items()}
+
+    def get_json(self, cid):
+        return json.loads(self._blobs[cid].decode())
+
+    def get_delta(self, cid):
+        raise AssertionError("no accepted record in this scenario carries a delta to fold")
+
+    def put_delta(self, payload, name=None):
+        self._n += 1
+        return "cid%032d" % self._n
+
+    def put_json_named(self, name, obj):
+        cid = self._put(obj)
+        self._names[name] = cid
+        if "glm_expert" in obj:                       # a contribution -> the coordinator rejects it
+            self.published.append(obj)
+            self.event += 1
+            key = "%d_%d" % (int(obj["layer"]), int(obj["glm_expert"]))
+            self._names[N.accepted_name(self.event)] = self._put(
+                {"event": self.event, "accepted": [], "slot_roots": {key: obj["base_slot_root"]},
+                 "model_root": obj["base_root"]})
+            self._pointer(obj["base_root"])
+        return cid
+
+
+def _starve_training_steps(model, layer, expert, state):
+    """Make the next `state[n]` TRAINING forwards route NOTHING to `expert`, by pinning its router
+    bias to -inf for the duration of each of those forwards (eval forwards are left alone). A faithful
+    stand-in for a cold expert on a small batch, and TRANSIENT by construction, so the upfront -inf
+    refusal cannot mask the defect under test. Returns the two hook handles.
+
+    Hooked on the MoE block, not on `gate`: Glm4MoeLiteTopkRouter.forward only produces the router
+    logits, and `e_score_correction_bias` is read one level up in Glm4MoeLiteMoE.route_tokens_to_experts
+    -- a gate-level post-hook restores the bias before the selection that reads it, and silently does
+    nothing at all."""
+    import torch
+    moe = model.model.layers[layer].mlp
+    gate = moe.gate
+    orig = float(gate.e_score_correction_bias[expert])
+
+    def _pre(mod, args):
+        if state.get("armed") and mod.training and state["n"] > 0:
+            state["n"] -= 1
+            state["starved"] += 1
+            with torch.no_grad():
+                gate.e_score_correction_bias[expert] = float("-inf")
+            state["on"] = True
+
+    def _post(mod, args, out):
+        if state.pop("on", False):
+            with torch.no_grad():
+                gate.e_score_correction_bias[expert] = orig
+        return out
+
+    return moe.register_forward_pre_hook(_pre), moe.register_forward_hook(_post)
+
+
+@pytest.fixture(scope="module")
+def advance_model():
+    """A tiny GLM used ONLY by the advance tests, so a folded delta or a half-trained LoRA from any
+    other test in this file cannot change what the router does here."""
+    import torch
+    torch.set_num_threads(2)
+    G = N._G()
+    T = N.TINY
+    model, cfg = G.build_tiny_glm(seed=T["seed"], vocab=T["vocab"], hidden=T["hidden"],
+                                  inter=T["inter"], moe_inter=T["moe_inter"], layers=T["layers"],
+                                  n_experts=T["n_experts"], topk=T["topk"])
+    return G, model, cfg
+
+
+class TestF8AdvanceOntoAColdCoordinate:
+    """The miner must SURVIVE a training step whose batch routed nothing to the coordinate it just
+    claimed, and it must refuse -- loudly, by coordinate -- a coordinate it could never train."""
+
+    MINER = "advancer"
+    INNER = 3
+    BATCH = 4
+
+    @pytest.fixture(autouse=True)
+    def _quiet(self, monkeypatch):
+        monkeypatch.setattr(N, "_maybe_self_update", lambda log: None)
+        monkeypatch.delenv("NEURAHASH_GLM_DATA_RESYNC", raising=False)
+
+    def _drive(self, advance_model, starve_steps):
+        """One full run: train+publish on (1,0) -> plateau -> claim the next coordinate -> train it,
+        with the first `starve_steps` training step(s) on the NEW coordinate routed away from it."""
+        G, model, cfg = advance_model
+        coords = [(1, 0), (1, 1), (1, 2), (1, 3)]
+        host = G.GlmExpertLaneHost(model, cfg, list(coords), claimable=list(coords))
+        args = types.SimpleNamespace(
+            mode="tiny", max_rounds=2, poll=0.0, round_wait=1e9, advance_after=1, garbage=False,
+            inner=self.INNER, lora_r=4, lr=1e-3, batch=self.BATCH, outer=0.7, wire="lora",
+            data_dir=".")
+        lane = _MiniLane(host)
+        nxt = N.next_claim_coord(list(host.slots), (1, 0), identity=self.MINER)
+        assert nxt is not None and tuple(nxt) != (1, 0)
+        state = {"armed": False, "n": starve_steps, "starved": 0}
+        logs = []
+
+        def log(*a):
+            line = " ".join(str(x) for x in a)
+            logs.append(line)
+            if "PLATEAU" in line:
+                state["armed"] = True                 # starve only the freshly claimed coordinate
+
+        h1, h2 = _starve_training_steps(model, nxt[0], nxt[1], state)
+        try:
+            rc = N._run_async(args, lane, host, model, cfg, G, b"k" * 16, 0, 1, 0, self.MINER,
+                              N.tiny_ids("train", slot=0)[:64], N.tiny_ids("val", slot=0)[:8],
+                              N.TINY["seq"], log)
+        finally:
+            h1.remove()
+            h2.remove()
+        return rc, lane, logs, state, tuple(nxt), host
+
+    def test_a_step_that_routes_nothing_to_the_new_coordinate_does_not_kill_the_miner(
+            self, advance_model):
+        """RED before the fix: RuntimeError('element 0 of tensors does not require grad and does not
+        have a grad_fn') escapes _run_async and the process dies rc=1, exactly as the live 4060 did."""
+        rc, lane, logs, state, nxt, _host = self._drive(advance_model, starve_steps=1)
+        assert state["starved"] == 1, "the scenario never starved a step -- it would prove nothing"
+        assert rc == 0, "\n".join(logs[-8:])
+        assert len(lane.published) == 2, [p.get("glm_expert") for p in lane.published]
+        second = lane.published[1]
+        assert (second["layer"], second["glm_expert"]) == nxt, "round 2 is on the CLAIMED coordinate"
+        assert second["steps"] == self.INNER - 1, \
+            "the published step count must exclude the step that had no gradient to apply"
+        assert second["tokens"] == (self.INNER - 1) * self.BATCH * N.TINY["seq"], \
+            "tokens must exclude the skipped step too -- reward is weighted by steps AND tokens"
+        assert [ln for ln in logs if "routed NO token" in ln], "the skip has to be visible in the log"
+
+    def test_the_advance_really_happened(self, advance_model):
+        """Guard on the SCENARIO: without a real plateau -> release -> claim there is no regression
+        test here at all, only a training-loop unit test wearing its name."""
+        _rc, _lane, logs, _state, nxt, host = self._drive(advance_model, starve_steps=1)
+        plateau = [ln for ln in logs if "PLATEAU on (L1,E0)" in ln]
+        assert plateau and ("CLAIM (L%d,E%d)" % nxt) in plateau[0], logs[:6]
+        assert host.index_of(*nxt) is not None, "the claimed coordinate has to be registered"
+
+    def test_a_coordinate_that_can_never_route_is_refused_by_name_not_in_backward(self,
+                                                                                  advance_model):
+        """The inert-row trap (piece_loader pins a NON-resident row's router bias to -inf). A miner
+        must refuse the round and say WHICH coordinate, instead of dying inside autograd."""
+        import torch
+        G, model, cfg = advance_model
+        gate = model.model.layers[1].mlp.gate
+        keep = float(gate.e_score_correction_bias[2])
+        with torch.no_grad():
+            gate.e_score_correction_bias[2] = float("-inf")
+        try:
+            with pytest.raises(G.UnroutableExpert) as ei:
+                G.train_glm_expert_contribution(model, cfg, 1, 2, N.tiny_ids("train", slot=0)[:32],
+                                                N.tiny_ids("val", slot=0)[:8], H=2, r=4, lr=1e-3,
+                                                batch=4)
+        finally:
+            with torch.no_grad():
+                gate.e_score_correction_bias[2] = keep
+        assert "(L1,E2)" in str(ei.value) and "INERT" in str(ei.value)
+
+    def test_the_optimizer_holds_exactly_the_trainable_parameters(self, advance_model):
+        """The invariant the crash violated in effect: after ANY claim the parameters the optimizer
+        steps are exactly the ones requiring grad, and there is at least one. Asserted on the REAL
+        wrap the trainer builds, then re-asserted through a whole contribution."""
+        G, model, cfg = advance_model
+        was = [(p, p.requires_grad) for p in model.parameters()]
+        LoRAExperts = G._lora_experts_cls()
+        layer = model.model.layers[1]
+        base = layer.mlp.experts
+        try:
+            for p in model.parameters():
+                p.requires_grad_(False)
+            le = LoRAExperts(base, {3: 0}, r=4, alpha=8)
+            layer.mlp.experts = le
+            mine = list(le.params_for(0))
+            live = [p for p in model.parameters() if p.requires_grad]
+            assert mine, "a claim with nothing trainable cannot produce a gradient"
+            assert {id(p) for p in live} == {id(p) for p in mine}, \
+                "the optimizer would step parameters the loss does not reach (or miss ones it does)"
+        finally:
+            layer.mlp.experts = base
+            for p, flag in was:
+                p.requires_grad_(flag)
+        out = G.train_glm_expert_contribution(model, cfg, 1, 3, N.tiny_ids("train", slot=0)[:32],
+                                              N.tiny_ids("val", slot=0)[:8], H=2, r=4, lr=1e-3,
+                                              batch=4)
+        assert (out["steps_trained"], out["steps_skipped"]) == (2, 0)
+
+    def test_the_defensive_unwrap_can_actually_recognise_a_leaked_wrapper(self, advance_model):
+        """_lora_experts_cls used to mint a NEW class object per call, so the documented unwrap
+        (`while isinstance(base, LoRAExperts)`) could never match a wrapper left by an EARLIER call --
+        i.e. by any leak that could really happen (memory v332-oom-death-and-resume-verdict)."""
+        G = advance_model[0]
+        assert G._lora_experts_cls() is G._lora_experts_cls()

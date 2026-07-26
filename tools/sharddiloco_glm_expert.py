@@ -71,7 +71,22 @@ from diloco_contributor import ShardDeltaLane  # noqa: E402
 # Faithful copies from D:/glm_loader/repo/tools/expert_shard_train.py (see module docstring). Only
 # reformatted imports; the math/semantics are unchanged so the canonical delta is identical to what
 # the built GLM worker uploads.
+_LORA_EXPERTS_CLS = None                 # memo -- see _lora_experts_cls
+
+
 def _lora_experts_cls():
+    """The LoRAExperts class, built once and MEMOIZED.
+
+    The memo is not a micro-optimisation, it is a correctness fix (2026-07-26). This used to define a
+    FRESH class object on every call, so `isinstance(x, _lora_experts_cls())` was False for a wrapper
+    built by any EARLIER call -- which is every wrapper that could actually have leaked. The
+    "defensive UNWRAP" in train_glm_expert_contribution, whose whole job is to recognise a leaked
+    wrapper from a previous round, therefore never fired against a real leak; only against a wrapper
+    made by the same call, which cannot exist. One stable class object makes that guard real.
+    Monkeypatching still works: tests replace the module attribute, not the memo."""
+    global _LORA_EXPERTS_CLS
+    if _LORA_EXPERTS_CLS is not None:
+        return _LORA_EXPERTS_CLS
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -144,7 +159,32 @@ def _lora_experts_cls():
                 final.index_add_(0, tok, dh.to(final.dtype))
             return final
 
+    _LORA_EXPERTS_CLS = LoRAExperts
     return LoRAExperts
+
+
+class UnroutableExpert(RuntimeError):
+    """This node cannot train coordinate (L,E): the router never sends it a token, so the LoRA
+    parameters are not in the loss graph and there is nothing to differentiate.
+
+    Raised INSTEAD of letting autograd die with "element 0 of tensors does not require grad and does
+    not have a grad_fn" -- an error that names neither the coordinate nor the cause and killed a live
+    4060 miner twice on 2026-07-26 (processes p61/p62, rc=1)."""
+
+
+def expert_is_routable(model, L, E):
+    """Can the router EVER select expert (L,E) on this node? Reads the router bias only -- no forward.
+
+    piece_loader allocates a resident layer's fused params FULL WIDTH and pins the router bias of every
+    NON-resident row to -inf (tools/piece_loader.py:403-408), so such a row is writable, reads back as
+    zeros, and is silently INERT. Training it produces a loss with no grad_fn. `True` when the model does
+    not expose a router bias at all (tiny stubs, other architectures): unknown is not a refusal."""
+    try:
+        bias = model.model.layers[int(L)].mlp.gate.e_score_correction_bias
+        v = float(bias[int(E)])
+    except Exception:                                    # noqa: BLE001 -- no router bias here; unknown
+        return True
+    return v == v and v != float("-inf")                 # NaN or -inf -> never selected
 
 
 def _materialize_canonical(le, E):
@@ -605,7 +645,10 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     only that LoRA for up to H inner steps on the node's train shard, SAVE-BEST on the node's PUBLIC val
     (memory moe-capability-gain: LR small, fp32, save-best), then materialize the canonical {gate,up,down}
     weight delta = scale*(B@A). The base fused weights are FROZEN and untouched, so the delta is purely
-    the contribution. Returns {delta (numpy float32), train_flops, n_examples, best_val_ce}.
+    the contribution. Returns {delta (numpy float32), train_flops, n_examples, best_val_ce,
+    steps_trained, steps_skipped} -- `steps_skipped` counts inner steps whose batch routed NO token to
+    (L,E), which have no gradient and are skipped rather than crashing (see the loop below). Raises
+    UnroutableExpert when the coordinate can never be trained here at all.
 
     F5 -- PREDICTABLE ACCEPTANCE. The coordinator GATES + MERGES the uploaded adapter at LoRA strength
     `outer` (base += outer*delta; default 0.7), but this SAVE-BEST selection used to evaluate at the
@@ -635,10 +678,38 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     while isinstance(base, LoRAExperts):
         base = base.base
         layer.mlp.experts = base
+    # REFUSE A ROUND WE CANNOT POSSIBLY TRAIN. A non-resident row of a resident layer has its router
+    # bias pinned to -inf, so expert E is never in `hit` inside LoRAExperts.forward, its LoRA never
+    # enters the graph, and `out.loss` comes back with no grad_fn. Saying so HERE names the coordinate;
+    # finding out in backward() does not (see UnroutableExpert).
+    if not expert_is_routable(model, L, E):
+        raise UnroutableExpert(
+            "coordinate (L%d,E%d) is INERT on this node: its router bias is -inf, so no token can ever "
+            "be routed to it and its LoRA can never appear in the loss graph. This row is allocated but "
+            "NOT resident (piece_loader pins non-resident rows to -inf) -- claim a coordinate this "
+            "node's pieces actually cover." % (int(L), int(E)))
     le = LoRAExperts(base, {E: 0}, r=r, alpha=alpha)
     layer.mlp.experts = le
     le.enabled_nodes = {0}
     opt = torch.optim.AdamW(le.params_for(0), lr=lr)
+    # THE OPTIMIZER HOLDS EXACTLY THE TRAINABLE PARAMETERS, AND THERE IS AT LEAST ONE. The freeze loop
+    # above plus this wrap is the only thing that makes that true; a leaked wrapper, a re-claim that
+    # rebuilt the LoRA, or a future edit that moves the freeze after the wrap would all break it
+    # silently and only surface as an autograd error 60 steps later. Checked on real nn.Modules only --
+    # the wrap-leak tests drive this kernel with a deliberately minimal stub model.
+    if not torch.is_grad_enabled():
+        raise RuntimeError(
+            "train_glm_expert_contribution called with autograd GLOBALLY DISABLED (inside no_grad/"
+            "inference_mode): every loss would come back without a grad_fn and no step could train.")
+    if isinstance(model, torch.nn.Module):
+        _mine = list(le.params_for(0))
+        _live = {id(p) for p in model.parameters() if p.requires_grad}
+        if not _mine or _live != {id(p) for p in _mine}:
+            raise RuntimeError(
+                "trainable-parameter mismatch for (L%d,E%d): the optimizer holds %d LoRA parameter(s) "
+                "but the model reports %d parameter(s) with requires_grad -- refusing to start a round "
+                "whose gradients would not reach the claimed expert."
+                % (int(L), int(E), len(_mine), len(_live)))
 
     def _snap():
         return {n: getattr(le, n)[str(E)].detach().clone() for n in ("A_gu", "B_gu", "A_d", "B_d")}
@@ -669,6 +740,7 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     # the layer still wrapped; the next round re-entered here, read the leaked wrapper as `base`, and
     # died on `base.hidden_dim`. The miner never came back. So every recoverable training error --
     # OOM, NaN, a bad batch -- turned the recovery path into a permanent kill.
+    trained = skipped = 0
     try:
         best_val, best_snap = _sel_val(), _snap()
         for step in range(1, H + 1):
@@ -676,9 +748,22 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
             ids = torch.as_tensor(train_ids[idx]).to(next(model.parameters()).device)
             model.train()
             out = model(input_ids=ids, labels=ids)
+            # A STEP WHOSE BATCH ROUTED NOTHING TO OUR EXPERT IS A NO-OP, NOT A CRASH.
+            # LoRAExperts.forward only injects the LoRA for experts that appear in `top_k_index`, so if
+            # none of this batch's tokens picked expert E the loss does not depend on a single trainable
+            # tensor and backward() raises "element 0 of tensors does not require grad and does not have
+            # a grad_fn" -- which killed the live 4060 miner (rc=1) on the first round after a plateau
+            # advance, twice, on 2026-07-26. It is not exotic: that miner runs --batch 4 x seq 32 = 128
+            # token positions x top-4 of 64 experts, i.e. ~512 draws over the 60 experts its pieces make
+            # routable, so a below-average expert missing a whole step is routine. Skip the step (no
+            # gradient exists to apply, and no FLOPs are claimed for it) and take the next batch.
+            if isinstance(out.loss, torch.Tensor) and not out.loss.requires_grad:
+                skipped += 1
+                continue
             opt.zero_grad()
             out.loss.backward()
             opt.step()
+            trained += 1
             n_ex += len(ids)
             if meter is not None:
                 meter.add_train(len(ids))
@@ -686,6 +771,14 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
                 v = _sel_val()
                 if v < best_val:
                     best_val, best_snap = v, _snap()
+        if H > 0 and trained == 0:
+            # Routable in principle (the -inf precheck passed) but not once in H batches. Publishing a
+            # zero delta here would be a lie the gate can only reject; say what happened instead.
+            raise UnroutableExpert(
+                "coordinate (L%d,E%d) received NO routed token in any of the %d inner step(s): every "
+                "batch produced a loss with no gradient path to its LoRA, so nothing could be trained. "
+                "The expert is resident but the router does not use it on this data shard."
+                % (int(L), int(E), int(H)))
         _restore(best_snap)
         delta = _materialize_canonical(le, E)
     finally:
@@ -693,8 +786,12 @@ def train_glm_expert_contribution(model, cfg, L, E, train_ids, val_ids, *, H=120
     train_flops = 3.0 * fwd * n_ex               # forward + backward (D3 convention)
     # `lora` is the SAME contribution as `delta`, 68x smaller: delta == materialize_from_lora(lora).
     # Returned alongside rather than instead so callers choose the wire without changing this kernel.
+    # `steps_trained`/`steps_skipped` are ADDITIVE: a caller that ignores them behaves as before, but the
+    # publisher can report the steps it actually took instead of the H it asked for (the coordinator
+    # weights reward by token_quality_weight(steps, tokens), so an inflated step count is unearned pay).
     return {"delta": delta, "lora": lora_factors_payload(le, E),
-            "train_flops": train_flops, "n_examples": n_ex, "best_val_ce": best_val}
+            "train_flops": train_flops, "n_examples": n_ex, "best_val_ce": best_val,
+            "steps_trained": trained, "steps_skipped": skipped}
 
 
 def garbage_delta(shape_ref, scale=3.0, seed=123):

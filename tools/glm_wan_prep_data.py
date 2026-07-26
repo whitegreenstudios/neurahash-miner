@@ -63,7 +63,24 @@ def _splits_with_train(train_rows):
 COORD_ONLY = frozenset({"probe", "heldout"})
 
 
-SPLIT_BUCKETS = 8192            # hash granularity; only affects how evenly documents distribute
+# Hash granularity for content-addressed split assignment. Only affects how EVENLY documents
+# distribute, never which split a given document lands in relative to the others -- but the
+# granularity is a hard floor on how small a split's share can be.
+#
+# Raised from 8192 to 2**20 on 2026-07-25. At 8192 buckets a ~205M-token corpus needs
+# --train-rows ~6.2M, and train's share then rounds up to the point where `val` is allocated ZERO
+# buckets, so prep dies with "split val: only 0 rows ... need 512". That is structural, not bad luck:
+# once train consumes nearly the whole corpus, val's share falls below one bucket. A finer grid lets
+# small splits keep a nonzero share at large train sizes.
+#
+# This does NOT move the goal metric: probe and heldout are read back from disk when they already
+# exist (freeze_coord, the [FROZEN: kept, not re-cut] path), so their contents are independent of the
+# bucket grid. Verify their sha256 after any prep regardless -- trust the artifact, not the argument.
+SPLIT_BUCKETS = 1 << 20         # 1,048,576
+
+# Documents per tokenizer call. Bounds peak RAM during prep -- see the chunking comment in carve().
+# 2000 docs of ~1.3 KB is a few MB of text per call, which the fast tokenizer handles comfortably.
+TOK_DOC_BATCH = 2000
 
 
 def split_of_document(doc, splits=SPLITS, buckets=SPLIT_BUCKETS):
@@ -132,7 +149,31 @@ def build_domain(tok, text, seq, miner_dir, coord_dir, domain, vocab_size, split
             used += int(part.shape[0])
             continue
         mine = by_split.get(name, [])
-        ids = tok("\n".join(mine), add_special_tokens=False)["input_ids"] if mine else []
+        # CHUNKED tokenization, and STOP once we have enough.
+        #
+        # The single-shot form -- tok("\n".join(mine)) -- died with
+        # "memory allocation of 9126805520 bytes failed" on a 1 GB corpus, on a box with 45 GB free.
+        # Three costs stack in that one line: a ~700 MB joined string, a Python list of ~143M int
+        # objects (~28 bytes each), and then a numpy copy of the same data. Peak far exceeds the 9.1 GB
+        # the allocator happened to ask for last.
+        #
+        # Only `n * seq` tokens are ever USED (see the slice below), and that was already true of the
+        # old code, so tokenizing the whole corpus was pure waste. Chunking + early exit bounds memory
+        # to one batch and makes prep time proportional to what is needed rather than to corpus size.
+        #
+        # Boundary note: batches are joined separately, so the few tokens at each batch seam differ
+        # from a single-shot tokenization. Harmless -- train/val are regenerated artifacts, not frozen
+        # ones, and probe/heldout never reach this path when freeze_coord is on (see above).
+        need = n * seq
+        chunks, have_tok = [], 0
+        for b0 in range(0, len(mine), TOK_DOC_BATCH):
+            batch = mine[b0:b0 + TOK_DOC_BATCH]
+            bids = tok("\n".join(batch), add_special_tokens=False)["input_ids"]
+            chunks.append(np.asarray(bids, dtype=np.int64))
+            have_tok += len(bids)
+            if have_tok >= need:
+                break
+        ids = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int64)
         have = len(ids) // seq
         if have < n:
             raise SystemExit(
@@ -202,7 +243,9 @@ def main():
     ap.add_argument("--domains", default="code,gutenberg", help="comma-separated corpus basenames")
     ap.add_argument("--seq", type=int, default=32)
     ap.add_argument("--max-chars", type=int, default=6_000_000,
-                    help="chars read per domain (bounds tokenizer time; 6M >> the ~800KB needed)")
+                    help="chars read per domain (bounds tokenizer time). NOTE: this SILENTLY TRUNCATES "
+                         "-- a 1 GB corpus with the 6M default reads only its first 6 MB and the run "
+                         "looks successful. Raise it past the corpus size for any large prep.")
     ap.add_argument("--refresh-coord-splits", dest="refresh_coord", action="store_true",
                     help="RE-CUT the frozen probe/heldout pools. This moves the goal metric's "
                          "yardstick, so held-out CE before and after are NOT comparable -- use it "

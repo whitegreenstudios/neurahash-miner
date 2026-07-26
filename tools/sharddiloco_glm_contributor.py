@@ -29,12 +29,26 @@ This module also holds the SHARED node helpers (lane names, deterministic tiny-G
 data, fingerprints) that tools/sharddiloco_glm_coordinator.py imports -- one definition, so the two
 roles cannot drift apart.
 
-Usage (tiny shakedown, plan step S3):
+Usage (JOIN the public lane -- what a STRANGER runs; no key, no signup, and no --url/--token:
+those two default to the public content lane, see add_common_args):
+  1. fetch the GLM base ONCE (tokenless, per-piece sha256-verified; --config-cid /
+     NEURAHASH_GLM_CONFIG_CID is required or the loader fails after the download):
+       C:/Python313/python.exe tools/fetch_glm_base.py --dest D:/hf_models/glm_base --pieces 0 \
+           --config-cid <published config sha256>
+  2. mine. --mode glm and --device cuda are REQUIRED for real training: the tiny/cpu defaults are
+     the hermetic-test path, NOT mining. An EMPTY --data-dir self-fills from the advertised corpus:
+       C:/Python313/python.exe tools/sharddiloco_glm_contributor.py --mode glm --device cuda \
+           --shard-dir D:/hf_models/glm_base --config-dir D:/hf_models/glm_base/config \
+           --data-dir D:/glm_wan/miner --domains daily
+Usage (tiny shakedown against a LOCAL store, plan step S3 -- loopback joins NOTHING public):
   C:/Python313/python.exe tools/sharddiloco_glm_contributor.py --miner miner0 --slot 0 \
       --key <hex16> --url http://127.0.0.1:8797 --token <tok> --mode tiny --slots 1:0,1:1
-Usage (real GLM, plan step S4):
+Usage (real GLM, plan step S4). --pieces 0-11 makes 60 layer-1 coordinates claimable at a
+BYTE-IDENTICAL parameter count to --piece 0's five (MEASURED 2026-07-26; a resident layer's fused
+params are allocated full-width either way -- docs/SHARD_CLAIM_DESIGN.md C12). --piece 0 alone caps
+the whole campaign at 5 coordinates, which is what stalled run 4:
   ... --mode glm --shard-dir D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb \
-      --config-dir D:/hf_models/GLM-4.7-Flash-bf16 --piece 0 --slots 1:0,1:1 \
+      --config-dir D:/hf_models/GLM-4.7-Flash-bf16 --pieces 0-11 --slots 1:0,1:1 \
       --data-dir D:/glm_wan --domains code,gutenberg --device cuda --batch 4
 """
 import argparse
@@ -42,6 +56,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.request
@@ -63,7 +78,8 @@ from neurahash import diloco_merge as dm                         # noqa: E402  (
 # sharddiloco_harness.publish_pointer/read_pointer read the module global POINTER_NAME at CALL time,
 # so assigning it here retargets the pointer without editing that file (plan sec 2b, risk 7).
 GLM_POINTER_NAME = "sharddiloco/glm/pointer"
-CONTRIB_PREFIX_FMT = "cg/r%d/"
+CONTRIB_PREFIX_FMT = "cg/r%d/"                     # LEGACY (pre-campaign) shape; see CAMPAIGN SCOPING
+CONTRIB_CAMPAIGN_PREFIX_FMT = "cg/%s/r%d/"         # campaign-scoped shape: cg/<campaign_id>/r<base_event>/
 ACCEPTED_NAME_FMT = "sharddiloco/glm/accepted/r%d"
 
 # ---- corpus-over-WAN auto sync (W6) --------------------------------------------------------------
@@ -74,6 +90,8 @@ ACCEPTED_NAME_FMT = "sharddiloco/glm/accepted/r%d"
 DATA_RECORD_NAME = "sharddiloco/glm/data"
 DATA_MANIFEST_NAME = "data_manifest.json"
 RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither locally-valid nor fetched+verified
+RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)
+RC_NO_CAMPAIGN = 11                 # exit code: the pointer advertises no campaign_id (see campaign_refusal)
 _ALLOWED_DATA_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)\.npy\Z")
 
 
@@ -82,16 +100,126 @@ def use_glm_lane_names():
     H.POINTER_NAME = GLM_POINTER_NAME
 
 
-def contrib_name(rnd, miner):
-    return CONTRIB_PREFIX_FMT % int(rnd) + str(miner)
+# ===================================================================== CAMPAIGN SCOPING (2026-07-25)
+# WHY (measured, scratchpad/FINDING_cross_campaign_replay.md). The lane store NEVER deletes and record
+# names carried no run identity ("cg/r<base_event>/<miner>"), so ONE flat namespace held 11,229 objects
+# from every campaign that ever ran. Two consequences, both measured on the live lane:
+#   1. a fresh coordinator's discovery scanned all 11,229 names and revealed one more dead r-number per
+#      event forever (run 4: 198 records "processed", 189 of them UNVERIFIED old ones);
+#   2. worse -- every campaign starts from the SAME pristine base, so at genesis a fresh campaign's
+#      base_root/base_slot_root EQUAL a dead campaign's early roots. The lineage guard therefore could
+#      not tell them apart and a dead run's delta was lineage-VALID: identity glm-ea20C873, which
+#      belongs to no live miner, was MINTED into runs 2, 3 and 4.
+# THE FIX, in two halves that must ship together:
+#   * the NAMESPACE half (campaign_prefix / contrib_name / contrib_prefix): records live under
+#     cg/<campaign_id>/r<N>/..., so discovery filters to this campaign and the 11,229-name scan
+#     collapses. This alone is only an OPTIMISATION -- a replayer can rename into our prefix.
+#   * the LINEAGE half (_campaign_seed_into, fed into model_root/slot_root): the campaign id SEEDS the
+#     root digest, so two campaigns over an identical pristine base share NO lineage root at ANY
+#     height. This is what actually stops the merge. The per-coordinate lineage design is untouched --
+#     only the digest's seed changes, and an unset campaign reproduces the old digest byte-for-byte.
+CAMPAIGN_POINTER_KEY = "campaign_id"               # the ADDITIVE v2-pointer field the coordinator stamps
+_CAMPAIGN_RE = re.compile(r"\A[0-9a-f]{8,64}\Z")   # lowercase hex only: never "/" (name-safe) and never
+                                                   # "r<digits>" (so cg/<id>/ can't be read as cg/r<N>/)
 
 
-def contrib_prefix(rnd):
-    return CONTRIB_PREFIX_FMT % int(rnd)
+def new_campaign_id():
+    """Mint a fresh campaign nonce: 16 lowercase hex chars (64 bits from `secrets`). Minted ONCE per
+    campaign by the coordinator and then PERSISTED -- a restart that re-minted would orphan the
+    campaign's own records, which is a worse bug than the cross-campaign replay this closes."""
+    return secrets.token_hex(8)
+
+
+def normalize_campaign_id(cid):
+    """The canonical form of `cid`, or None when it is absent/unusable. Fail-closed on purpose: the
+    pointer is UNSIGNED on a shared-token lane, so an id we cannot validate is treated as no id at all
+    rather than pasted into object names or hash seeds."""
+    if cid is None:
+        return None
+    s = str(cid).strip().lower()
+    return s if _CAMPAIGN_RE.match(s) else None
+
+
+def campaign_scope_on(environ=None):
+    """NEURAHASH_SD_CAMPAIGN_SCOPE -- the documented opt-out for a LEGACY lane (same truthiness house
+    style as dm.shard_diloco_on). DEFAULT ON. Set 0/false/off/no to join a lane that predates campaign
+    scoping. What it does per role, precisely:
+      * COORDINATOR: mints nothing, seeds nothing, advertises nothing -> v3.4.1 exactly (flat `cg/rN/`
+        names, unseeded roots).
+      * MINER: suppresses the fail-closed REFUSAL only (campaign_refusal). If the coordinator advertises
+        a campaign anyway, the miner still adopts it -- publishing unscoped into a scoped lane would
+        make every delta wrong-lineage-slot-root, and that is not a behaviour worth reproducing."""
+    env = os.environ if environ is None else environ
+    return (env.get("NEURAHASH_SD_CAMPAIGN_SCOPE", "1") or "1").strip().lower() \
+        not in ("0", "false", "off", "no")
+
+
+def bind_campaign_id(host, cid):
+    """Attach this process's campaign scope to the lane `host` and return the normalized id (None =
+    unscoped/legacy). The scope rides the HOST, not a module global, because every root function already
+    takes the host -- so both roles hash identically, no call site has to remember an extra argument,
+    and two hosts in one process (a test's coordinator + miner) cannot leak into each other."""
+    val = normalize_campaign_id(cid)
+    host.campaign_id = val
+    return val
+
+
+def host_campaign_id(host):
+    """The campaign scope bound to `host`, or None. Tolerates any host object (test fakes included)."""
+    return normalize_campaign_id(getattr(host, "campaign_id", None))
+
+
+def campaign_prefix(campaign=None):
+    """"cg/<campaign_id>/" -- the namespace every contribution record of one campaign lives under
+    (legacy "cg/" when unscoped). Pure."""
+    cid = normalize_campaign_id(campaign)
+    return "cg/" if cid is None else "cg/%s/" % cid
+
+
+def contrib_name(rnd, miner, campaign=None):
+    return contrib_prefix(rnd, campaign) + str(miner)
+
+
+def contrib_prefix(rnd, campaign=None):
+    cid = normalize_campaign_id(campaign)
+    if cid is None:
+        return CONTRIB_PREFIX_FMT % int(rnd)                      # legacy lane, byte-identical
+    return CONTRIB_CAMPAIGN_PREFIX_FMT % (cid, int(rnd))
 
 
 def accepted_name(rnd):
     return ACCEPTED_NAME_FMT % int(rnd)
+
+
+def pointer_campaign_id(ptr):
+    """The campaign id a RAW v2 pointer advertises, or None. Read off the raw dict (like
+    `domains_digest`) because dm.sd_pointer_decode normalizes to a fixed key set and drops additive
+    fields. Pure."""
+    if not isinstance(ptr, dict):
+        return None
+    return normalize_campaign_id(ptr.get(CAMPAIGN_POINTER_KEY))
+
+
+def campaign_refusal(ptr, environ=None):
+    """FAIL-CLOSED miner gate: may we publish against this pointer? None = yes, else the ONE log line
+    that names the reason and the way out.
+
+    A pointer with no campaign id is a coordinator that predates campaign scoping. Publishing anyway
+    would put our records back into the shared `cg/rN/` namespace -- the exact surface that let a dead
+    campaign's delta be minted into three live runs -- so the default is to REFUSE and say why, instead
+    of silently joining a lane where our own work and a dead run's are indistinguishable. Pure."""
+    if not campaign_scope_on(environ):
+        return None                                               # operator opted into the legacy lane
+    if pointer_campaign_id(ptr) is not None:
+        return None
+    raw = (ptr or {}).get(CAMPAIGN_POINTER_KEY) if isinstance(ptr, dict) else None
+    return ("no CAMPAIGN ID on the coordinator's pointer (campaign_id=%r). This coordinator predates "
+            "campaign scoping, so every contribution would be published into the SHARED cg/rN/ "
+            "namespace where a dead campaign's records are indistinguishable from ours -- MEASURED: a "
+            "foreign identity's deltas were minted into three separate runs from that namespace. "
+            "REFUSING to publish. Fix: upgrade the coordinator (it then stamps campaign_id on the "
+            "pointer), or, to join a legacy lane deliberately, re-run with "
+            "NEURAHASH_SD_CAMPAIGN_SCOPE=0." % (raw,))
 
 
 def _flush(*a):
@@ -132,6 +260,112 @@ def parse_coord(s):
         raise SystemExit("[glm-node] --expert must look like L:E with integers, got %r" % txt)
 
 
+def parse_pieces(spec):
+    """'0-12' / '0,1,2' / '3' -> a SORTED, DEDUPLICATED list of expert-piece ids. Pure.
+
+    MAPPING, stated because getting it wrong is silent: a piece id indexes the manifest's
+    `experts_<id>` NAME, not its position in the pieces list (piece_loader._piece_record looks up
+    "experts_%d"). The list also carries the trunk at position 0, so name-vs-position is off by one
+    -- and an off-by-one here does not raise, it just leaves a layer partially resident (measured on
+    tools/glm_router_domain_probe.py: 59/64 instead of 64/64). node_piece_ids' residency assertion is
+    the second line of defence; this docstring is the first.
+
+    Ranges are INCLUSIVE on both ends ('0-12' is 13 pieces). Every malformed shape raises SystemExit
+    rather than degrading to piece 0: silently selecting the default would reproduce exactly the
+    five-coordinate ceiling this flag exists to remove."""
+    txt = str(spec).strip()
+    out = set()
+    for part in txt.split(","):
+        part = part.strip()
+        if not part:
+            raise SystemExit("[glm-node] --pieces has an empty entry in %r; use e.g. 0-12 or 0,1,2"
+                             % txt)
+        if "-" in part:
+            a, sep, b = part.partition("-")
+            try:
+                lo, hi = int(a.strip()), int(b.strip())
+            except ValueError:
+                raise SystemExit("[glm-node] --pieces range %r is not two integers (want e.g. 0-12)"
+                                 % part)
+            if lo > hi:
+                raise SystemExit("[glm-node] --pieces range %r is descending; ranges are inclusive "
+                                 "and ascending (want e.g. %d-%d)" % (part, hi, lo))
+            out.update(range(lo, hi + 1))
+        else:
+            try:
+                out.add(int(part))
+            except ValueError:
+                raise SystemExit("[glm-node] --pieces entry %r is not an integer (want e.g. 0-12 "
+                                 "or 0,1,2)" % part)
+    if not out:
+        raise SystemExit("[glm-node] --pieces must be a non-empty list like 0-12 or 0,1,2")
+    if min(out) < 0:
+        raise SystemExit("[glm-node] --pieces contains a negative piece id (%d) in %r"
+                         % (min(out), txt))
+    return sorted(out)
+
+
+def node_piece_ids(args):
+    """The expert pieces THIS node keeps resident -- the single place both roles resolve them.
+
+    WHY THIS EXISTS (measured, run 4, scratchpad/FINDING_five_coordinate_ceiling.md): `--piece` is one
+    int, one piece covers 5 (layer, expert) coordinates, so a whole campaign's trainable universe was
+    5 coordinates. It plateaued at held-out CE 6.51103 and then ran ~620 events with ZERO accepted
+    merges while both miners cycled PLATEAU -> RELEASE -> CLAIM across the same five forever. Shard
+    Claim was working; it had nowhere to go. Layer 1 is covered by pieces 0..12 (all 64 experts), and
+    piece_loader already allocates a resident layer's fused params FULL WIDTH, so widening residency
+    fills rows of tensors that are allocated either way.
+
+    --pieces wins when given; otherwise the DEPRECATED --piece is used exactly as before (same env
+    default, same single-element list), so every existing launch script is byte-for-byte unchanged."""
+    spec = getattr(args, "pieces", None)
+    if spec is not None and str(spec).strip() != "":
+        return parse_pieces(spec)
+    p = getattr(args, "piece", None)
+    return [] if p is None else [int(p)]
+
+
+def fmt_pieces(args):
+    """How this node's piece selection is NAMED in an error message -- the flag the operator actually
+    passed, so the fix they are told to make is the fix that applies to their command line."""
+    spec = getattr(args, "pieces", None)
+    if spec is not None and str(spec).strip() != "":
+        return "--pieces %s" % str(spec).strip()
+    return "--piece %s" % (getattr(args, "piece", None),)
+
+
+def fmt_coord_pieces(piece_ids, limit=8):
+    """'0, 1, 2 ... (+10 more)' -- compact piece list for a startup log line (13 ids would otherwise
+    push the useful part of the summary off the line)."""
+    ids = [int(p) for p in piece_ids]
+    head = ", ".join(str(p) for p in ids[:limit])
+    extra = len(ids) - limit
+    return head + ((" (+%d more)" % extra) if extra > 0 else "")
+
+
+def check_residency(n_resident, claimable, piece_ids):
+    """FAIL LOUDLY when the loaded expert count does not equal the requested one. Pure (ints only).
+
+    A piece id resolves by NAME (`experts_<id>`), and the manifest's list also carries the trunk, so
+    an off-by-one in a --pieces range does not raise anywhere: build_partial_model happily loads the
+    wrong 13 pieces, the intended layer comes back e.g. 59/64 resident, and the 5 missing rows are
+    writable-but-inert (zero weights, router pinned to -inf). A miner claiming one of them would be
+    gate-rejected forever with nothing in any log to say why -- the failure mode this whole
+    claimability guard exists to prevent. `claimable is None` means residency is unchecked (tiny mode
+    / no manifest), which stays a no-op exactly as before."""
+    if claimable is None or n_resident is None:
+        return None
+    got, want = int(n_resident), len(claimable)
+    if got != want:
+        raise SystemExit(
+            "[glm-node] FATAL residency mismatch: asked for %d piece(s) %s = %d claimable "
+            "coordinate(s), but the loaded model has %d resident expert(s). A piece id names "
+            "`experts_<id>` in the manifest, NOT a position in its piece list -- an off-by-one here "
+            "is silent (the missing rows are writable but never routed). Refusing to train."
+            % (len(list(piece_ids)), fmt_coord_pieces(piece_ids), want, got))
+    return got
+
+
 def coord_data_slot(L, E):
     """The `slot` argument to pass to _ids_path / node_ids / coord_secret_ids when work is addressed by
     COORDINATE rather than by position.
@@ -147,6 +381,77 @@ def coord_data_slot(L, E):
     domains slots 0 and 1 resolve to now -- so the frozen probe/heldout pools (c0d4cbd) keep their
     meaning and the before/after held-out CE stays comparable."""
     return int(E)
+
+
+def domains_list(args):
+    """This process's EFFECTIVE data-domain list, parsed in EXACTLY ONE place so no caller can drift from
+    _ids_path -- which is the thing that actually resolves a shard, as `doms[slot % len(doms)]`."""
+    return [d.strip() for d in str(args.domains).split(",") if d.strip()]
+
+
+def domains_canonical(doms):
+    """Reduce a domain list to the MINIMAL list that induces the SAME shard mapping.
+
+    What has to agree between the roles is the FUNCTION `E -> doms[E % len(doms)]`, not the spelling. The
+    live pair really is spelled two ways -- coordinator `daily,daily`, contributor `daily` -- and both send
+    every coordinate to the same domain, so digesting the literal list would refuse to start a configuration
+    that is provably safe. A purely periodic sequence has a unique minimal period and that period DIVIDES
+    its length, so the smallest-period prefix is a canonical form: two lists induce the same mapping iff
+    their canonical forms are equal. ['daily','daily'] -> ['daily']; ['code','gutenberg','web'] is already
+    minimal; ['gutenberg','code'] stays distinct from ['code','gutenberg']. Pure."""
+    doms = [str(d) for d in doms]
+    n = len(doms)
+    for p in range(1, n + 1):
+        if n % p == 0 and all(doms[i] == doms[i % p] for i in range(n)):
+            return doms[:p]
+    return doms
+
+
+def domains_digest(doms):
+    """sha256 over the CANONICAL form of a domain list (domains_canonical). Order is part of the identity,
+    not cosmetic: a shard resolves as `doms[coord_data_slot(L,E) % len(doms)]`, so 'code,gutenberg' and
+    'gutenberg,code' send E=0 to DIFFERENT domains, and appending one entry renumbers every modulus. Pure."""
+    return hashlib.sha256("\n".join(domains_canonical(doms)).encode("utf-8")).hexdigest()
+
+
+def domains_pointer_fields(args):
+    """The two ADDITIVE keys the coordinator stamps onto its v2 pointer so the roles can cross-check the
+    one flag nothing else validates. `domains` is only there to make a mismatch message readable -- the
+    domain NAMES are already public (the data record advertises ids_<domain>_train.npy); the secret is the
+    probe/heldout CONTENT, which is never named here."""
+    doms = domains_list(args)
+    return {"domains": list(doms), "domains_digest": domains_digest(doms)}
+
+
+def domains_mismatch(ptr, args):
+    """FIX B (C6, 2026-07-25): does the coordinator resolve data shards against the same domain list we do?
+    Returns None when they agree, or when the pointer carries NO digest (a pre-Shard-Claim coordinator --
+    additive by design, never a hard fail); otherwise a message naming BOTH lists.
+
+    Why this has to exist. `--domains` is a PER-PROCESS flag and nothing cross-verified it. The miner's
+    TRAIN shard is `doms[coord_data_slot(L,E) % len(doms)]` on ITS list and the coordinator's SECRET PROBE
+    pool is the same expression on ITS list, so coordinator `code,gutenberg` against a miner on
+    `code,gutenberg,web` gives E=2 the probe pool "code" versus the train shard "web": every delta is then
+    gated on text it never trained on and rejected SYSTEMATICALLY WITH NO ERROR ANYWHERE. Comparison is on
+    the CANONICAL mapping (domains_canonical), so the live pair -- `daily,daily` against `daily`, two
+    spellings of one mapping -- keeps running; only a genuinely different mapping is refused. Pure."""
+    if not isinstance(ptr, dict):
+        return None
+    theirs_digest = ptr.get("domains_digest")
+    if not theirs_digest:
+        return None                                          # pre-Shard-Claim peer: nothing to compare
+    ours = domains_list(args)
+    if str(theirs_digest) == domains_digest(ours):
+        return None
+    theirs = ptr.get("domains")
+    theirs_txt = ",".join(str(d) for d in theirs) if theirs else "(not published)"
+    return ("--domains MISMATCH. Coordinator resolves data shards against [%s] (digest %s..), this miner "
+            "against [%s] (digest %s..). A shard is doms[E %% len(doms)], so a different list -- or the "
+            "same names in a different ORDER -- makes the coordinator gate every delta on a domain this "
+            "miner never trained on: a systematic reject with NO error anywhere. Refusing to start; "
+            "restart with --domains %s (or NEURAHASH_GLM_DOMAINS=%s)."
+            % (theirs_txt, str(theirs_digest)[:12], ",".join(ours), domains_digest(ours)[:12],
+               theirs_txt, theirs_txt))
 
 
 def fmt_coords(coords, limit=8):
@@ -174,13 +479,18 @@ def node_claimable_coords(args):
     # we never needed would be a self-inflicted outage.
     if getattr(args, "mode", None) != "glm":
         return None
-    if not getattr(args, "shard_dir", None) or getattr(args, "piece", None) is None:
+    if not getattr(args, "shard_dir", None):
+        return None
+    pieces = node_piece_ids(args)
+    if not pieces:
         return None
     try:
         import piece_loader
         man = piece_loader.load_manifest(args.shard_dir, require_files=False)
         cfg = _resolve_claim_config(args)
-        return piece_loader.claimable_expert_ids(man, [int(args.piece)], cfg)
+        # UNION over every selected piece -- claimable_expert_ids already takes a list and folds the
+        # per-piece expert sets together, then filters the dense layer 0 and the MTP/nextn layer out.
+        return piece_loader.claimable_expert_ids(man, pieces, cfg)
     except ImportError:
         return None
     except Exception as ex:                                          # noqa: BLE001
@@ -189,8 +499,8 @@ def node_claimable_coords(args):
 
 def _raise_claim_probe(ex):
     raise SystemExit("[glm-node] cannot determine this node's claimable coordinates from "
-                     "--shard-dir/--piece (%s: %s). Fix the shard dir, or pass --expert only after "
-                     "confirming the piece covers it." % (type(ex).__name__, ex))
+                     "--shard-dir/--pieces (%s: %s). Fix the shard dir, or pass --expert only after "
+                     "confirming the selected piece(s) cover it." % (type(ex).__name__, ex))
 
 
 def _resolve_claim_config(args):
@@ -226,19 +536,57 @@ def pick_start_coord(claimable, identity):
     return tuple(claimable[h % len(claimable)])
 
 
-def next_claim_coord(claimable, current):
-    """The coordinate to claim after `current`, cycling through the claimable set in order.
+def claim_walk_order(claimable, identity=None, ranked=None):
+    """The ORDER in which `identity` sweeps the claimable set: a per-identity PERMUTATION of the same
+    coordinates, produced by sorting them on sha256(identity|L:E). `identity=None` -> the input order
+    (the legacy shared sweep). Registry-free, lock-free and pure -- the same hash-of-address trick
+    pick_start_coord already uses, applied to the walk instead of just its first step.
+
+    `ranked` (--claim-by affinity) OVERRIDES the hash permutation with a measured order: the ESFT
+    affinity ranking, highest first, filtered to what is claimable here. Any claimable coordinate the
+    probe did not score is appended in input order so the sweep still eventually covers everything --
+    a coordinate silently dropped from the walk would be starved forever."""
+    coords = [tuple(c) for c in claimable or []]
+    if ranked:
+        seen = set()
+        order = [tuple(c) for c in ranked if tuple(c) in set(coords) and not (
+            tuple(c) in seen or seen.add(tuple(c)))]
+        return order + [c for c in coords if c not in seen]
+    if identity is None:
+        return coords
+    return sorted(coords, key=lambda c: hashlib.sha256(
+        ("%s|%d:%d" % (identity, int(c[0]), int(c[1]))).encode()).hexdigest())
+
+
+def next_claim_coord(claimable, current, identity=None, ranked=None):
+    """The coordinate to claim after `current`, cycling through THIS identity's walk order.
 
     This is the owner's "finish one then start the 2nd one" -- sweeping the space is just
     claim -> work -> plateau -> release -> claim next. Returns None when the set has only this one
-    coordinate (nothing to advance to, so the caller should stay put rather than churn)."""
+    coordinate (nothing to advance to, so the caller should stay put rather than churn).
+
+    WHY THE ORDER IS PER-IDENTITY (measured live 2026-07-25). pick_start_coord spreads miners by hashing
+    the wallet, but a shared +1 advance walked everyone through the SAME sequence, so a one-off collision
+    became a PERMANENT one: the 5090 (glm-ea20C873) swept 1:1 -> 1:2 -> 1:3 -> 1:4 into the 4060
+    (glm-361447E3) sitting on 1:2, and they stayed together for events 12-15 -- every one a reject, with
+    held-out CE frozen at 7.76966 -- while the coordinates neither miner reached starved. Duplicate work
+    is wasteful-but-not-incorrect by design; duplicate work that cannot END is a different bug. Walking a
+    per-identity permutation makes the collision transient (the two identities' successors differ) without
+    a registry or a lease. Still deterministic per identity, so a restarted miner behaves predictably; and
+    still a single cycle over the whole permutation, so every claimable coordinate is eventually visited
+    and the coordinate we are on now is never returned.
+
+    `ranked` (--claim-by affinity) replaces that permutation with the ESFT affinity order, so "advance
+    on plateau" becomes "drop to the NEXT-HIGHEST-affinity coordinate" rather than to the next hash
+    bucket -- see claim_walk_order and the ESFT block below."""
     coords = [tuple(c) for c in claimable or []]
     if len(coords) <= 1:
         return None
+    order = claim_walk_order(coords, identity, ranked=ranked)
     cur = tuple(current)
-    if cur not in coords:
-        return coords[0]
-    return coords[(coords.index(cur) + 1) % len(coords)]
+    if cur not in order:
+        return order[0]
+    return order[(order.index(cur) + 1) % len(order)]
 
 
 def record_touched_coord(rec, coord):
@@ -300,16 +648,18 @@ def resolve_claim(args, slots, log=print, identity=None):
     # needs its own message -- reporting "piece 0 does not hold (L1,E0)" for a piece that holds nothing
     # at all sends the reader looking for the wrong problem.
     if claimable is not None and not claimable:
-        raise SystemExit("[glm-contrib] --piece %s holds NO real experts (it covers only the MTP/nextn "
-                         "layer, which the model never instantiates). Pick another piece." % args.piece)
+        raise SystemExit("[glm-contrib] %s holds NO real experts (it covers only the MTP/nextn "
+                         "layer, which the model never instantiates). Pick another piece."
+                         % fmt_pieces(args))
     if claimable is not None and (L, E) not in claimable:
         shown = ", ".join("%d:%d" % c for c in claimable[:16]) or "(none)"
         raise SystemExit(
-            "[glm-contrib] REFUSING to claim (L%d,E%d): --piece %s does not hold it, so this node "
+            "[glm-contrib] REFUSING to claim (L%d,E%d): %s does not hold it, so this node "
             "would train an INERT expert -- writable, never routed, rejected forever, silently. "
-            "Claimable here: %s%s. Load the piece that covers (L%d,E%d) instead."
-            % (L, E, args.piece, shown, (" ... (%d total)" % len(claimable)) if len(claimable) > 16 else "",
-               L, E))
+            "Claimable here: %s%s. Load the piece(s) covering (L%d,E%d) instead (--pieces accepts a "
+            "range, e.g. 0-12 for all 64 experts of layer 1)."
+            % (L, E, fmt_pieces(args), shown,
+               (" ... (%d total)" % len(claimable)) if len(claimable) > 16 else "", L, E))
     if (L, E) in slots:
         i = slots.index((L, E))
     else:
@@ -327,24 +677,311 @@ def claim_all_coords(args, slots):
     return [tuple(x) for x in (c if c else slots)]
 
 
+# ======================================================== ESFT expert-affinity selection (--claim-by)
+# WHY THIS EXISTS -- MEASURED ELSEWHERE, do not re-derive (docs/research/MOE_POSTTRAIN_2026-07-25.md,
+# docs/SHARD_CLAIM_DESIGN.md "Selecting the coordinate by AFFINITY").
+#
+# pick_start_coord decides which expert to train by HASHING THE WALLET ADDRESS, and next_claim_coord
+# advances along a per-identity permutation. Both are routing-BLIND, and routing-blind selection is the
+# one variant published work has measured to LOSE:
+#   * MoE-Sieve (arXiv:2603.24044) measured random expert selection 2.5 percentage points WORSE than
+#     router-guided selection at a matched budget.
+#   * Mixtral (arXiv:2401.04088 sec 5) measured expert assignment across 8 Pile domains at layers
+#     0/15/31: "Surprisingly, we do not observe obvious patterns in the assignment of experts based on
+#     the topic" -- routers organise by SYNTAX/POSITION, not subject. Nobody gets to DECIDE what an
+#     expert specialises in; the frozen router already decided, so the job is to MEASURE its choice.
+#   * Branch-Train-Merge (arXiv:2208.03306), at this lane's exact 64-expert count: domain
+#     specialization is REQUIRED -- "LM ensembles with random data splits do not perform well".
+# ESFT (arXiv:2407.01906, EMNLP 2024) is the published method on a near-identical architecture
+# (DeepSeek-V2-Lite: 64 routed + 2 shared experts, top-6): it PROBES first with a small subset (32
+# samples x 4096 tokens ~= 131K tokens), scores every expert, and trains only the top-scored ones --
+# "the routing distribution for a specific task tends to be highly concentrated, while the distribution
+# of activated experts varies significantly across different tasks."
+ESFT_P_GATE = 0.1          # ESFT verbatim: "The threshold p is set to 0.1 for ESFT-Gate and 0.2 for
+ESFT_P_TOKEN = 0.2         # ESFT-Token, respectively"
+ESFT_PROBE_SAMPLES = 32    # ESFT's own N_s. Forward passes only -- no optimizer, no backward.
+
+
+def esft_select(scores, p):
+    """ESFT's selection rule: the SMALLEST top-scored set E_s^l with SUM_{i in E_s^l} R_i^l >= p.
+
+    `scores` is a {coord: score} mapping or an iterable of (coord, score). Returns the coordinates in
+    descending-score order, stopping at the first one that brings the running sum to >= p. Ties break
+    on the coordinate itself so the result is deterministic across processes. p <= 0 -> the empty set
+    (the smallest set clearing 0 really is nothing); a total below p -> every coordinate, because there
+    is no smaller set that can clear it. Pure -- no torch, no model."""
+    items = list(scores.items() if hasattr(scores, "items") else scores)
+    items.sort(key=lambda kv: (-float(kv[1]), tuple(kv[0])))
+    out, acc, p = [], 0.0, float(p)
+    if p <= 0.0:
+        return out
+    for c, s in items:
+        out.append(tuple(c))
+        acc += float(s)
+        if acc >= p:
+            break
+    return out
+
+
+def esft_select_layers(scores, p):
+    """esft_select applied PER LAYER, then unioned -- ESFT's actual rule, whose scores are g_i^l / r_i^l
+    with the layer superscript, and whose thresholds are calibrated against a per-layer total of 1.
+
+    Pooling layers instead would silently inflate the threshold's reach: with 2 candidate layers the
+    pooled scores sum to 2, so p=0.1 clears on half the mass it is meant to describe. (On a real
+    single-piece node every claimable coordinate sits in ONE layer, so the two agree there -- but a node
+    holding more pieces spans layers and would diverge.) Pure."""
+    items = list(scores.items() if hasattr(scores, "items") else scores)
+    by_layer = {}
+    for c, s in items:
+        by_layer.setdefault(int(tuple(c)[0]), []).append((tuple(c), float(s)))
+    out = []
+    for L in sorted(by_layer):
+        out.extend(esft_select(by_layer[L], p))
+    return sorted(out)
+
+
+def _routed_experts_module(host, L):
+    """The module `mlp` actually CALLS with (hidden_states, top_k_index, top_k_weights) for layer L --
+    the only place the frozen router's decisions are observable without re-deriving them.
+
+    It is `layers[L].mlp.experts`, which is the fused Glm4MoeLiteNaiveMoe normally and the LoRAExperts
+    WRAPPER while a contribution is training. Deliberately not host._fused(L): that unwraps to
+    `.base`, whose forward LoRAExperts never calls (it reaches into base.gate_up_proj directly), so a
+    hook there would silently never fire. host._fused(L) is still called first, purely to reuse its two
+    named failures -- IndexError for the MTP/nextn layer the model never instantiates, AttributeError
+    for a fully non-resident layer's _DeadExperts placeholder."""
+    host._fused(int(L))                                  # validation only (raises the named errors)
+    return host.model.model.layers[int(L)].mlp.experts
+
+
+def probe_expert_affinity(host, ids, coords=None, samples=ESFT_PROBE_SAMPLES, batch=8, log=None):
+    """ESFT's expert-affinity probe: FORWARD PASSES ONLY over a bounded token sample, scoring every
+    candidate coordinate with both ESFT metrics and returning a ranking.
+
+    The metrics, transcribed from arXiv:2407.01906 (K = experts per token, N_s = samples, L_j = length
+    of sample j, g_{i,k}^l = the gate score expert i received for token k of layer l, 0 if unselected):
+
+        ESFT-Gate    g_i^l = (1/N_s) * SUM_j (1/L_j) * SUM_k  g_{i,k}^l
+        ESFT-Token   r_i^l = (1/N_s) * SUM_j (1/L_j) * SUM_k [ 1(g_{i,k}^l > 0) / K ]
+
+    Every sample here has the SAME length T (`ids` is [N,T]), so SUM_j (1/L_j) SUM_k collapses exactly
+    into one mean over the N_s*T tokens -- which is what makes batching sequences metric-preserving
+    rather than an approximation.
+
+    NO TRAINING, EVER. torch.no_grad(), no optimizer, no backward; the only state touched is one
+    forward PRE-hook per candidate layer, removed in a finally. tests/test_glm_shard_claim.py asserts
+    every parameter and buffer is bit-identical before/after, because a "probe" that trained would
+    silently corrupt the frozen base that every per-coordinate lineage root is computed over.
+
+    It reuses the model the miner ALREADY built (`host.model`) and never builds or loads a second one:
+    on the real lane the base is 4.02 GiB of trunk plus 1.125 GiB per resident layer (memory
+    glm-capacity-per-card), so a second copy does not fit. It also skips the lm_head entirely -- only
+    routing is needed, and the [B,T,154880] logits are the single biggest allocation in a GLM forward.
+
+    NOTE ON THE -inf ROUTER MASK. piece_loader allocates a resident layer's fused params FULL WIDTH
+    (all 64 expert rows) and masks the non-resident rows of the router to -inf
+    (piece_loader.py:403-408), so on a real node only the ~5 resident experts of a layer can be
+    selected at all and the surviving gate scores are renormalised over just those. That changes the
+    ABSOLUTE scores -- they are affinities within the resident set, not within all 64 -- but NOT the
+    RANKING among the coordinates this node can actually claim, which is the only thing this function
+    is used to decide.
+
+    Returns a dict: `ranking` [(coord, gate, token), ...] highest-first, `gate`/`token` mappings,
+    `select_gate`/`select_token` (esft_select_layers at ESFT's published thresholds -- PER LAYER, since
+    both metrics carry the layer superscript and sum to 1 within a layer), `n_samples`, `n_tokens`,
+    `topk`, `scaling`.
+    """
+    import torch
+    model = host.model
+    cands = sorted({(int(L), int(E)) for (L, E) in
+                    (coords if coords is not None else host.slots)})
+    if not cands:
+        raise SystemExit("[glm-node] affinity probe: no candidate coordinates to score")
+    ids = np.asarray(ids)
+    if ids.ndim != 2 or ids.shape[0] == 0 or ids.shape[1] < 2:
+        raise SystemExit("[glm-node] affinity probe needs a [N,T] token sample with N>=1, T>=2; got %r"
+                         % (tuple(ids.shape),))
+    n = max(1, min(int(samples), int(ids.shape[0])))
+    sample = ids[:n]                    # the FIRST n sequences -- deterministic, never a random draw
+    by_layer = {}
+    for (L, E) in cands:
+        by_layer.setdefault(L, []).append(E)
+
+    # `routed_scaling_factor` is applied to the gate weights AFTER top-k normalisation, so per token
+    # they sum to that factor, not to 1 (GLM-4.7-Flash: 1.8; DeepSeek-V2-Lite, the model ESFT measured:
+    # 1.0). Dividing it out is what keeps ESFT's published p a FRACTION of the routed gate mass -- left
+    # in, p=0.1 would silently mean 0.0556 of it on this architecture.
+    scaling = float(getattr(host.cfg, "routed_scaling_factor", 1.0) or 1.0)
+    topk = int(getattr(host.cfg, "num_experts_per_tok", 1) or 1)
+    gate_acc = {c: 0.0 for c in cands}      # SUM over tokens of g_{i,k}   (float64 accumulation)
+    tok_acc = {c: 0 for c in cands}         # COUNT of (token, slot) picks landing on i
+    tok_seen = {L: 0 for L in by_layer}     # tokens routed through each candidate layer
+
+    def _pre_hook(L):
+        def pre(_mod, inputs):
+            # inputs == (hidden_states, top_k_index, top_k_weights): exactly what the frozen router
+            # handed the experts on THIS forward, so these are the model's real routing decisions and
+            # not a re-derivation that could drift from them.
+            idx, w = inputs[1], inputs[2]
+            flat_i = idx.reshape(-1)
+            flat_w = w.reshape(-1).to(torch.float64) / scaling
+            for E in by_layer[L]:
+                m = flat_i == int(E)
+                hits = int(m.sum())
+                if hits:
+                    gate_acc[(L, int(E))] += float(flat_w[m].sum())
+                    tok_acc[(L, int(E))] += hits
+            tok_seen[L] += int(idx.shape[0])
+            return None
+        return pre
+
+    handles = []
+    was_training = bool(model.training)
+    try:
+        for L in by_layer:
+            handles.append(_routed_experts_module(host, L).register_forward_pre_hook(_pre_hook(L)))
+        model.eval()
+        trunk = getattr(model, "model", None)        # skip lm_head: routing is all this needs
+        fwd = trunk if trunk is not None else model
+        b = max(1, int(batch))
+        with torch.no_grad():
+            for s in range(0, n, b):
+                fwd(input_ids=torch.as_tensor(sample[s:s + b]).to(
+                    next(model.parameters()).device))
+    finally:
+        for h in handles:
+            h.remove()
+        model.train(was_training)
+
+    gate = {c: (gate_acc[c] / tok_seen[c[0]]) if tok_seen[c[0]] else 0.0 for c in cands}
+    tokr = {c: (tok_acc[c] / (tok_seen[c[0]] * topk)) if tok_seen[c[0]] else 0.0 for c in cands}
+    # Rank on the GATE metric, tie-break on the token ratio then the coordinate. The gate metric leads
+    # because the token ratio SATURATES on a real node: 5 resident experts with top_k=4 means 4 of 5
+    # are selected for nearly every token, so r_i is ~uniform there while g_i still discriminates.
+    ranking = sorted(cands, key=lambda c: (-gate[c], -tokr[c], c))
+    out = {"ranking": [(c, gate[c], tokr[c]) for c in ranking],
+           "gate": gate, "token": tokr,
+           "select_gate": esft_select_layers(gate, ESFT_P_GATE),
+           "select_token": esft_select_layers(tokr, ESFT_P_TOKEN),
+           "n_samples": n, "n_tokens": int(n * ids.shape[1]), "topk": topk, "scaling": scaling}
+    if log:
+        log("[glm-node] ESFT affinity probe: %d sample(s) x %d tokens = %d tokens, forward-only, %d "
+            "candidate coordinate(s)" % (n, int(ids.shape[1]), out["n_tokens"], len(cands)))
+        for c, g, r in out["ranking"]:
+            log("[glm-node]   %d:%d  gate=%.6f  token_ratio=%.6f%s%s"
+                % (c[0], c[1], g, r,
+                   "  [ESFT-Gate p=%.1f]" % ESFT_P_GATE if c in out["select_gate"] else "",
+                   "  [ESFT-Token p=%.1f]" % ESFT_P_TOKEN if c in out["select_token"] else ""))
+    return out
+
+
+def affinity_claim(args, host, ids, L, E, i, miner="", log=print):
+    """--claim-by affinity: replace the wallet-hash claim with the HIGHEST-AFFINITY claimable
+    coordinate, and return the full ranking so the plateau advance follows it too.
+
+    Returns (L, E, i, ranked) where `ranked` is the affinity-descending coordinate list (highest
+    first). On any probe failure NOTHING changes -- the miner keeps the hash-chosen coordinate and
+    `ranked` is None, so a bad probe degrades to today's behaviour instead of stopping a public miner.
+    The caller must re-read this coordinate's data shard afterwards (coord_data_slot), exactly as the
+    plateau advance does.
+
+    The probe sample is THIS miner's own train split for the coordinate it resolved by hash. That is a
+    deliberate, documented limitation: a shard is doms[coord_data_slot(L,E) % len(doms)], so the
+    ranking answers "which of my claimable coordinates does the frozen router prefer for THIS text",
+    not "which coordinate is best for its own domain". It is still strictly more informative than a
+    wallet hash, which correlates with nothing at all."""
+    cands = claim_all_coords(args, list(host.slots))
+    try:
+        rep = probe_expert_affinity(host, ids, coords=cands, log=log)
+    except Exception as ex:                                          # noqa: BLE001
+        log("[glm-contrib %s] affinity probe FAILED (%s: %s) -- keeping the hash-chosen claim "
+            "(L%d,E%d)" % (miner, type(ex).__name__, ex, L, E))
+        return L, E, i, None
+    ranked = [c for (c, _g, _r) in rep["ranking"]]
+    top = ranked[0]
+    if tuple(top) == (int(L), int(E)):
+        log("[glm-contrib %s] --claim-by affinity: (L%d,E%d) is ALREADY the highest-affinity "
+            "coordinate here (gate=%.6f)" % (miner, L, E, rep["gate"][tuple(top)]))
+        return L, E, i, ranked
+    idx = host.index_of(*top)
+    if idx is None:
+        try:
+            idx = host.register(*top)
+        except (ValueError, RuntimeError) as ex:
+            log("[glm-contrib %s] --claim-by affinity: cannot claim top-affinity (L%d,E%d): %s -- "
+                "keeping (L%d,E%d)" % (miner, top[0], top[1], ex, L, E))
+            return L, E, i, ranked
+    log("[glm-contrib %s] --claim-by affinity: RECLAIM (L%d,E%d) -> (L%d,E%d) [local slot %d], "
+        "gate %.6f > %.6f. Routing-blind selection is the measured-loser variant (MoE-Sieve: random "
+        "2.5pp worse than router-guided); this follows the frozen router instead."
+        % (miner, L, E, top[0], top[1], idx, rep["gate"][tuple(top)],
+           rep["gate"].get((int(L), int(E)), float("nan"))))
+    return int(top[0]), int(top[1]), int(idx), ranked
+
+
+# ================================================================== JOIN defaults (public testing)
+# Owner directive (memory public-testing-unlimited-slots-directive): public testing, UNLIMITED slots,
+# anyone may join. A join default that only works for the author is therefore a bug, not a policy:
+# a LOOPBACK --url reaches nothing from another machine and an EMPTY --token cannot write, so the
+# published Mine snippet was uncopyable and a stranger could not join at all.
+#
+# WHY PUBLISHING THIS TOKEN IS SAFE -- do NOT "fix" it back into a secret or a <placeholder>:
+#   * it is the PUBLIC DEMO token of the anchor content store, deliberately spam-open, and it
+#     already ships as the --token default of the esh_worker client (precedent: public commit
+#     1fdcd5a, "default the PUBLIC demo content token (no token setup, #71)");
+#   * ROTATING IT BREAKS EVERY RUNNING MINER (memory content-token-is-public-demo-token-2026-07-21);
+#   * the store's real write defense is per-writer signed PUT + rate/size/prefix bounds
+#     (docs/STORE_AUTH_DESIGN.md, tests/test_store_auth.py), not the secrecy of this string.
+# The env vars still win over both defaults, so a private or local lane stays one export away.
+PUBLIC_LANE_URL = "http://47.84.93.96:8710"
+PUBLIC_LANE_TOKEN = "2802648a1e87b4b3c6ca6da2688b4308"
+
+
 def add_common_args(ap):
     """Args shared by BOTH roles so coordinator and contributor cannot be configured apart."""
-    ap.add_argument("--url", default=os.environ.get("NEURAHASH_CONTENT_URL", "http://127.0.0.1:8797"))
-    ap.add_argument("--token", default=os.environ.get("NEURAHASH_CONTENT_TOKEN", ""))
+    # public lane, not loopback: a stranger must reach a real store with zero flags (see above).
+    ap.add_argument("--url", default=os.environ.get("NEURAHASH_CONTENT_URL", PUBLIC_LANE_URL),
+                    help="content-lane base URL (default: %(default)s); NEURAHASH_CONTENT_URL wins. "
+                         "The default IS the public anchor store, so joining needs no flag.")
+    # public DEMO token, not a secret: rotating it breaks every miner (see above).
+    ap.add_argument("--token", default=os.environ.get("NEURAHASH_CONTENT_TOKEN", PUBLIC_LANE_TOKEN),
+                    help="content-lane write token; NEURAHASH_CONTENT_TOKEN wins. Defaults to the "
+                         "PUBLIC DEMO token " + PUBLIC_LANE_TOKEN + " -- shared by design, not a "
+                         "credential. (Printed as a literal, not as the resolved default, so an "
+                         "operator's private lane token never lands in a --help paste.)")
     ap.add_argument("--mode", default=os.environ.get("NEURAHASH_GLM_MODE", "tiny"),
                     choices=("tiny", "glm"),
                     help="tiny = deterministic build_tiny_glm base (wire shakedown, plan S3); "
-                         "glm = real GLM-4.7-Flash piece via piece_loader (plan S4+)")
+                         "glm = real GLM-4.7-Flash piece via piece_loader (plan S4+). REAL MINING "
+                         "NEEDS --mode glm: the 'tiny' default is the hermetic-test lane.")
     ap.add_argument("--slots", default=os.environ.get("NEURAHASH_GLM_SLOTS", "1:0,1:1"),
                     help="lane slots as layer:expert pairs, e.g. 1:0,1:1")
+    # These two defaults are one node's local layout, NOT a lane fact: mode=glm needs YOUR own
+    # `tools/fetch_glm_base.py --dest <dir>` output (--shard-dir <dir>, --config-dir <dir>/config).
     ap.add_argument("--shard-dir", default=os.environ.get(
-        "NEURAHASH_GLM_SHARD_DIR", "D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb"))
+        "NEURAHASH_GLM_SHARD_DIR", "D:/hf_models/GLM-4.7-Flash-bf16_shards_100mb"),
+        help="dir holding pieces/ + manifests, i.e. `fetch_glm_base.py --dest` (mode=glm)")
     ap.add_argument("--config-dir", default=os.environ.get(
-        "NEURAHASH_GLM_CONFIG_DIR", "D:/hf_models/GLM-4.7-Flash-bf16"))
+        "NEURAHASH_GLM_CONFIG_DIR", "D:/hf_models/GLM-4.7-Flash-bf16"),
+        help="dir holding the model config.json, i.e. <fetch --dest>/config (mode=glm)")
+    # --pieces (plural) is the one that widens the CLAIMABLE universe; --piece is kept working
+    # verbatim so no existing launch script changes behaviour. See node_piece_ids for the measurement
+    # that motivated it (one piece == 5 coordinates == a campaign that ran out of work).
+    ap.add_argument("--pieces", default=os.environ.get("NEURAHASH_GLM_PIECES") or None,
+                    help="expert piece ids to keep resident: a single id, a comma list, or an "
+                         "INCLUSIVE range -- '0-12' makes all 64 experts of layer 1 claimable "
+                         "(one piece is only 5 coordinates). ALL selected experts stay resident on "
+                         "every node so contributor and coordinator route identically (plan risk 5); "
+                         "only the CLAIMED coordinate trains, so optimizer state does not scale. "
+                         "Overrides --piece when both are given. Env: NEURAHASH_GLM_PIECES.")
     ap.add_argument("--piece", type=int, default=int(os.environ.get("NEURAHASH_GLM_PIECE", "0")),
-                    help="expert piece id to keep resident; ALL its experts stay resident on every "
-                         "node so contributor and coordinator route identically (plan risk 5)")
-    ap.add_argument("--device", default=os.environ.get("NEURAHASH_GLM_DEVICE", "cpu"))
+                    help="DEPRECATED single expert piece id, kept so existing scripts keep working "
+                         "unchanged. Prefer --pieces: one piece holds only 5 (layer, expert) "
+                         "coordinates, which is what capped the whole campaign at 5.")
+    ap.add_argument("--device", default=os.environ.get("NEURAHASH_GLM_DEVICE", "cpu"),
+                    help="torch device. REAL MINING NEEDS --device cuda; the 'cpu' default keeps "
+                         "the test suite (and a --help on any box) off the GPU.")
     # MINER-FACING data dir: train + val ONLY. The coordinator's SECRET probe/heldout live in a
     # separate coordinator-only dir (tools/glm_wan_prep_data.py writes <out>/miner vs <out>/coord),
     # so this default resolves to a dir a miner can hold and even ship without leaking the gate (F1).
@@ -651,15 +1288,22 @@ def build_node_model(args, log=None, need_gib=None):
         raise SystemExit(
             "cannot import piece_loader (%s). It should ship next to this file in tools/; if you "
             "keep it elsewhere, point NEURAHASH_GLM_LOADER_DIR at that directory." % ex)
+    piece_ids = node_piece_ids(args)
     model, summ = piece_loader.build_partial_model(
-        args.shard_dir, [int(args.piece)], device=args.device, dtype=torch.bfloat16,
+        args.shard_dir, piece_ids, device=args.device, dtype=torch.bfloat16,
         config_dir=args.config_dir, strip_mtp=True)
     if int(summ.get("meta_params_left", 0)) != 0:
         raise SystemExit("[glm-node] FATAL: %d meta params left after load (incomplete piece)"
                          % summ["meta_params_left"])
+    # RESIDENCY ASSERTION: what got loaded must equal what was asked for. A piece id indexes the
+    # manifest's `experts_<id>` NAME, not its list position, and a mismatch there does NOT raise --
+    # it leaves a layer partially resident and every non-resident row inert (router -inf), i.e. the
+    # exact silent failure this lane already paid for once.
+    check_residency(summ.get("n_resident_experts"), node_claimable_coords(args), piece_ids)
     model.eval()
     if log:
-        log("[glm-node] GLM piece %d resident: %s" % (args.piece, summ))
+        log("[glm-node] GLM piece(s) %s (%d) resident: %s"
+            % (fmt_coord_pieces(piece_ids), len(piece_ids), summ))
     seq = _infer_seq(args)                      # from a split THIS role holds (never the secret one)
     return model, model.config, seq
 
@@ -668,7 +1312,7 @@ def _ids_path(args, slot, split, base=None):
     """Path to a split's id file. `base` overrides args.data_dir -- the coordinator passes its
     coordinator-only dir (args.coord_data_dir) for the secret probe/heldout splits (F1), so those
     files are read from a dir that is never present on a miner box."""
-    doms = [d.strip() for d in str(args.domains).split(",") if d.strip()]
+    doms = domains_list(args)                 # ONE parse for the whole module (see domains_digest)
     dom = doms[int(slot) % len(doms)]
     root = base if base is not None else args.data_dir
     return os.path.join(root, "ids_%s_%s.npy" % (dom, split))
@@ -716,9 +1360,23 @@ def model_root(host):
     of the accepted deltas diverged from the coordinator detects it IMMEDIATELY instead of training
     against a phantom base."""
     h = hashlib.sha256()
+    _campaign_seed_into(h, host_campaign_id(host))
     for i in range(len(host.slots)):
         _slot_digest_into(h, host, i)
     return h.hexdigest()
+
+
+def _campaign_seed_into(h, campaign_id):
+    """Seed a root digest with the CAMPAIGN, so two campaigns over an identical pristine base do not
+    share a lineage root at any height (see CAMPAIGN SCOPING at the top of this file: at genesis they
+    provably did, and a dead run's delta was therefore lineage-valid and got minted).
+
+    Deliberately the FIRST thing fed into the digest -- a prefix, not a suffix -- so it scopes the whole
+    hash rather than being appended to a value someone else could have already produced. An unset
+    campaign (None / "") feeds NOTHING, which is what keeps every pre-campaign root, pointer and
+    accepted record byte-identical. Pure."""
+    if campaign_id:
+        h.update(("campaign:%s|" % campaign_id).encode())
 
 
 def _slot_digest_into(h, host, idx):
@@ -762,6 +1420,7 @@ def slot_root(host, idx):
         (piece id -> coordinate differs, and nothing cross-verifies it) no longer disagree on the
         root of a coordinate they both hold."""
     h = hashlib.sha256()
+    _campaign_seed_into(h, host_campaign_id(host))    # campaign scope: see _campaign_seed_into
     _slot_digest_into(h, host, idx)
     return h.hexdigest()
 
@@ -1731,14 +2390,17 @@ def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid
     return rec
 
 
-def async_publish_name(base_event, miner, k):
+def async_publish_name(base_event, miner, k, campaign=None):
     """F-Q1: the UNIQUE per-publish contribution name = contrib_name(base_event, miner) + a per-miner
     monotonic counter suffix '.<k>'. When a miner completes >=2 H-blocks against ONE base_event (the
     coordinator merge lagging), each publish lands on a DISTINCT manifest name instead of the 2nd atomically
     repointing (and silently losing) the 1st -- the exact lost-work bug F-Q1 closes. The signature covers
     ecid/base_event/miner, NOT the name (H.sign at the publish site), so the suffix is signature-safe, and
-    the coordinator reads base_event/miner from the RECORD, not the name. Pure."""
-    return "%s.%d" % (contrib_name(base_event, miner), int(k))
+    the coordinator reads base_event/miner from the RECORD, not the name. Pure.
+
+    `campaign` scopes the name to one campaign (cg/<campaign_id>/r<N>/<miner>.<k>); None keeps the legacy
+    flat shape. See CAMPAIGN SCOPING at the top of this file."""
+    return "%s.%d" % (contrib_name(base_event, miner, campaign), int(k))
 
 
 # ==================================================================== v3.2.1 signed auto-update wire
@@ -1774,7 +2436,7 @@ def _maybe_self_update(log=_flush, _check=None):
 
 
 def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log,
-               *, wallet=None):
+               *, wallet=None, claim_ranked=None):
     """NON-BLOCKING async cadence (alpha 2.0 #146). Selected by main() only when the coordinator
     publishes a v2 pointer. The contributor NEVER waits on a barrier: each iteration it
       (1) scans the manifest ONCE and folds any accepted records past last_applied (non-blocking
@@ -1787,7 +2449,11 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     our root cannot reach the coordinator's aborts (rc6). Self-abort codes preserved: rc6 (no progress,
     redefined here), rc8 (poisoned accepted record -- unchanged from sync). rc7 (drift) does NOT exist
     in this path. Returns the process exit code. The only sleeps are args.poll pacing on a transient
-    manifest/pointer read failure -- there is no barrier sleep."""
+    manifest/pointer read failure -- there is no barrier sleep.
+
+    `claim_ranked` (--claim-by affinity) is the ESFT affinity order from probe_expert_affinity; when
+    given, the plateau advance walks it instead of the wallet-hash permutation, so releasing a
+    plateaued expert lands on the NEXT-HIGHEST-affinity coordinate this node holds."""
     # LOCAL re-gate closure, IDENTICAL to the sync path: the own-slot delta is re-gated on our own val
     # split (F2 defense-in-depth); cross-domain deltas fold unconditionally on the coordinator's signed
     # accept (own_slot=i scopes the check so a cross-domain accept is not false-positive rejected).
@@ -1807,9 +2473,17 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     last_pub_base_event = None
     advance_after = int(getattr(args, "advance_after", 0) or 0)
     claim_coords = claim_all_coords(args, list(host.slots))
-    log("[glm-contrib %s] shard claim: %d coordinate(s) claimable here, advance_after=%s"
+    # The sweep ORDER is per-identity (see next_claim_coord): a shared +1 advance turned a one-off
+    # collision between two miners into a permanent one. Same durable identity pick_start_coord used.
+    claim_identity = wallet.address if wallet is not None else (miner or "anonymous")
+    log("[glm-contrib %s] shard claim: %d coordinate(s) claimable here, advance_after=%s, order=%s, "
+        "walk=%s"
         % (miner, len(claim_coords),
-           ("%d consecutive rejects" % advance_after) if advance_after else "OFF (never advance)"))
+           ("%d consecutive rejects" % advance_after) if advance_after else "OFF (never advance)",
+           "ESFT affinity (measured)" if claim_ranked else "wallet-hash permutation",
+           " -> ".join("%d:%d" % c for c in claim_walk_order(
+               claim_coords, claim_identity, ranked=claim_ranked)[:6])
+           + ("..." if len(claim_coords) > 6 else "")))
     log("[glm-contrib %s] ASYNC cadence (v2 lane, #146): non-blocking; train continuously, never wait "
         "on a barrier. --max-rounds=%d counts our own contributions." % (miner, args.max_rounds))
     # -- alpha 3.0 Objective 2: periodic corpus re-sync baseline. OFF unless NEURAHASH_GLM_DATA_RESYNC;
@@ -1877,6 +2551,20 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             log("[glm-contrib %s] coordinator signalled DONE; exiting after %d contributions"
                 % (miner, rounds_done))
             return 0
+        # CAMPAIGN CHANGED: the lane is no longer the campaign we latched at boot -- the coordinator
+        # restarted into a new one. Every record we publish from here would land under a prefix it
+        # never scans, hashed against roots it never had, so we would train forever and be ignored with
+        # NOTHING logged anywhere: an undiscovered record is never even dropped. Exit loudly; a restart
+        # latches the current campaign at boot. (Both None on a legacy lane -> never fires.)
+        _ptr_camp = pointer_campaign_id(ptr)
+        if _ptr_camp != host_campaign_id(host):
+            log("[glm-contrib %s] FATAL: campaign CHANGED on the lane (ours=%s, pointer now advertises "
+                "%s) -- the coordinator restarted into a different campaign. Our contributions would be "
+                "published where it never looks and hashed against roots it never had: silent "
+                "starvation, so exiting instead. Restart to join %s."
+                % (miner, host_campaign_id(host) or "none", _ptr_camp or "none",
+                   _ptr_camp or "the current campaign"))
+            return RC_NO_CAMPAIGN
         pointer_root = dec["model_root"]
 
         # -- (1) NON-BLOCKING catch-up: fold every accepted record past last_applied, IN ORDER, but ONLY
@@ -1914,7 +2602,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             else:
                 reject_streak += 1
         if advance_after and reject_streak >= advance_after:
-            nxt = next_claim_coord(claim_coords, (L, E))
+            nxt = next_claim_coord(claim_coords, (L, E), identity=claim_identity,
+                                   ranked=claim_ranked)
             if nxt is None:
                 log("[glm-contrib %s] plateaued on (L%d,E%d) after %d consecutive gate rejects, but this "
                     "node holds no other coordinate to claim -- staying put." % (miner, L, E, reject_streak))
@@ -2013,7 +2702,9 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                                              delta_bytes, steps, tokens,
                                              address=(wallet.address if wallet is not None else None),
                                              base_slot_root=slot_root(host, i))
-        pub_name = async_publish_name(base_event, miner, publish_k)   # F-Q1: unique name per publish
+        # F-Q1: unique name per publish; CAMPAIGN-SCOPED so a future run cannot discover our records
+        # (and we cannot discover a dead run's) -- the id came from the coordinator's own pointer.
+        pub_name = async_publish_name(base_event, miner, publish_k, host_campaign_id(host))
         lane.put_json_named(pub_name, record)
         publish_k += 1
         rounds_done += 1
@@ -2077,6 +2768,17 @@ def main(argv=None):
                          "holds. That is the sweep -- claim, work, plateau, release, claim next. "
                          "0 disables advancing (stay on one coordinate forever, pre-shard-claim "
                          "behaviour).")
+    ap.add_argument("--claim-by", dest="claim_by",
+                    default=os.environ.get("NEURAHASH_SD_CLAIM_BY", "hash"),
+                    choices=("hash", "affinity"),
+                    help="HOW to choose which expert coordinate to train. hash (default, unchanged "
+                         "behaviour) derives it from the wallet address -- registry-free but "
+                         "routing-BLIND, and routing-blind selection is the variant MoE-Sieve measured "
+                         "2.5pp WORSE than router-guided at matched budget. affinity runs ESFT's "
+                         "forward-pass-only probe (arXiv:2407.01906) over this node's own train sample "
+                         "at startup, claims the HIGHEST-affinity claimable coordinate, and advances "
+                         "on plateau to the next-highest instead of the next hash bucket. The full "
+                         "ranking is logged once so the choice is auditable.")
     ap.add_argument("--garbage", action="store_true",
                     help="ADVERSARIAL control: publish a correctly-SIGNED but harmful random delta "
                          "(sharddiloco_glm_expert.garbage_delta) that the secret-probe gate must REJECT")
@@ -2093,6 +2795,22 @@ def main(argv=None):
     L, E, i, _claim_src = resolve_claim(
         args, slots, log=_flush,
         identity=(wallet.address if wallet is not None else (args.miner or "miner0")))
+    # SHARD CLAIM: hold EVERY claimable coordinate in the lane host, not just the one we claimed.
+    #
+    # MEASURED 2026-07-25 on the live WAN lane: holding only the claimed coordinate makes every
+    # accepted delta for the OTHERS get skipped as "not resident here", so they sit at the frozen base
+    # while the coordinator's move on. The moment we plateau and advance, the new coordinate is stale,
+    # which forced a blocking resume_to_root replay -- and on a real lane that replay (24 s manifest
+    # read plus a per-record fold) took longer than the coordinator's 600 s idle window, so a HEALTHY
+    # advancing miner made the coordinator conclude the lane was idle and shut down at event 29.
+    #
+    # Registering the whole claimable set up front means the normal catch-up path folds accepted deltas
+    # for all of them as events stream by, so an advance needs no replay at all -- resume_to_root then
+    # early-returns because the root already matches. Cost is trivial: 5 coordinates is ~189 MB of fp32
+    # working state and ~0.1 s per model_root, versus minutes of stall per advance.
+    for _c in claim_all_coords(args, list(slots)):
+        if tuple(_c) not in slots:
+            slots.append(tuple(_c))
     # KEYLESS: the miner id IS the wallet-address derivation (the coordinator binds the name to the recovered
     # key, so any other name is rejected). KEYED: --miner / NEURAHASH_SD_MINER, else the legacy 'miner0'.
     if wallet is not None:
@@ -2124,6 +2842,22 @@ def main(argv=None):
     train_ids = node_ids(args, coord_data_slot(L, E), "train")
     val_ids = node_ids(args, coord_data_slot(L, E), "val")
 
+    # ---- --claim-by affinity: replace the routing-BLIND wallet-hash claim with a MEASURED one. -------
+    # Runs here and nowhere earlier because it needs the built model, and it reuses THAT model rather
+    # than loading a second one (4.02 GiB trunk + 1.125 GiB/resident layer would not fit twice). Forward
+    # passes only. Default is still `hash`, so a miner that does not ask for this is byte-identical to
+    # v3.3.2. See the ESFT block above for the three measured results that make hash the losing variant.
+    _claim_ranked = None
+    if str(getattr(args, "claim_by", "hash")) == "affinity":
+        L, E, i, _claim_ranked = affinity_claim(args, host, train_ids, L, E, i, miner=miner,
+                                                log=_flush)
+        # Same mid-flight reload the plateau advance performs: the data shard is a function of the
+        # COORDINATE (doms[coord_data_slot(L,E) % len(doms)]), so re-claiming changes which files we
+        # train and self-gate on. Skipping this trains one domain and gates on another -- a systematic
+        # reject with no error anywhere (C6).
+        train_ids = node_ids(args, coord_data_slot(L, E), "train")
+        val_ids = node_ids(args, coord_data_slot(L, E), "val")
+
     # wait for the coordinator's first pointer
     ptr, t0 = None, time.time()
     while time.time() - t0 < args.wait_up:
@@ -2139,6 +2873,20 @@ def main(argv=None):
                % (miner, args.url, args.wait_up))
         return 4
 
+    # ---- FIX B (C6): cross-check the ONE flag nothing else validates -- --domains. -------------------
+    # Both roles compute their data shard as doms[coord_data_slot(L,E) % len(doms)] on their OWN list, so a
+    # divergent list (or merely a divergent ORDER) gates every delta on text this miner never trained on and
+    # rejects it systematically WITH NO ERROR ANYWHERE. Refuse to start instead, naming both lists. Additive:
+    # a coordinator that publishes no digest is a pre-Shard-Claim peer -- log once and continue as before.
+    _dom_mismatch = domains_mismatch(ptr, args)
+    if _dom_mismatch:
+        _flush("[glm-contrib %s] FATAL: %s" % (miner, _dom_mismatch))
+        return RC_DOMAINS_MISMATCH
+    if not ptr.get("domains_digest"):
+        _flush("[glm-contrib %s] NOTE: coordinator publishes no domain digest (pre-Shard-Claim peer) -- "
+               "cannot cross-check our --domains %s; an undetected mismatch would reject every delta "
+               "silently." % (miner, ",".join(domains_list(args))))
+
     # ---- MODE SELECTION (alpha 2.0, #146): pointer-driven, decided ONCE on the first pointer. -------
     # A v2 pointer (coordinator opted into NEURAHASH_SD_ASYNC) runs the NON-BLOCKING async cadence; a v1
     # pointer -- or an explicit NEURAHASH_SD_ASYNC=0 opt-out on a v2 lane -- falls through to the EXISTING
@@ -2151,9 +2899,36 @@ def main(argv=None):
     _flush("[glm-contrib %s] MODE=%s (pointer v%s event=%s name=%s) -- #146 async iff v2"
            % (miner, "ASYNC" if _mode_async else "SYNC", _pdec.get("v"), _pdec.get("event"),
               H.POINTER_NAME))
+
+    # ---- CAMPAIGN SCOPE: latch the coordinator's campaign id, or refuse to publish (fail-closed). ----
+    # Everything downstream reads it off the host: the record NAMES we publish under and the lineage
+    # ROOTS we hash. Bound here, once, from the first pointer -- before any root that a coordinator will
+    # judge is computed (the boot "base ready" line above is only a log). See CAMPAIGN SCOPING above.
+    #
+    # AFTER the mode decision, and ASYNC-ONLY, deliberately: a v1 SYNC pointer has no field to carry a
+    # campaign id, and the coordinator makes scoping inert in sync mode for exactly that reason
+    # (sharddiloco_glm_coordinator.main). Refusing there would mean a default-configured miner could no
+    # longer join ANY legacy v1 lane -- breaking the "the sync path stays byte-identical" contract this
+    # file has kept since alpha-2.
+    if _mode_async:
+        _camp_refusal = campaign_refusal(ptr)
+        if _camp_refusal:
+            _flush("[glm-contrib %s] FATAL: %s" % (miner, _camp_refusal))
+            return RC_NO_CAMPAIGN
+        _campaign = bind_campaign_id(host, pointer_campaign_id(ptr))
+        if _campaign:
+            _flush("[glm-contrib %s] campaign=%s (from the coordinator's pointer): publishing under %s "
+                   "and hashing lineage roots seeded with it -- a dead campaign's records cannot be "
+                   "confused with ours." % (miner, _campaign, campaign_prefix(_campaign) + "r<N>/"))
+        else:
+            _flush("[glm-contrib %s] campaign scoping OFF (NEURAHASH_SD_CAMPAIGN_SCOPE=0) and this "
+                   "coordinator advertises none: publishing into the SHARED %sr<N>/ namespace with "
+                   "unseeded lineage roots, where a dead campaign's records are indistinguishable from "
+                   "ours. Legacy lanes only." % (miner, campaign_prefix(None)))
     if _mode_async:
         return _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner,
-                          train_ids, val_ids, seq, _flush, wallet=wallet)
+                          train_ids, val_ids, seq, _flush, wallet=wallet,
+                          claim_ranked=_claim_ranked)
 
     done_last = -1
     applied = -1            # last round whose ACCEPTED record has been replayed locally
@@ -2254,7 +3029,7 @@ def main(argv=None):
                       base_slot_root=slot_root(host, i))     # SHARD CLAIM: per-coordinate lineage
         if wallet is not None:
             record["address"] = wallet.address                  # keyless: claimed address (coordinator trusts recovered)
-        rname = contrib_name(rnd, miner)
+        rname = contrib_name(rnd, miner, host_campaign_id(host))   # campaign-scoped (None -> legacy)
         rec_cid = lane.put_json_named(rname, record)
         done_last = rnd
         rounds_done += 1

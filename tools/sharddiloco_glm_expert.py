@@ -503,7 +503,19 @@ class GlmExpertLaneHost:
         return exp.base if hasattr(exp, "base") else exp
 
     def read_slot(self, idx):
-        """Current canonical {gate,up,down} of slot idx, as numpy float32 (a copy)."""
+        """Current canonical {gate,up,down} of slot idx, as numpy float32.
+
+        ALIASING (corrected 2026-07-26 -- this docstring used to claim "a copy", which is the opposite of
+        the behaviour on the dtype the tiny test model uses). `.float()` is a no-op when the fused weights
+        are ALREADY float32 on CPU, and `.numpy()` then shares storage with the model tensor, so on a
+        float32 CPU model the returned arrays ALIAS the model: mutating them mutates the model in place
+        (measured). They are genuine copies exactly when a cast or a device hop happens -- any non-float32
+        dtype (a real bf16 GLM trunk) or any non-CPU device.
+
+        Callers that must not touch the model therefore copy DEFENSIVELY rather than relying on the dtype:
+        `_repair_base_slot` and `begin_round` below do (`v.copy()`), and so does the resume snapshot in
+        sharddiloco_glm_coordinator.py:639-640, whose comment already asserted the alias. Do the same in
+        any new caller -- a lane that only ever runs bf16 would hide the bug until someone ran fp32."""
         import torch
         L, E = self.slots[idx]
         exp = self._fused(L)

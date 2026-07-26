@@ -36,6 +36,11 @@ os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 REPO = "whitegreenstudios888/neurahash-data"
 PREFIX = "glm47_pieces_100mb"
 
+# sha256 of the GLM-4.7-Flash config.json, already present as an object in the public lane (verified
+# 2026-07-25). A content hash, never a secret -- see the --config-cid comment in main() for why this
+# needs a default at all.
+PUBLIC_CONFIG_CID = "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb"
+
 
 def _force_ipv4():
     import socket
@@ -98,9 +103,16 @@ def main():
     ap.add_argument("--dest", required=True, help="shard dir to populate (holds pieces/ + manifests)")
     ap.add_argument("--pieces", default="0", help="comma-separated expert piece indices to fetch")
     ap.add_argument("--skip-trunk", action="store_true", help="trunk already present and verified")
-    ap.add_argument("--config-cid", default=os.environ.get("NEURAHASH_GLM_CONFIG_CID"),
+    # The config CID is a CONTENT HASH, not a secret, and it must have a working default: without one
+    # the loader fails only AFTER a multi-GB download, so a stranger burns the whole fetch and ends up
+    # with an unloadable shard dir. Measured 2026-07-25: this value is the sha256 of the GLM-4.7-Flash
+    # config.json and the object is already present in the public lane, so defaulting it costs nothing
+    # and is the last step to a genuinely joinable lane. Env NEURAHASH_GLM_CONFIG_CID still wins.
+    ap.add_argument("--config-cid",
+                    default=os.environ.get("NEURAHASH_GLM_CONFIG_CID", PUBLIC_CONFIG_CID),
                     help="content-address of the model config.json; fetched from the lane into "
-                         "<dest>/config so ONE fetch leaves a LOADABLE shard dir")
+                         "<dest>/config so ONE fetch leaves a LOADABLE shard dir "
+                         "(default: the published GLM-4.7-Flash config, %(default)s)")
     ap.add_argument("--lane", default=os.environ.get("NEURAHASH_CONTENT_URL",
                                                      "http://47.84.93.96:8710"))
     args = ap.parse_args()

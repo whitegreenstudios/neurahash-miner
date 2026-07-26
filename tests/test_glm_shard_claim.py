@@ -21,9 +21,13 @@ properties here are load-bearing and neither is obvious:
 
 Run: C:/Python313/python.exe -m pytest tests/test_glm_shard_claim.py -q
 """
+import argparse
+import ipaddress
+import json
 import os
 import sys
 import types
+import urllib.parse
 
 import pytest
 
@@ -77,6 +81,218 @@ class TestClaimableExpertIds:
         no real experts at all, and used to boot completely clean and then train nothing."""
         man = self._manifest({589: [[47, 0], [47, 1], [47, 2]]})
         assert PL.claimable_expert_ids(man, [589], self._cfg()) == []
+
+
+# ================================================== MULTI-PIECE residency (--pieces), no torch
+# WHY: run 4 plateaued at held-out CE 6.51103 and then ran ~620 events over ~7.5 h with ZERO accepted
+# merges. Not archaeology (760 of 769 events went to the two live miners) and not dead miners (both
+# training at ~40 s/round). The cause was structural: --piece is ONE int, one piece covers 5
+# coordinates, so the campaign's entire trainable universe was (L1,E0)..(L1,E4) and the miners cycled
+# 129 PLATEAU -> RELEASE -> CLAIM transitions across the same five forever. Shard Claim worked; it had
+# nowhere to go (scratchpad/FINDING_five_coordinate_ceiling.md). On the live manifest layer 1 is
+# covered by pieces 0..12 = all 64 experts, and piece_loader allocates a resident layer's fused params
+# FULL WIDTH either way -- so widening residency fills rows of tensors that already exist.
+@pytest.fixture
+def shard_dir(tmp_path):
+    """A manifest + config shaped like the real one but scaled to the tiny model (layers 0..2 with
+    layer 0 dense, 4 experts per layer), so the same fixtures drive both the pure filter and the real
+    host registry. Piece 3 is 100% MTP (layer 3 == num_hidden_layers), mirroring live pieces 589-601.
+
+    No piece FILES are written: node_claimable_coords reads the manifest as pure metadata
+    (require_files=False), which is the whole point of doing the claim check before the 5.67 GB load."""
+    pieces = {0: [[1, 0], [1, 1]], 1: [[1, 2], [1, 3]], 2: [[2, 0], [2, 1]], 3: [[3, 0], [3, 1]]}
+    man = {"version": 1, "n_pieces": len(pieces) + 1,
+           "pieces": [{"piece": "trunk", "experts": []}]
+                     + [{"piece": "experts_%d" % p, "experts": e} for p, e in sorted(pieces.items())]}
+    (tmp_path / "model_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 3, "first_k_dense_replace": 1}), encoding="utf-8")
+    return str(tmp_path)
+
+
+def _piece_args(shard_dir, pieces=None, piece=0, expert=None):
+    """A --mode glm namespace carrying exactly the fields the piece/claim path reads."""
+    return types.SimpleNamespace(mode="glm", shard_dir=shard_dir, config_dir=None,
+                                 piece=piece, pieces=pieces, expert=expert, slot=None,
+                                 slots="1:0,1:1", domains="code,gutenberg")
+
+
+class TestParsePieces:
+    """Parsing is where a silent failure would hurt most: degrading a typo to piece 0 would rebuild
+    the exact five-coordinate ceiling this flag exists to remove, and nothing downstream would say so."""
+
+    def test_a_single_id_is_a_one_element_list(self):
+        assert N.parse_pieces("7") == [7]
+
+    def test_a_comma_list_keeps_every_id(self):
+        assert N.parse_pieces("0,1,2") == [0, 1, 2]
+
+    def test_a_range_is_inclusive_on_both_ends(self):
+        """'0-12' must be THIRTEEN pieces: on the live manifest that is exactly layer 1's 64 experts,
+        and an exclusive end would leave it 59/64 with the missing rows silently inert."""
+        assert N.parse_pieces("0-12") == list(range(13))
+        assert len(N.parse_pieces("0-12")) == 13
+
+    def test_overlapping_and_duplicate_entries_collapse_and_sort(self):
+        assert N.parse_pieces("2,0-3,1,3") == [0, 1, 2, 3]
+        assert N.parse_pieces("5-7,6-8") == [5, 6, 7, 8]
+
+    def test_whitespace_is_tolerated(self):
+        assert N.parse_pieces(" 0 - 2 , 5 ") == [0, 1, 2, 5]
+
+    @pytest.mark.parametrize("bad", ["", "   ", "a", "0,,1", "1-", "-", "1-b", "0-2,", "3-1", "-1"])
+    def test_every_malformed_value_fails_loudly_instead_of_selecting_piece_0(self, bad):
+        with pytest.raises(SystemExit) as ex:
+            N.parse_pieces(bad)
+        assert "--pieces" in str(ex.value)
+
+
+class TestNodePieceIds:
+    """--pieces wins when given; --piece keeps working byte-for-byte otherwise."""
+
+    def test_pieces_selects_the_union(self, shard_dir):
+        assert N.node_piece_ids(_piece_args(shard_dir, pieces="0-2")) == [0, 1, 2]
+
+    def test_piece_alone_is_unchanged(self, shard_dir):
+        assert N.node_piece_ids(_piece_args(shard_dir, piece=1)) == [1]
+
+    def test_pieces_overrides_piece(self, shard_dir):
+        assert N.node_piece_ids(_piece_args(shard_dir, pieces="2", piece=0)) == [2]
+
+    def test_an_args_namespace_without_pieces_at_all_still_works(self):
+        """Callers predating this flag (and the async lane's dirty-namespace test) pass a partial
+        namespace; getattr-defaulting is what keeps them on the old single-piece path."""
+        args = types.SimpleNamespace(piece=4)
+        assert N.node_piece_ids(args) == [4]
+
+    def test_an_empty_pieces_string_falls_back_to_piece(self, shard_dir):
+        """NEURAHASH_GLM_PIECES='' must mean 'unset', not 'parse the empty string and die'."""
+        assert N.node_piece_ids(_piece_args(shard_dir, pieces="", piece=3)) == [3]
+
+
+class TestClaimableUnionAcrossPieces:
+    """The actual unlock: claimable_here must be the UNION of the selected pieces' coordinates."""
+
+    def test_multi_piece_yields_the_union_and_its_exact_size(self, shard_dir):
+        """Assert the NUMBER, not just non-emptiness: the whole finding is that the count was 5 when
+        the operator believed the space was unlimited. Pieces 0..2 hold 2 coordinates each = 6."""
+        got = N.node_claimable_coords(_piece_args(shard_dir, pieces="0-2"))
+        assert got == [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1)]
+        assert len(got) == 6 == sum(2 for _ in range(3))
+
+    def test_a_comma_list_matches_the_equivalent_range(self, shard_dir):
+        assert (N.node_claimable_coords(_piece_args(shard_dir, pieces="0,1,2"))
+                == N.node_claimable_coords(_piece_args(shard_dir, pieces="0-2")))
+
+    def test_single_piece_behaviour_is_byte_for_byte_what_it_was(self, shard_dir):
+        """The no-silent-change guard: --piece N must return exactly what piece_loader reports for
+        [N] -- the same call the pre-multi-piece code made."""
+        cfg = types.SimpleNamespace(num_hidden_layers=3, first_k_dense_replace=1)
+        man = PL.load_manifest(shard_dir, require_files=False)
+        for pid in (0, 1, 2):
+            assert (N.node_claimable_coords(_piece_args(shard_dir, piece=pid))
+                    == PL.claimable_expert_ids(man, [pid], cfg))
+        assert N.node_claimable_coords(_piece_args(shard_dir, piece=0)) == [(1, 0), (1, 1)]
+
+    def test_the_mtp_filter_still_applies_across_a_union(self, shard_dir):
+        """Piece 3 is 100% MTP. Widening residency must not smuggle unreal coordinates in -- handing
+        one to the lane host raised a naked 'index 3 is out of range' deep inside read_slot."""
+        assert N.node_claimable_coords(_piece_args(shard_dir, pieces="3")) == []
+        assert N.node_claimable_coords(_piece_args(shard_dir, pieces="0-3")) == \
+            N.node_claimable_coords(_piece_args(shard_dir, pieces="0-2"))
+
+    def test_a_piece_id_absent_from_the_manifest_fails_loudly(self, shard_dir):
+        with pytest.raises(SystemExit, match=r"cannot determine this node's claimable coordinates"):
+            N.node_claimable_coords(_piece_args(shard_dir, pieces="0-9"))
+
+
+class TestClaimabilityGuardAcrossPieces:
+    """The guard must WIDEN with residency and not one millimetre further: a coordinate in a selected
+    piece becomes claimable, a coordinate in a NON-selected piece stays refused."""
+
+    def test_a_coordinate_in_a_newly_resident_piece_is_claimable(self, shard_dir):
+        slots = N.parse_slots("1:0,1:1")
+        L, E, i, src = N.resolve_claim(_piece_args(shard_dir, pieces="0-2", expert="1:3"),
+                                       slots, log=lambda *a: None)
+        assert (L, E) == (1, 3) and src == "--expert"
+        assert slots[i] == (1, 3)
+
+    def test_the_same_coordinate_is_refused_under_the_old_single_piece(self, shard_dir):
+        """(1,3) lives in piece 1. Under --piece 0 it must still be refused -- this is the assertion
+        that the guard was widened by RESIDENCY and not simply weakened."""
+        with pytest.raises(SystemExit, match=r"REFUSING to claim \(L1,E3\)"):
+            N.resolve_claim(_piece_args(shard_dir, piece=0, expert="1:3"),
+                            N.parse_slots("1:0,1:1"), log=lambda *a: None)
+
+    def test_a_coordinate_outside_every_selected_piece_is_still_refused(self, shard_dir):
+        """(2,0) is in piece 2; selecting only 0-1 must not make it claimable."""
+        with pytest.raises(SystemExit, match=r"REFUSING to claim \(L2,E0\)"):
+            N.resolve_claim(_piece_args(shard_dir, pieces="0-1", expert="2:0"),
+                            N.parse_slots("1:0,1:1"), log=lambda *a: None)
+
+    def test_the_refusal_names_the_flag_the_operator_actually_passed(self, shard_dir):
+        with pytest.raises(SystemExit, match=r"--pieces 0-1 does not hold it"):
+            N.resolve_claim(_piece_args(shard_dir, pieces="0-1", expert="2:0"),
+                            N.parse_slots("1:0,1:1"), log=lambda *a: None)
+
+    def test_an_all_mtp_selection_still_gets_its_own_message(self, shard_dir):
+        with pytest.raises(SystemExit, match=r"--pieces 3 holds NO real experts"):
+            N.resolve_claim(_piece_args(shard_dir, pieces="3", expert="1:0"),
+                            N.parse_slots("1:0,1:1"), log=lambda *a: None)
+
+    def test_claim_all_coords_sweeps_the_whole_union(self, shard_dir):
+        """The plateau-advance path must see the widened universe, or the miner still cycles the same
+        five coordinates forever -- the measured symptom this change exists to fix."""
+        got = N.claim_all_coords(_piece_args(shard_dir, pieces="0-2"), N.parse_slots("1:0,1:1"))
+        assert len(got) == 6 and (1, 3) in got and (2, 1) in got
+
+
+class TestTheUnionFeedsTheRealRegistry:
+    """Claimable is only half the story -- the lane host must actually REGISTER the widened
+    coordinates, because the host is what reads and writes weights. Uses the real tiny GLM."""
+
+    def test_a_coordinate_from_a_newly_selected_piece_registers_and_activates(self, host, shard_dir):
+        G, model, cfg, _ = host
+        claimable = N.node_claimable_coords(_piece_args(shard_dir, pieces="0-2"))
+        h = G.GlmExpertLaneHost(model, cfg, [(1, 0), (1, 1)], claimable=claimable)
+        assert h.index_of(1, 3) is None                      # unseen at startup
+        i = h.register(1, 3)
+        assert i == 2 and h.index_of(1, 3) == 2
+
+    def test_the_narrow_single_piece_host_still_refuses_it(self, host, shard_dir):
+        """Same model, same code path, narrower residency -> refused. The registry guard tracks
+        residency rather than having been loosened."""
+        G, model, cfg, _ = host
+        claimable = N.node_claimable_coords(_piece_args(shard_dir, piece=0))
+        h = G.GlmExpertLaneHost(model, cfg, [(1, 0), (1, 1)], claimable=claimable)
+        with pytest.raises(ValueError):
+            h.register(1, 3)
+
+
+class TestResidencyAssertion:
+    """A piece id names `experts_<id>`, NOT a position in the manifest's piece list (which also holds
+    the trunk). An off-by-one there does not raise anywhere: the layer comes back partially resident
+    and the missing rows are writable-but-inert. Measured on tools/glm_router_domain_probe.py as a
+    layer silently left 59/64. This assertion is what turns that into a startup failure."""
+
+    def test_a_match_passes_and_returns_the_count(self):
+        assert N.check_residency(64, [(1, e) for e in range(64)], list(range(13))) == 64
+
+    def test_a_short_load_is_fatal_and_says_which_pieces(self):
+        with pytest.raises(SystemExit) as ex:
+            N.check_residency(59, [(1, e) for e in range(64)], list(range(13)))
+        msg = str(ex.value)
+        assert "residency mismatch" in msg and "59 resident" in msg and "64 claimable" in msg
+
+    def test_an_over_long_load_is_equally_fatal(self):
+        """Too MANY resident experts means the ids resolved to different pieces than requested --
+        just as wrong, and it would quietly change what every node routes over (plan risk 5)."""
+        with pytest.raises(SystemExit, match=r"residency mismatch"):
+            N.check_residency(70, [(1, e) for e in range(64)], list(range(13)))
+
+    def test_unchecked_residency_stays_a_no_op(self):
+        """tiny mode / no manifest -> claimable is None -> no assertion, exactly as before."""
+        assert N.check_residency(5, None, [0]) is None
 
 
 # ============================================================ the slot registry on a real tiny GLM
@@ -1042,9 +1258,17 @@ def _loop_env(loop_model, store_harness, start_slots, rounds, max_active=None):
                 claimable=claimable)
 
 
-def _publish_claim(env, coord, miner, base_event=0, wire_idx=0, host=None, seed=0):
+def _publish_claim(env, coord, miner, base_event=0, wire_idx=0, host=None, seed=0, key=_LKEY,
+                   slot_root=None):
     """Publish ONE contribution addressed by COORDINATE, the way a shard-claim miner does. `host` is the
-    MINER's host (its own slot list, hence its own local index) -- deliberately not the coordinator's."""
+    MINER's host (its own slot list, hence its own local index) -- deliberately not the coordinator's.
+
+    `key` is the HMAC key the record is SIGNED with; pass anything other than _LKEY (or None for no
+    signature at all) to publish exactly what an unauthenticated party can PUT on this shared-token lane.
+
+    `slot_root` OVERRIDES base_slot_root, which is how a lineage-DEAD record is modelled: that field is
+    UNSIGNED (the HMAC covers cid + base_event + miner only), so a dead run's leftover -- or anyone
+    holding the public PUT token -- can carry a root this coordinator never produced."""
     h = env["host"] if host is None else host
     idx = h.index_of(*coord)
     ref = h.read_slot(idx if idx is not None else 0)
@@ -1053,9 +1277,10 @@ def _publish_claim(env, coord, miner, base_event=0, wire_idx=0, host=None, seed=
     cid = env["store"].put_delta(payload)
     rec = N.build_async_contrib_record(
         miner, wire_idx, coord[0], coord[1], base_event, N.model_root(h), cid,
-        _H.sign(_LKEY, cid, base_event, miner), 1e9,
+        (_H.sign(key, cid, base_event, miner) if key is not None else None), 1e9,
         int(len(_H.pack_arrays(payload, np.float16))), 10, 160,
-        base_slot_root=(N.slot_root(h, idx) if idx is not None else None))
+        base_slot_root=(slot_root if slot_root is not None
+                        else (N.slot_root(h, idx) if idx is not None else None)))
     name = N.contrib_name(base_event, miner)
     env["store"].put_json_named(name, rec)
     env["store"].schedule_contrib(name)
@@ -1517,3 +1742,1665 @@ class TestF6NoProgressGuardSkippedWhenSlotSetsDiffer:
         import inspect
         src = inspect.getsource(N._run_async)
         assert "comparable=global_root_comparable(host, dec)" in src
+
+
+# ===================================================== v3.4.1 FIX A: discovery cost on a long-lived store
+class _CountingLane:
+    """The ContentLane surface the async loop's DISCOVER pass touches, with CALL COUNTERS.
+
+    Counting is the whole point: on the live store (11,051 objects, 13.6 GB) `manifest()` was MEASURED at
+    23.79 s against `get_json()` at 0.06 s, so "how many times per pass" is a first-order cost, not a
+    detail. Nothing here fakes the loop -- run_async_events is driven for real."""
+
+    def __init__(self, records):
+        self.names, self._recs = {}, {}
+        for name, rec in sorted(records.items()):
+            sha = "sha-" + name.replace("/", "-")
+            self.names[name] = {"sha256": sha}
+            self._recs[sha] = rec
+        self.manifest_calls = 0
+        self.fetched = []                       # sha of every get_json, in order
+        self.written = []                       # named writes (genesis + terminal pointer)
+
+    def manifest(self):
+        self.manifest_calls += 1
+        return dict(self.names)
+
+    def get_json(self, sha):
+        self.fetched.append(sha)
+        return dict(self._recs[sha])
+
+    def put_json_named(self, name, obj):
+        self.written.append(name)
+        return "cid%d" % len(self.written)
+
+
+class _RegistryHost(_FoldHost):
+    """_FoldHost plus the slot-registry surface run_async_events touches BEFORE any merge (register /
+    index_of / is_active / evict / active / claimable_coords). No torch, no GLM: these tests never let a
+    slot become ready, so the merge path -- the only part that needs a real model -- is never entered."""
+
+    def __init__(self, coords, shape=(2, 3)):
+        _FoldHost.__init__(self, coords, shape=shape)
+        self._shape = shape
+        self.active = set(range(len(self.slots)))
+        self.max_active = None
+
+    def register(self, L, E):
+        i = self.index_of(L, E)
+        if i is None:
+            self.slots.append((int(L), int(E)))
+            i = len(self.slots) - 1
+            self._w[i] = {k: np.zeros(self._shape, np.float32) for k in ("gate", "up", "down")}
+        self.active.add(int(i))
+        return int(i)
+
+    def is_active(self, i):
+        return int(i) in self.active
+
+    def evict(self, i):
+        had = int(i) in self.active
+        self.active.discard(int(i))
+        return had
+
+    def claimable_coords(self):
+        return None
+
+
+class _PooledProbe:
+    """Every startup slot already HAS its secret gate pool, so _admit_coordinate takes the
+    known-coordinate path and never builds one (pool construction needs the real corpus)."""
+
+    def __init__(self):
+        self.ensure_calls = []
+
+    def has_pool(self, i):
+        return True
+
+    def ensure_pool(self, i, pools):
+        self.ensure_calls.append(int(i))
+
+
+_A_COORD = (1, 0)                       # the ONE coordinate these tests declare at startup
+
+
+def _contrib_rec(base_event, miner, coord=_A_COORD):
+    """A contribution record as the wire carries it: addressed by COORDINATE, dated by base_event."""
+    return dict(miner=miner, expert=0, layer=int(coord[0]), glm_expert=int(coord[1]),
+                base_event=int(base_event), base_root="g0", base_slot_root="s0",
+                expert_cid="c-%s" % miner, sig="00" * 32, steps=10, tokens=160,
+                train_flops=1e9, delta_bytes=1024)
+
+
+def _loop_args(rounds=1):
+    a = types.SimpleNamespace()
+    a.rounds = rounds
+    a.poll_timeout = 5.0
+    a.mode = "tiny"
+    a.outer = 0.7
+    a.margin = -1e9
+    a.merge_tol = 1e9
+    a.probe_size = 8
+    a.eval_chunk = 64
+    a.slots = "1:0"
+    a.domains = "code,gutenberg"
+    a.threads = 2
+    a.max_active_slots = 8
+    return a
+
+
+@coordinator_only
+class TestFixAManifestIsNotReReadEveryPass:
+    """FIX A (v3.4.1). run_async_events called `lane.manifest()` at the TOP of every iteration. MEASURED
+    2026-07-25 against the live store: manifest() = 23.79 s, get_json() = 0.06 s -- so the loop was capped
+    near 2.5 iterations per MINUTE no matter what NEURAHASH_SD_POLL_S said (it logged poll=1.5s), it
+    degrades linearly forever because the store never deletes, and a fresh --no-resume coordinator spent
+    ~20 minutes without judging any of a healthy miner's 7 valid contributions. On a CLEAN store (manifest
+    0.014 s) the same campaign accepted within ~2 minutes.
+
+    Method: drive the REAL loop (the same function the live campaign runs) with a grace window nothing can
+    satisfy, so exactly one record is DISCOVERED and stays PENDING -- the loop keeps spinning with work in
+    hand, which is precisely the state in which re-reading the manifest is pure waste. Pass count comes
+    from _collect_unprocessed, called once per pass past the manifest step."""
+
+    @staticmethod
+    def _env(monkeypatch, refresh="1e9", idle="0.3"):
+        monkeypatch.setenv("NEURAHASH_SD_MANIFEST_REFRESH_S", refresh)
+        monkeypatch.setenv("NEURAHASH_SD_IDLE_EXIT_S", idle)
+        monkeypatch.setenv("NEURAHASH_SD_POLL_S", "0.001")
+        monkeypatch.setenv("NEURAHASH_SD_GRACE_S", "300")     # nothing EVER becomes ready -> no merge
+        monkeypatch.setenv("NEURAHASH_SD_QUORUM_K", "1")
+        monkeypatch.setenv("NEURAHASH_SD_IDLE_EVICT_EVENTS", "0")
+        monkeypatch.setenv("NEURAHASH_GLM_OPEN_ADMISSION", "0")   # no registry file read in a unit test
+        monkeypatch.setenv("NEURAHASH_GLM_QUORUM", "0")
+        monkeypatch.delenv("NEURAHASH_SHARDDILOCO_MAX_STALENESS", raising=False)
+
+    @staticmethod
+    def _drive(monkeypatch, records):
+        import sharddiloco_glm_coordinator as C
+        lane = _CountingLane(records)
+        host = _RegistryHost([_A_COORD])
+        passes = {"n": 0}
+        _real = C._collect_unprocessed
+
+        def _counting(*a, **kw):
+            passes["n"] += 1
+            return _real(*a, **kw)
+
+        monkeypatch.setattr(C, "_collect_unprocessed", _counting)
+        logs = []
+        rc = C.run_async_events(None, None, host, lane, _PooledProbe(),
+                                types.SimpleNamespace(verify=0.0, fwd=1.0), None, [], host.slots,
+                                {}, _loop_args(), 1.0,
+                                lambda *a: logs.append(" ".join(str(x) for x in a)))
+        return rc, lane, passes["n"], logs
+
+    def test_the_manifest_is_read_twice_not_once_per_pass(self, monkeypatch):
+        """The claim, exactly: many passes, TWO manifest reads -- one at entry, one forced before the idle
+        exit. Pre-fix this was one read PER PASS (manifest_calls == passes)."""
+        self._env(monkeypatch)
+        rc, lane, passes, logs = self._drive(monkeypatch, {N.contrib_name(0, "m1"): _contrib_rec(0, "m1")})
+        assert rc == 0
+        assert passes >= 5, "the loop must really have spun many times (got %d)" % passes
+        assert lane.manifest_calls == 2, \
+            "expected 1 entry read + 1 forced pre-exit read, got %d over %d passes" % (
+                lane.manifest_calls, passes)
+        assert any("ASYNC idle" in ln for ln in logs), "\n".join(logs[-5:])
+
+    def test_the_idle_exit_is_never_taken_on_a_stale_manifest(self, monkeypatch):
+        """The guard means "no new contribution EXISTS"; a manifest we chose not to re-read cannot support
+        that claim. So the second read above is not incidental -- it happens BEFORE the idle exit, with
+        pending work in hand and the refresh window (1e9 s) nowhere near elapsed."""
+        self._env(monkeypatch)
+        _rc, lane, _p, logs = self._drive(monkeypatch, {N.contrib_name(0, "m1"): _contrib_rec(0, "m1")})
+        assert lane.manifest_calls == 2 and any("ASYNC idle" in ln for ln in logs)
+
+    def test_a_zero_refresh_window_still_reads_it_every_pass(self, monkeypatch):
+        """The knob is live in BOTH directions: NEURAHASH_SD_MANIFEST_REFRESH_S=0 restores the old
+        read-every-pass cadence, so the caching is a policy, not a hard-coded skip."""
+        self._env(monkeypatch, refresh="0")
+        _rc, lane, passes, _logs = self._drive(monkeypatch,
+                                               {N.contrib_name(0, "m1"): _contrib_rec(0, "m1")})
+        assert lane.manifest_calls == passes >= 5
+
+    def test_a_future_base_event_name_is_never_fetched(self, monkeypatch):
+        """FIX A part 2. `_collect_unprocessed` returned EVERY unseen parseable name (3,915 of them on the
+        live store) and the loop paid one get_json for each before _lineage_ok dropped it as
+        `future-base-event` -- e.g. `LINEAGE-DROP cg/r1/glm-E2223497.4 base_event=1`. The NAME already
+        carries the base event (N.CONTRIB_PREFIX_FMT), so cur_event=0 can reject cg/r7/... for free."""
+        self._env(monkeypatch)
+        recs = {N.contrib_name(0, "m1"): _contrib_rec(0, "m1"),
+                N.contrib_name(7, "m2"): _contrib_rec(7, "m2")}
+        _rc, lane, _p, logs = self._drive(monkeypatch, recs)
+        assert lane.fetched == ["sha-cg-r0-m1"], \
+            "the r7 record must never be fetched at event 0; fetched=%r" % (lane.fetched,)
+        assert not any("future-base-event" in ln for ln in logs), "it should not even reach the gate"
+
+    def test_the_skipped_name_is_not_remembered_and_is_picked_up_when_the_clock_reaches_it(self):
+        """The skip must be a "not yet", not a rejection. Reproduces the loop's own discovery contract
+        (it adds ONLY returned names to its run-long `seen` set) and shows the same record being collected
+        once cur_event catches up -- so a record for base_event 5 is still usable at event 5."""
+        import sharddiloco_glm_coordinator as C
+        names = [N.contrib_name(0, "m1"), N.contrib_name(5, "m2")]
+        seen = set()
+        for name, _be, _m in C._collect_unprocessed(names, seen, C._parse_contrib_name, max_base_event=0):
+            seen.add(name)                                   # exactly what run_async_events does
+        assert seen == {N.contrib_name(0, "m1")}
+        assert N.contrib_name(5, "m2") not in seen, "a future record must NOT be permanently ignored"
+        later = C._collect_unprocessed(names, seen, C._parse_contrib_name, max_base_event=5)
+        assert [n for n, _b, _m in later] == [N.contrib_name(5, "m2")]
+
+    def test_the_prefilter_is_off_by_default_so_other_callers_do_not_change(self):
+        import sharddiloco_glm_coordinator as C
+        names = [N.contrib_name(0, "a"), N.contrib_name(9, "b"), "glm/pointer"]
+        assert [b for _n, b, _m in C._collect_unprocessed(names, set(), C._parse_contrib_name)] == [0, 9]
+
+    def test_the_loop_scopes_discovery_to_the_current_event_and_documents_the_knob(self):
+        """Wiring: the helpers are worthless if the loop does not pass clock.event, and an operator who
+        cannot see the refresh cadence in the startup line will spend another 20 minutes guessing."""
+        import inspect
+        import sharddiloco_glm_coordinator as C
+        src = inspect.getsource(C.run_async_events)
+        assert "max_base_event=clock.event" in src
+        assert "NEURAHASH_SD_MANIFEST_REFRESH_S" in src, "the startup log must name the knob"
+        assert C._manifest_refresh_s({}) == 30.0
+        assert C._manifest_refresh_s({"NEURAHASH_SD_MANIFEST_REFRESH_S": "5"}) == 5.0
+
+
+# ======================================================== v3.4.1 FIX B: the sweep order is per-identity
+class TestFixBSweepOrderIsPerIdentity:
+    """FIX B (v3.4.1). pick_start_coord spread miners by wallet hash, but next_claim_coord advanced
+    EVERYONE by +1 through the same sorted list, so a one-off collision became permanent. OBSERVED LIVE
+    2026-07-25: the 5090 (glm-ea20C873) swept 1:1 -> 1:2 -> 1:3 -> 1:4 into the 4060 (glm-361447E3)
+    parked on 1:2; they shared 1:2 for events 12-15, every one a reject, held-out CE frozen at 7.76966,
+    while the coordinates neither miner reached starved."""
+
+    _C = [(1, e) for e in range(7)]
+    _IDS = ["0x%040x" % k for k in range(40)]
+
+    @classmethod
+    def _walk(cls, identity, start, coords=None):
+        """Follow next_claim_coord from `start` for len(coords)-1 steps -- one full sweep."""
+        coords = cls._C if coords is None else coords
+        out, cur = [], tuple(start)
+        for _ in range(len(coords) - 1):
+            cur = N.next_claim_coord(coords, cur, identity=identity)
+            out.append(cur)
+        return out
+
+    def test_two_identities_walk_the_same_set_in_different_orders(self):
+        walks = {tuple(self._walk(i, (1, 0))) for i in self._IDS}
+        assert len(walks) >= 3, "40 identities produced only %d distinct sweeps" % len(walks)
+
+    def test_a_collision_does_not_persist_the_way_it_did_live(self):
+        """The measured failure, as an assertion. Legacy (+1, identity=None): two miners meeting on 1:2
+        advance to the SAME next coordinate -- locked. Per-identity: the successors of 1:2 spread out."""
+        assert N.next_claim_coord(self._C, (1, 2)) == N.next_claim_coord(self._C, (1, 2)) == (1, 3)
+        nxt = {N.next_claim_coord(self._C, (1, 2), identity=i) for i in self._IDS}
+        assert len(nxt) >= 3, "successors of a shared coordinate must spread, got %r" % (nxt,)
+
+    def test_every_identity_still_sweeps_the_whole_claimable_set(self):
+        """A different order must not mean a smaller orbit: the walk is a single cycle over a permutation,
+        so from ANY start it visits every other coordinate exactly once before repeating."""
+        for i in self._IDS[:12]:
+            for start in (self._C[0], self._C[3], self._C[-1]):
+                w = self._walk(i, start)
+                assert len(set(w)) == len(w) == len(self._C) - 1, (i, start, w)
+                assert set(w) | {tuple(start)} == set(self._C), (i, start, w)
+
+    def test_the_walk_is_deterministic_per_identity(self):
+        """A restarted miner must behave predictably -- no PID, no clock, no randomness in the order."""
+        for i in self._IDS[:5]:
+            assert self._walk(i, (1, 0)) == self._walk(i, (1, 0))
+            assert N.claim_walk_order(self._C, i) == N.claim_walk_order(list(self._C), i)
+
+    def test_it_never_returns_the_coordinate_we_are_on(self):
+        """Advancing onto our own coordinate would reload the data shard and change nothing."""
+        for i in self._IDS:
+            for cur in self._C:
+                assert N.next_claim_coord(self._C, cur, identity=i) != tuple(cur)
+
+    def test_a_walk_order_is_a_permutation_not_a_subset(self):
+        for i in self._IDS[:8]:
+            assert sorted(N.claim_walk_order(self._C, i)) == sorted(tuple(c) for c in self._C)
+
+    def test_no_identity_keeps_the_legacy_shared_sweep_exactly(self):
+        """Backward compatibility is load-bearing: the 2-argument call is what every pre-3.4.1 caller and
+        test uses, and it must stay the plain +1 cycle."""
+        assert N.claim_walk_order(self._C) == self._C
+        assert N.next_claim_coord(self._C, (1, 0)) == (1, 1)
+        assert N.next_claim_coord([(1, 0)], (1, 0), identity="0xabc") is None
+        assert N.next_claim_coord([], (1, 0), identity="0xabc") is None
+        assert N.next_claim_coord([(1, 0), (1, 1)], (9, 9), identity=None) == (1, 0)
+
+    def test_a_coordinate_outside_the_set_recovers_into_this_identitys_order(self):
+        got = N.next_claim_coord(self._C, (9, 9), identity="0xabc")
+        assert got == N.claim_walk_order(self._C, "0xabc")[0]
+
+    def test_the_contributor_loop_advances_with_its_wallet_identity(self):
+        """Wiring: a per-identity order that the sweep does not pass its identity to is decoration."""
+        import inspect
+        src = inspect.getsource(N._run_async)
+        # No closing paren in the match: --claim-by affinity appends `ranked=claim_ranked` to this call
+        # (TestClaimByFlag), so the argument list wraps. The property guarded is unchanged -- the sweep
+        # must pass its own identity -- and this is still the verbatim call prefix.
+        assert "next_claim_coord(claim_coords, (L, E), identity=claim_identity" in src
+        assert "claim_identity = wallet.address if wallet is not None else" in src, \
+            "the identity must be the DURABLE wallet address, so a restart walks the same order"
+
+
+# ============================================================ the JOIN defaults a stranger inherits
+class TestJoinDefaultsAreReachable:
+    """Unlimited claimable coordinates are worthless if the client cannot reach the lane at all.
+
+    Audited 2026-07-25 against the fresh public clone at v3.4.0: no flag is required=True, so the
+    client STARTS for a stranger -- and then talks to nobody, because `--url` defaulted to
+    http://127.0.0.1:8797 (the stranger's OWN box, closed port) and `--token` to "" (every PUT 401).
+    The published Mine snippet was therefore uncopyable by anyone but the author, which contradicts
+    the standing directive (memory public-testing-unlimited-slots-directive: public testing,
+    UNLIMITED slots, anyone may join).
+
+    Both values CAN ship as defaults because neither is a secret: the lane is the public anchor
+    store and the token is its PUBLIC DEMO token, already the shipped `--token` default of the
+    esh_worker client (public commit 1fdcd5a) and spam-open by design -- rotating it would break
+    every running miner (memory content-token-is-public-demo-token-2026-07-21). These tests are the
+    guard against a future session "hardening" either one back into a placeholder.
+    """
+
+    @staticmethod
+    def _is_unreachable_host(host):
+        """True for hosts that only ever resolve to the machine running the client."""
+        if host.lower() in ("localhost", "localhost.localdomain", ""):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False                     # a real hostname; DNS is not this test's business
+        return ip.is_loopback or ip.is_unspecified
+
+    @staticmethod
+    def _join_defaults(monkeypatch):
+        """Defaults straight from the module's OWN argparse setup, with the env cleared.
+
+        argparse captures os.environ at add_argument() time, so clearing first is what makes this a
+        test of the CODE's defaults rather than of whatever this machine exports."""
+        for k in ("NEURAHASH_CONTENT_URL", "NEURAHASH_CONTENT_TOKEN"):
+            monkeypatch.delenv(k, raising=False)
+        return N.add_common_args(argparse.ArgumentParser()).parse_args([])
+
+    def test_the_url_default_is_not_a_loopback_address(self, monkeypatch):
+        url = self._join_defaults(monkeypatch).url
+        assert url.startswith("http://") or url.startswith("https://"), url
+        host = urllib.parse.urlsplit(url).hostname or ""
+        assert not self._is_unreachable_host(host), (
+            "--url default %r resolves to the miner's own box: a stranger copy-pasting the Mine "
+            "snippet joins nothing" % url)
+
+    def test_the_token_default_is_not_empty(self, monkeypatch):
+        tok = self._join_defaults(monkeypatch).token
+        assert tok.strip(), ("--token default is empty: every publish 401s. The lane token is "
+                             "public by design, so the default can be the real one")
+        assert len(tok.strip()) >= 16, tok
+
+    def test_the_environment_still_wins_over_both_defaults(self, monkeypatch):
+        """The live campaign and any private lane are driven by these env vars -- defaulting the
+        public lane must not take that override away."""
+        monkeypatch.setenv("NEURAHASH_CONTENT_URL", "http://10.0.0.5:8797")
+        monkeypatch.setenv("NEURAHASH_CONTENT_TOKEN", "private-lane-token-0123456789")
+        ns = N.add_common_args(argparse.ArgumentParser()).parse_args([])
+        assert ns.url == "http://10.0.0.5:8797"
+        assert ns.token == "private-lane-token-0123456789"
+        cli = N.add_common_args(argparse.ArgumentParser()).parse_args(
+            ["--url", "http://127.0.0.1:8797", "--token", "x"])
+        assert (cli.url, cli.token) == ("http://127.0.0.1:8797", "x")    # explicit flags still win
+
+
+# ============================================ v3.4.2 FIX A: registration is gated on a VERIFIED signature
+@coordinator_only
+class TestFixARegistrationRequiresAVerifiedSignature:
+    """FIX A (SECURITY, 2026-07-25). `_admit_coordinate` ran inside the DISCOVER pass, so a coordinate was
+    REGISTERED -- seat under --max-active-slots taken, secret gate pool built, ~75.5 MB of fp32 slot
+    materialized, lineage root seeded -- BEFORE `_fetch_validate_contribs` had checked a single signature.
+
+    Why that is reachable and not theoretical: the lane's PUT token is a deliberately PUBLIC demo token
+    (memory content-token-is-public-demo-token-2026-07-21) and the client now DEFAULTS it, so "anyone holding
+    the token" means any user of the client. One unsigned PUT per coordinate was enough to make the
+    coordinator register every claimable coordinate it holds and exhaust the active set with records that can
+    never merge -- honest claimants then DEFER forever. Resource occupation, not weight corruption, but
+    trivially reachable. The fix: DISCOVER resolves the coordinate PURELY (_record_coordinate) and queues by
+    it; registration happens in the merge path only after _verify_record_identity authenticates a record."""
+
+    _CLAIM = (2, 3)                      # unseen at startup -> registering it IS the state change we watch
+    _OTHER_KEY = b"\x77" * 16            # a genuine HMAC over the right message, with the WRONG key
+
+    @pytest.fixture(autouse=True)
+    def _fast_idle(self, monkeypatch):
+        """These tests END with the loop waiting for work that will never come (that is the point: the
+        unverified record must never merge), so the 600 s default idle guard would hang the suite. Set it
+        INSIDE the class so the file stays fast standalone and never depends on the caller's environment."""
+        monkeypatch.setenv("NEURAHASH_SD_IDLE_EXIT_S", "1")
+        monkeypatch.setenv("NEURAHASH_SD_POLL_S", "0.05")
+
+    def test_a_bad_signature_registers_nothing(self, loop_model, store_harness):
+        """RED before the fix: host.index_of(2,3) == 1, probe.has_pool(1) True, len(host.slots) == 2."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=1, max_active=8)
+        host, G = env["host"], loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        mh.register(*self._CLAIM)
+        _publish_claim(env, self._CLAIM, "attacker", wire_idx=1, host=mh, seed=3, key=self._OTHER_KEY)
+
+        logs = _drive_loop(env, ["attacker"])           # rostered under _LKEY; the record is signed wrongly
+        assert host.index_of(*self._CLAIM) is None, \
+            "an unverified record REGISTERED a coordinate:\n" + "\n".join(logs[-12:])
+        assert len(host.slots) == 1 and host.active == {0}, "a seat was taken by unauthenticated input"
+        assert env["probe"].has_pool(1) is False, "a secret gate pool was built for an unverified record"
+        assert env["store"].accepted(1) is None, "an unverified record committed an event"
+        assert any("UNVERIFIED" in ln for ln in logs), \
+            "the drop must be VISIBLE -- a silent drop is what made this look safe:\n" + "\n".join(logs[-8:])
+
+    def test_an_unsigned_record_registers_nothing_either(self, loop_model, store_harness):
+        """No `sig` field at all -- the cheapest possible PUT, and the one that used to cost a whole seat."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=1, max_active=8)
+        host, G = env["host"], loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        mh.register(*self._CLAIM)
+        _publish_claim(env, self._CLAIM, "nosig", wire_idx=1, host=mh, seed=4, key=None)
+        logs = _drive_loop(env, ["nosig"])
+        assert host.index_of(*self._CLAIM) is None, "\n".join(logs[-12:])
+        assert env["probe"].has_pool(1) is False
+
+    def test_the_cap_cannot_be_exhausted_by_unsigned_records(self, loop_model, store_harness):
+        """The squat, end to end: ONE free seat, three unsigned claims on DIFFERENT coordinates, then an
+        honest signed claim. Pre-fix the first unsigned record took the seat and the honest miner was
+        DEFERRED (`max_active_slots=2 reached; cannot admit`) with nothing ever merged."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=1, max_active=2)
+        host, G = env["host"], loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        for n, sq in enumerate(((2, 0), (2, 1), (2, 2))):
+            mh.register(*sq)
+            _publish_claim(env, sq, "squat%d" % n, wire_idx=1, host=mh, seed=20 + n, key=self._OTHER_KEY)
+        mh.register(*self._CLAIM)
+        _publish_claim(env, self._CLAIM, "honest", wire_idx=1, host=mh, seed=9)
+
+        logs = _drive_loop(env, ["squat0", "squat1", "squat2", "honest"])
+        assert [host.index_of(*c) for c in ((2, 0), (2, 1), (2, 2))] == [None, None, None], \
+            "unsigned claims still occupy seats:\n" + "\n".join(logs[-14:])
+        assert host.index_of(*self._CLAIM) == 1, \
+            "the honest claimant did not get the only free seat:\n" + "\n".join(logs[-14:])
+        rec = env["store"].accepted(1)
+        assert rec is not None and rec["accepted"], "\n".join(logs[-14:])
+        assert (rec["accepted"][0]["layer"], rec["accepted"][0]["glm_expert"]) == self._CLAIM
+
+    def test_a_verified_record_still_registers_and_merges_on_OUR_index(self, loop_model, store_harness):
+        """The complement, so the fix cannot pass by refusing everything: the SAME coordinate with a
+        correctly signed record registers, gets its gate pool, and is merged into the COORDINATOR's own
+        registry index -- never the miner's wire index (F1)."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=1, max_active=8)
+        host, G = env["host"], loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        mh.register(*self._CLAIM)
+        _publish_claim(env, self._CLAIM, "honest", wire_idx=99, host=mh, seed=5)   # nonsense wire index
+
+        logs = _drive_loop(env, ["honest"])
+        idx = host.index_of(*self._CLAIM)
+        assert idx == 1, "a VERIFIED claim was not registered:\n" + "\n".join(logs[-12:])
+        assert host.is_active(idx) and env["probe"].has_pool(idx)
+        rec = env["store"].accepted(1)
+        assert rec is not None and rec["accepted"], "\n".join(logs[-12:])
+        row = rec["accepted"][0]
+        assert row["slot"] == idx, "merged on the WIRE index %r, not ours %r" % (row["slot"], idx)
+        assert (row["layer"], row["glm_expert"]) == self._CLAIM
+        assert rec["slot_roots"]["2_3"] == N.slot_root(host, idx)
+
+    def test_an_over_capacity_honest_claim_is_deferred_and_does_not_starve_anyone(
+            self, loop_model, store_harness):
+        """The constraint the restructure had to preserve, now that DEFER happens with the record already
+        popped off its queue: an over-capacity claim must be put BACK (retried), never silently dropped --
+        miner-side a dropped claim is indistinguishable from a rejected delta. And because a deferred
+        coordinate stays queued, it must not be re-selected forever: its arrival stamp is demoted so the
+        coordinates that CAN merge still get their events."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=3, max_active=1)   # zero free seats
+        host, G = env["host"], loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        # The waiting claim is revealed FIRST (the harness reveals one contribution per poll), so it is in
+        # hand for every pass -- exactly the state that used to spin the loop or starve the others.
+        mh.register(*self._CLAIM)
+        _publish_claim(env, self._CLAIM, "zz-waiting", wire_idx=1, host=mh, seed=7)   # honest, no seat free
+        for n, m in enumerate(("h0", "h1", "h2")):
+            _publish_claim(env, (1, 0), m, wire_idx=0, seed=40 + n)      # mergeable on the taken seat
+
+        logs = _drive_loop(env, ["h0", "h1", "h2", "zz-waiting"])
+        defers = [ln for ln in logs if "DEFER zz-waiting" in ln]
+        assert len(defers) >= 2, ("the deferred claim was dropped instead of retried (%d DEFER lines):\n"
+                                  % len(defers)) + "\n".join(logs[-14:])
+        assert host.index_of(*self._CLAIM) is None, "the cap was breached"
+        assert [env["store"].accepted(e) is not None for e in (1, 2, 3)] == [True] * 3, \
+            "a deferred coordinate starved the one that could merge:\n" + "\n".join(logs[-14:])
+        assert not any("zz-waiting" in (row.get("miner") or "")
+                       for e in (1, 2, 3) for row in (env["store"].accepted(e)["accepted"] or [])), \
+            "an unadmitted claim was paid"
+
+    def test_discovery_itself_mutates_nothing(self):
+        """_record_coordinate is the DISCOVER-side resolver and its whole value is that it is PURE: it must
+        not register, append, activate or seed anything, for either record shape."""
+        C, host, slots, probe, _clock, srh, _args = TestAdmitCoordinate._setup()
+        before = (list(host.slots), set(host.active), list(slots), dict(srh))
+        assert C._record_coordinate(host, slots, {"layer": 2, "glm_expert": 3}, "m",
+                                    lambda *_: None) == (2, 3)
+        assert C._record_coordinate(host, slots, {"expert": 1}, "old", lambda *_: None) == (1, 1)
+        assert (list(host.slots), set(host.active), list(slots), dict(srh)) == before
+        assert host.index_of(2, 3) is None and probe.has_pool(2) is False
+
+    def test_the_wire_index_never_becomes_the_pending_key(self):
+        """A record claiming (1,1) with a bogus wire index 99 must be filed under the COORDINATE, so two
+        miners that both publish local index 1 cannot collide in the queue -- the F1 collision, moved one
+        step earlier now that discovery is what keys the queue."""
+        C, host, slots, _probe, _clock, _srh, _args = TestAdmitCoordinate._setup()
+        a = C._record_coordinate(host, slots, {"layer": 1, "glm_expert": 1, "expert": 99}, "a",
+                                 lambda *_: None)
+        b = C._record_coordinate(host, slots, {"layer": 2, "glm_expert": 3, "expert": 99}, "b",
+                                 lambda *_: None)
+        assert a == (1, 1) and b == (2, 3) and a != b
+
+    def test_identity_verification_precedes_registration_in_the_loop(self):
+        """Wiring regression, and the only cheap guard against this hole coming back: in run_async_events
+        the authentication call must appear BEFORE the registration call."""
+        import inspect
+        import sharddiloco_glm_coordinator as C
+        src = inspect.getsource(C.run_async_events)
+        assert "_record_coordinate(" in src, "DISCOVER must resolve the coordinate purely"
+        i_verify, i_admit = src.find("_verify_record_identity("), src.find("_admit_coordinate(")
+        assert i_verify > 0 and i_admit > 0, (i_verify, i_admit)
+        assert i_verify < i_admit, "registration is back ahead of the signature check"
+
+    def test_unverified_is_a_drop_not_a_verify_ok_false_merge(self):
+        """_verify_record_identity's outcomes, which its two callers read differently: a rostered bad HMAC
+        keeps the (False, miner) shape so _fetch_validate_contribs still hands it to the gate exactly as
+        before, while a keyless failure is (False, None) = drop outright. run_async_events treats BOTH as
+        "must not register". A missing sig must never raise: the lane's PUT token is public, so a rostered
+        NAME with no `sig` field is a record a stranger can write."""
+        import sharddiloco_glm_coordinator as C
+        rec = {"sig": _H.sign(_LKEY, "cid", 0, "m1"), "expert_cid": "cid"}
+        assert C._verify_record_identity(rec, "m1", 0, {"m1": {"key": _LKEY}}, None) == (True, "m1")
+        assert C._verify_record_identity(rec, "m1", 0, {"m1": {"key": b"\x01" * 16}}, None) \
+            == (False, "m1")
+        assert C._verify_record_identity({}, "m1", 0, {"m1": {"key": _LKEY}}, None) == (False, "m1")
+        assert C._verify_record_identity({}, "stranger", 0, {}, None) == (False, "stranger")
+
+
+# ================================================ v3.4.2 FIX B: --domains is cross-checked between roles
+@coordinator_only
+class TestFixBDomainListsAreCrossChecked:
+    """FIX B (2026-07-25). `N.coord_data_slot(L,E)` returns E on both sides, but the DOMAIN is then
+    `doms[E % len(doms)]` and `--domains` was a PER-PROCESS flag with nothing cross-verifying it.
+
+    Coordinator `code,gutenberg` with a miner on `code,gutenberg,web` and a claim on E=2 gives probe pool
+    "code" against train shard "web": every delta is gated on text it never trained on and rejected
+    SYSTEMATICALLY WITH NO ERROR ANYWHERE -- the silent-failure class this project keeps getting bitten by
+    (memory pouw-verified-not-useful). The coordinator now publishes a digest of its effective list on the v2
+    pointer and a contributor refuses to start on a mismatch; an absent digest (pre-Shard-Claim peer) is
+    logged once and still starts. Comparison is on the MAPPING, not the spelling, so the live pair
+    (coordinator `daily,daily`, contributor `daily`) keeps running."""
+
+    @staticmethod
+    def _args(domains):
+        return types.SimpleNamespace(domains=domains)
+
+    @staticmethod
+    def _args_full(domains):
+        return types.SimpleNamespace(domains=domains, data_dir="D", mode="glm")
+
+    def test_the_digest_covers_content_and_order(self):
+        d = N.domains_digest
+        assert d(["code", "gutenberg"]) == d(["code", "gutenberg"])
+        assert d(["code", "gutenberg"]) != d(["gutenberg", "code"]), \
+            "ORDER decides doms[E % len(doms)] -- a reordered list is a DIFFERENT mapping"
+        assert d(["code", "gutenberg"]) != d(["code", "gutenberg", "web"]), \
+            "appending one domain renumbers every modulus"
+        assert len(d(["daily"])) == 64
+
+    def test_equal_mappings_spelled_differently_are_not_a_mismatch(self):
+        """The live pair: `daily,daily` and `daily` resolve EVERY coordinate to the same domain, so refusing
+        to start on it would break a provably safe running campaign."""
+        assert N.domains_canonical(["daily", "daily"]) == ["daily"]
+        assert N.domains_canonical(["a", "b", "a", "b"]) == ["a", "b"]
+        assert N.domains_canonical(["code", "gutenberg", "web"]) == ["code", "gutenberg", "web"]
+        assert N.domains_digest(["daily", "daily"]) == N.domains_digest(["daily"])
+        for e in range(6):
+            assert N._ids_path(self._args_full("daily,daily"), N.coord_data_slot(1, e), "train") \
+                == N._ids_path(self._args_full("daily"), N.coord_data_slot(1, e), "train"), \
+                "canonicalization must only ever merge lists that really do resolve identically"
+
+    def test_whitespace_and_empty_entries_do_not_create_a_false_mismatch(self):
+        assert N.domains_list(self._args(" code , gutenberg ,")) == ["code", "gutenberg"]
+        assert N.domains_digest(N.domains_list(self._args(" code , gutenberg ,"))) \
+            == N.domains_digest(N.domains_list(self._args("code,gutenberg")))
+
+    def test_a_mismatch_is_reported_and_names_both_lists(self):
+        """The exact trap from the finding: an extra domain on the miner side only."""
+        ptr = dict(N.domains_pointer_fields(self._args("code,gutenberg")), v=2, event=0)
+        msg = N.domains_mismatch(ptr, self._args("code,gutenberg,web"))
+        assert msg is not None, "the coordinator/miner domain trap went undetected"
+        assert "code,gutenberg]" in msg, msg
+        assert "code,gutenberg,web]" in msg, msg
+        assert "MISMATCH" in msg
+
+    def test_a_reordered_list_is_also_a_mismatch(self):
+        ptr = dict(N.domains_pointer_fields(self._args("code,gutenberg")), v=2)
+        msg = N.domains_mismatch(ptr, self._args("gutenberg,code"))
+        assert msg is not None and "gutenberg,code]" in msg, msg
+
+    def test_matching_lists_pass_and_an_absent_digest_still_starts(self):
+        ptr = dict(N.domains_pointer_fields(self._args("daily,daily")), v=2)
+        assert N.domains_mismatch(ptr, self._args("daily,daily")) is None
+        assert N.domains_mismatch(ptr, self._args("daily")) is None           # the LIVE pair
+        # ADDITIVE: a pre-Shard-Claim coordinator publishes no digest -> never a hard fail.
+        assert N.domains_mismatch({"v": 2, "event": 3, "model_root": "r"}, self._args("web")) is None
+        assert N.domains_mismatch({"round": 0, "state_cid": "r"}, self._args("web")) is None
+        assert N.domains_mismatch(None, self._args("web")) is None
+
+    def test_the_coordinator_stamps_the_digest_on_every_v2_pointer(self):
+        """Genesis, per-event and terminal pointers all have to carry it: a contributor joining MID-RUN reads
+        whatever the current pointer is, not the genesis one."""
+        import sharddiloco_glm_coordinator as C
+        import neurahash.diloco_merge as dm
+        args = self._args("code,gutenberg")
+        meta = N.domains_pointer_fields(args)
+        writes = {}
+
+        class _Lane:
+            def put_json_named(self, name, obj):
+                writes[name] = obj
+                return "cid"
+
+        lane, clock = _Lane(), dm.SlotClock()
+        C._publish_async_genesis(lane, [(1, 0)], "root", domains=meta)
+        assert N.domains_mismatch(writes[N.GLM_POINTER_NAME], args) is None
+        assert N.domains_mismatch(writes[N.GLM_POINTER_NAME], self._args("web")) is not None
+        writes.clear()
+        C._commit_accepted_and_advance(lane, clock, [(1, 0)], 0, {"accepted": []}, "root2", False,
+                                       domains=meta)
+        assert writes[N.GLM_POINTER_NAME]["domains_digest"] == meta["domains_digest"]
+        assert N.domains_mismatch(writes[N.GLM_POINTER_NAME], self._args("web")) is not None
+        # ...and it stays ADDITIVE: omitting it reproduces the previous pointer byte-for-byte.
+        assert C._build_pointer(dm.SlotClock(), [(1, 0)], "r") \
+            == dm.sd_pointer_encode(0, {"1_0": 0}, "r", False)
+
+    def test_the_contributor_refuses_to_start_on_a_mismatch(self):
+        """Wiring: the pure helper is worthless unless main() actually exits on it, and the coordinator
+        actually publishes what the miner checks."""
+        import inspect
+        src = inspect.getsource(N.main)
+        assert "domains_mismatch(ptr, args)" in src, "main must cross-check the FIRST pointer it reads"
+        assert "RC_DOMAINS_MISMATCH" in src and N.RC_DOMAINS_MISMATCH != 0
+        assert "domains_digest" in src, "the absent-digest case must be logged, not silently skipped"
+        import sharddiloco_glm_coordinator as C
+        assert "domains_pointer_fields" in inspect.getsource(C.run_async_events)
+
+
+# ================================================ ESFT expert-affinity claim selection (--claim-by)
+# WHY (measured elsewhere, see docs/research/MOE_POSTTRAIN_2026-07-25.md +
+# docs/SHARD_CLAIM_DESIGN.md "Selecting the coordinate by AFFINITY"): pick_start_coord chooses which
+# expert to train by HASHING THE WALLET ADDRESS and next_claim_coord advances along a per-identity
+# permutation. Both are routing-BLIND, and routing-blind selection is the one variant published work
+# has MEASURED to lose -- MoE-Sieve (arXiv:2603.24044) put random expert selection 2.5 percentage
+# points behind router-guided at a matched budget; Mixtral (arXiv:2401.04088 sec 5) showed nobody gets
+# to DECIDE what an expert specialises in ("we do not observe obvious patterns in the assignment of
+# experts based on the topic"); Branch-Train-Merge (arXiv:2208.03306) showed random splits do not work
+# at this exact 64-expert count. ESFT (arXiv:2407.01906) is the published alternative on a
+# near-identical architecture: probe with a small forward-only sample, score every expert, train the
+# top-scored ones.
+class TestEsftSelectionRule:
+    """The PURE half: ESFT's threshold rule, "the smallest top-scored set E_s^l with
+    SUM_{i in E_s^l} R_i^l >= p", at the paper's verbatim thresholds ("The threshold p is set to 0.1
+    for ESFT-Gate and 0.2 for ESFT-Token, respectively"). No torch, no model -- microseconds."""
+
+    def test_the_published_thresholds_are_the_ones_we_ship(self):
+        assert N.ESFT_P_GATE == 0.1 and N.ESFT_P_TOKEN == 0.2
+
+    def test_returns_the_smallest_set_clearing_the_threshold(self):
+        """SMALLEST is the whole point: the set is a training budget, so one coordinate too many is
+        wasted GPU-hours and one too few misses the mass the threshold was calibrated for."""
+        s = {(1, 0): 0.5, (1, 1): 0.3, (1, 2): 0.15, (1, 3): 0.05}
+        assert N.esft_select(s, 0.1) == [(1, 0)]                  # 0.5 alone already clears 0.1
+        assert N.esft_select(s, 0.5) == [(1, 0)]                  # >= is inclusive, so still one
+        assert N.esft_select(s, 0.51) == [(1, 0), (1, 1)]         # exactly one more, never two
+        assert N.esft_select(s, 0.95) == [(1, 0), (1, 1), (1, 2)]
+
+    def test_it_is_descending_by_score_not_by_coordinate(self):
+        s = {(1, 0): 0.01, (1, 3): 0.9, (1, 1): 0.09}
+        assert N.esft_select(s, 0.5) == [(1, 3)]
+
+    def test_degenerate_thresholds_do_not_invent_or_lose_coordinates(self):
+        s = {(1, 0): 0.6, (1, 1): 0.4}
+        assert N.esft_select(s, 0.0) == []                        # smallest set clearing 0 is nothing
+        assert N.esft_select(s, 5.0) == [(1, 0), (1, 1)]          # unreachable p -> everything
+        assert N.esft_select({}, 0.1) == []
+
+    def test_ties_break_on_the_coordinate_so_two_nodes_agree(self):
+        """Two miners probing the same model must select the same set, or one of them silently trains
+        an expert the other believes it owns."""
+        s = [((1, 2), 0.25), ((1, 0), 0.25), ((1, 1), 0.25), ((1, 3), 0.25)]
+        assert N.esft_select(s, 0.3) == [(1, 0), (1, 1)]
+        assert N.esft_select(list(reversed(s)), 0.3) == [(1, 0), (1, 1)]
+
+    def test_the_threshold_is_applied_per_layer_not_pooled(self):
+        """ESFT's scores carry the layer superscript (g_i^l, r_i^l) and sum to 1 WITHIN a layer, so
+        pooling two candidate layers doubles the total and p=0.1 would clear on half the mass it
+        describes. A node holding several pieces spans layers, so this is not hypothetical."""
+        s = {(1, 0): 0.7, (1, 1): 0.3, (2, 0): 0.6, (2, 1): 0.4}
+        assert N.esft_select_layers(s, 0.5) == [(1, 0), (2, 0)]   # one per layer
+        assert N.esft_select(s, 0.5) == [(1, 0)]                  # pooled: layer 2 never considered
+        assert N.esft_select_layers(s, 0.8) == [(1, 0), (1, 1), (2, 0), (2, 1)]
+
+
+@pytest.fixture(scope="module")
+def probe_host(host):
+    """A host holding EVERY claimable coordinate (layers 1-2 x experts 0-3 on the tiny GLM), which is
+    what main() builds before the probe runs, plus the tiny train split as the token sample. Module
+    scope: build_tiny_glm is seconds and the probe must not mutate anything, which is exactly what
+    test_the_probe_updates_no_parameter asserts."""
+    G, model, cfg, claimable = host
+    h = G.GlmExpertLaneHost(model, cfg, [(1, 0), (1, 1)], claimable=claimable)
+    for c in claimable:
+        if h.index_of(*c) is None:
+            h.register(*c)
+    return h, claimable, N.tiny_ids("train")
+
+
+def _state_hash(model):
+    """sha256 over the FULL state_dict (parameters AND buffers, in sorted key order). Buffers matter:
+    the router's e_score_correction_bias is a buffer, and piece_loader writes -inf into it."""
+    import hashlib
+    hh = hashlib.sha256()
+    for k, v in sorted(model.state_dict().items()):
+        hh.update(k.encode())
+        hh.update(v.detach().cpu().numpy().tobytes())
+    return hh.hexdigest()
+
+
+class TestEsftAffinityProbe:
+    """The probe on a REAL tiny GLM (real router, real fused experts, real top-k). Forward passes only."""
+
+    def test_the_probe_updates_no_parameter(self, probe_host):
+        """THE LOAD-BEARING TEST. The base is FROZEN and every per-coordinate lineage root
+        (slot_root -> base_slot_root -> _lineage_ok) is a hash over it, so a "probe" that trained even
+        one expert by accident would change our root, get every later contribution dropped
+        `wrong-lineage-slot-root` forever, and corrupt the weights the whole fleet gates against. Full
+        state_dict hash, not a spot check."""
+        h, claimable, ids = probe_host
+        before = _state_hash(h.model)
+        N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        assert _state_hash(h.model) == before, \
+            "the affinity probe MUTATED the frozen base -- it must be forward-only"
+
+    def test_no_grad_and_no_optimizer_are_left_behind(self, probe_host):
+        """Belt and braces on the same property: no parameter may come back with a gradient (which
+        would prove a backward ran), and no forward hook may survive the call (a leaked hook would
+        keep accumulating during TRAINING forwards and slow every later round)."""
+        h, claimable, ids = probe_host
+        N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        assert all(p.grad is None for p in h.model.parameters())
+        for L in (1, 2):
+            mod = N._routed_experts_module(h, L)
+            assert len(getattr(mod, "_forward_pre_hooks", {})) == 0, \
+                "a probe hook leaked onto layer %d" % L
+
+    def test_ranks_exactly_the_claimable_coordinates(self, probe_host):
+        """No extras (a non-resident row is writable and silently inert -- claiming one trains forever
+        and is rejected forever) and no omissions (an unranked coordinate is starved out of the sweep)."""
+        h, claimable, ids = probe_host
+        rep = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        ranked = [c for (c, _g, _r) in rep["ranking"]]
+        assert sorted(ranked) == sorted(tuple(c) for c in claimable)
+        assert len(ranked) == len(set(ranked)) == len(claimable)
+        assert sorted(rep["gate"]) == sorted(rep["token"]) == sorted(ranked)
+
+    def test_the_ranking_is_ordered_highest_affinity_first(self, probe_host):
+        h, claimable, ids = probe_host
+        rep = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        gates = [g for (_c, g, _r) in rep["ranking"]]
+        assert gates == sorted(gates, reverse=True)
+
+    def test_is_deterministic_for_a_fixed_model_and_sample(self, probe_host):
+        """Bit-identical, not approximately equal: the ranking decides which coordinate a miner claims,
+        so two runs of the same miner on the same base must agree or a restart silently re-claims."""
+        h, claimable, ids = probe_host
+        a = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        b = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        assert a["ranking"] == b["ranking"]
+        assert all(a["gate"][c] == b["gate"][c] for c in a["gate"])
+        assert all(a["token"][c] == b["token"][c] for c in a["token"])
+
+    def test_both_esft_metrics_are_computed_and_normalised_per_layer(self, probe_host):
+        """ESFT-Gate g_i^l and ESFT-Token r_i^l are DIFFERENT statistics (mean gate score vs. token
+        selection ratio) and both must be reported -- the paper thresholds them separately. Each sums to
+        ~1 within a layer, which is what makes p a fraction: the token ratio exactly (every token
+        contributes 1/K per pick, K picks), the gate score once routed_scaling_factor is divided out."""
+        h, claimable, ids = probe_host
+        rep = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        assert rep["topk"] == N.TINY["topk"] and rep["scaling"] == 1.8      # GLM scales by 1.8, not 1
+        for L in (1, 2):
+            gate_sum = sum(v for c, v in rep["gate"].items() if c[0] == L)
+            tok_sum = sum(v for c, v in rep["token"].items() if c[0] == L)
+            assert abs(tok_sum - 1.0) < 1e-9, (L, tok_sum)
+            assert abs(gate_sum - 1.0) < 1e-6, (L, gate_sum)
+        assert rep["gate"] != rep["token"], "the two metrics collapsed into one -- one is not computed"
+
+    def test_the_p_threshold_selection_uses_both_metrics_at_their_own_thresholds(self, probe_host):
+        h, claimable, ids = probe_host
+        rep = N.probe_expert_affinity(h, ids, coords=claimable, samples=8)
+        assert rep["select_gate"] == N.esft_select_layers(rep["gate"], N.ESFT_P_GATE)
+        assert rep["select_token"] == N.esft_select_layers(rep["token"], N.ESFT_P_TOKEN)
+        assert rep["select_gate"] and rep["select_token"]
+        # SMALLEST-set property, re-checked on the real measured scores rather than on fixtures.
+        for L in (1, 2):
+            sel = [c for c in rep["select_gate"] if c[0] == L]
+            assert sum(rep["gate"][c] for c in sel) >= N.ESFT_P_GATE
+            assert sum(rep["gate"][c] for c in sel[:-1]) < N.ESFT_P_GATE
+
+    def test_the_sample_size_is_a_bounded_parameter(self, probe_host):
+        """ESFT's own anchor is 32 samples x 4096 tokens ~= 131K tokens, forward-only. The probe must
+        never read the whole train split by default -- on the real lane that is the entire corpus."""
+        h, claimable, ids = probe_host
+        assert N.ESFT_PROBE_SAMPLES == 32
+        rep = N.probe_expert_affinity(h, ids, coords=claimable, samples=4)
+        assert rep["n_samples"] == 4 and rep["n_tokens"] == 4 * N.TINY["seq"]
+        assert len(ids) == N.TINY["train_n"] > 4                 # i.e. it really did sample, not read all
+        big = N.probe_expert_affinity(h, ids, coords=claimable, samples=len(ids) + 10)
+        assert big["n_samples"] == len(ids)                      # clamps, never indexes past the end
+
+    def test_it_reuses_the_model_it_was_given(self, probe_host):
+        """A second model does not fit: the real base is 4.02 GiB of trunk plus 1.125 GiB per resident
+        layer (memory glm-capacity-per-card). The probe therefore takes a HOST, never a path, and the
+        object identity of the model must be unchanged afterwards."""
+        h, claimable, ids = probe_host
+        before = id(h.model)
+        N.probe_expert_affinity(h, ids, coords=claimable, samples=4)
+        assert id(h.model) is not None and id(h.model) == before
+        import inspect
+        sig = inspect.signature(N.probe_expert_affinity)
+        assert list(sig.parameters)[:2] == ["host", "ids"]
+        src = inspect.getsource(N.probe_expert_affinity)
+        assert "build_tiny_glm" not in src and "build_node_model" not in src and "load_pieces" not in src
+
+    def test_the_hook_target_is_the_module_the_router_actually_calls(self, probe_host):
+        """host._fused() unwraps to `.base`, whose forward LoRAExperts NEVER calls (it reaches into
+        base.gate_up_proj directly), so hooking there would silently never fire -- and a probe that
+        measures nothing returns a ranking that is pure noise. Must be layers[L].mlp.experts, wrapper
+        included."""
+        h, _claimable, _ids = probe_host
+        layer = h.model.model.layers[1]
+        assert N._routed_experts_module(h, 1) is layer.mlp.experts
+        G = N._G()
+        LoRAExperts = G._lora_experts_cls()
+        base = layer.mlp.experts
+        try:
+            layer.mlp.experts = LoRAExperts(base, {0: 0}, r=2, alpha=4)
+            assert N._routed_experts_module(h, 1) is layer.mlp.experts       # the WRAPPER
+            assert N._routed_experts_module(h, 1) is not h._fused(1)         # not the unwrapped base
+        finally:
+            layer.mlp.experts = base
+        assert _state_hash(h.model)                                          # model still intact
+
+    def test_an_unhostable_layer_still_fails_loudly(self, probe_host):
+        h, _claimable, ids = probe_host
+        with pytest.raises(IndexError, match=r"not instantiated"):
+            N.probe_expert_affinity(h, ids, coords=[(N.TINY["layers"], 0)], samples=2)
+
+    def test_a_useless_sample_or_empty_candidate_set_is_refused_up_front(self, probe_host):
+        h, claimable, _ids = probe_host
+        with pytest.raises(SystemExit, match=r"no candidate coordinates"):
+            N.probe_expert_affinity(h, np.zeros((4, 8), dtype=np.int64), coords=[], samples=2)
+        with pytest.raises(SystemExit, match=r"\[N,T\] token sample"):
+            N.probe_expert_affinity(h, np.zeros((0, 8), dtype=np.int64), coords=claimable)
+
+
+class TestClaimByFlag:
+    """--claim-by {hash,affinity}. hash is the DEFAULT, so a miner that does not ask for affinity
+    behaves exactly as v3.3.2 did; affinity claims the highest-affinity coordinate and advances on
+    plateau to the next-highest instead of the next hash bucket."""
+
+    @staticmethod
+    def _args(**kw):
+        a = dict(expert=None, slot=None, mode="glm", slots="1:0", domains="daily", piece=0,
+                 shard_dir="x", config_dir="x", claim_by="hash")
+        a.update(kw)
+        return types.SimpleNamespace(**a)
+
+    def test_hash_is_the_default_flag_value(self):
+        ap = __import__("argparse").ArgumentParser()
+        N.add_common_args(ap)      # --claim-by lives on the contributor parser; check main()'s default
+        import inspect
+        src = inspect.getsource(N.main)
+        assert '"--claim-by"' in src and 'default=os.environ.get("NEURAHASH_SD_CLAIM_BY", "hash")' in src
+        assert 'choices=("hash", "affinity")' in src
+
+    def test_claim_by_hash_reproduces_todays_wallet_hash_choice(self, monkeypatch):
+        """NO SILENT BEHAVIOUR CHANGE. The live campaign runs without this flag, so the default path
+        must resolve to the same coordinate the wallet hash resolved to before it existed --
+        resolve_claim does not even look at claim_by."""
+        monkeypatch.delenv("NEURAHASH_SD_EXPERT", raising=False)
+        claim = [(1, e) for e in range(5)]
+        monkeypatch.setattr(N, "node_claimable_coords", lambda a: claim)
+        wallet = "0x" + "ab" * 20
+        expect = N.pick_start_coord(claim, wallet)
+        for a in (self._args(), self._args(claim_by="affinity"), types.SimpleNamespace(
+                expert=None, slot=None, mode="glm", slots="1:0", domains="daily", piece=0,
+                shard_dir="x", config_dir="x")):                      # no claim_by attribute at all
+            L, E, i, src = N.resolve_claim(a, N.parse_slots("1:0"), log=lambda *x: None,
+                                           identity=wallet)
+            assert (L, E) == expect and "wallet-hash" in src
+        import inspect
+        assert "claim_by" not in inspect.getsource(N.resolve_claim), \
+            "the hash path must be untouched by the new flag"
+
+    def test_affinity_claims_the_top_ranked_coordinate(self, probe_host, monkeypatch):
+        """The wiring, with a KNOWN ranking so the assertion is about selection and not about which
+        expert the tiny model happens to prefer."""
+        h, claimable, ids = probe_host
+        want = (2, 3)
+        order = [want] + [c for c in claimable if c != want]
+        monkeypatch.setattr(N, "probe_expert_affinity", lambda *a, **k: {
+            "ranking": [(c, 1.0 - n * 0.1, 0.5) for n, c in enumerate(order)],
+            "gate": {c: 1.0 - n * 0.1 for n, c in enumerate(order)}})
+        monkeypatch.setattr(N, "claim_all_coords", lambda a, s: [tuple(c) for c in claimable])
+        L, E, i, ranked = N.affinity_claim(self._args(claim_by="affinity"), h, ids, 1, 0,
+                                           h.index_of(1, 0), log=lambda *x: None)
+        assert (L, E) == want
+        assert i == h.index_of(*want), "the claim must land on the LOCAL slot index for that coordinate"
+        assert ranked[0] == want and sorted(ranked) == sorted(tuple(c) for c in claimable)
+
+    def test_affinity_advances_to_the_next_highest_on_plateau(self, probe_host, monkeypatch):
+        """Plateau = K consecutive gate rejects. Under affinity the release must drop to the
+        NEXT-HIGHEST-affinity coordinate, not to the next wallet-hash bucket, and must still cycle so
+        no coordinate is starved."""
+        h, claimable, ids = probe_host
+        order = [(2, 3), (1, 2), (1, 0), (2, 1), (1, 1), (1, 3), (2, 0), (2, 2)]
+        assert sorted(order) == sorted(tuple(c) for c in claimable)
+        assert N.next_claim_coord(claimable, (2, 3), identity="0xabc", ranked=order) == (1, 2)
+        assert N.next_claim_coord(claimable, (1, 2), identity="0xabc", ranked=order) == (1, 0)
+        assert N.next_claim_coord(claimable, order[-1], identity="0xabc", ranked=order) == order[0]
+        assert N.claim_walk_order(claimable, "0xabc", ranked=order) == order
+        # ...and the hash permutation is genuinely a DIFFERENT order, so this test would pass
+        # vacuously if the ranking were being ignored.
+        assert N.claim_walk_order(claimable, "0xabc") != order
+
+    def test_the_walk_never_drops_a_claimable_coordinate(self):
+        """A ranking that is stale (probed before a piece changed) must not starve the coordinates it
+        does not mention, and must not smuggle in ones this node cannot host."""
+        claim = [(1, 0), (1, 1), (1, 2)]
+        got = N.claim_walk_order(claim, "0xabc", ranked=[(1, 2), (9, 9), (1, 2)])
+        assert got == [(1, 2), (1, 0), (1, 1)]
+        assert (9, 9) not in got and len(got) == len(set(got)) == 3
+
+    def test_a_failed_probe_keeps_the_hash_claim_instead_of_stopping_the_miner(self, probe_host,
+                                                                              monkeypatch):
+        """Public testing, anyone may join: a probe that raises must degrade to today's behaviour, not
+        kill a stranger's miner. ranked=None then also puts the sweep back on the hash permutation."""
+        h, claimable, ids = probe_host
+
+        def _boom(*a, **k):
+            raise RuntimeError("probe exploded")
+
+        monkeypatch.setattr(N, "probe_expert_affinity", _boom)
+        monkeypatch.setattr(N, "node_claimable_coords", lambda a: [tuple(c) for c in claimable])
+        said = []
+        L, E, i, ranked = N.affinity_claim(self._args(claim_by="affinity"), h, ids, 1, 1,
+                                           h.index_of(1, 1), miner="glm-x", log=said.append)
+        assert (L, E, i) == (1, 1, h.index_of(1, 1)) and ranked is None
+        assert any("affinity probe FAILED" in s for s in said), said
+
+    def test_main_actually_calls_the_probe_and_reloads_the_data_shard(self):
+        """A pure helper nobody calls is worthless. main() must (a) gate the probe on --claim-by
+        affinity, (b) re-read the ids for the NEW coordinate -- the shard is
+        doms[coord_data_slot(L,E) % len(doms)], so re-claiming without a reload trains one domain and
+        self-gates on another (C6) -- and (c) hand the ranking to the async loop's plateau advance."""
+        import inspect
+        src = inspect.getsource(N.main)
+        assert 'getattr(args, "claim_by", "hash")) == "affinity"' in src
+        assert "affinity_claim(" in src
+        i_claim = src.index("affinity_claim(")
+        tail = src[i_claim:i_claim + 900]
+        assert "node_ids(args, coord_data_slot(L, E), \"train\")" in tail
+        assert "node_ids(args, coord_data_slot(L, E), \"val\")" in tail
+        assert "claim_ranked=_claim_ranked" in src
+        asrc = inspect.getsource(N._run_async)
+        assert "ranked=claim_ranked" in asrc, "the plateau advance must follow the affinity order"
+        assert "claim_ranked" in asrc.split("\n")[0] + asrc.split("\n")[1]
+
+
+# ==================================================== CAMPAIGN SCOPING (cross-campaign replay, 07-25)
+# MEASURED (scratchpad/FINDING_cross_campaign_replay.md): the never-deleting store held 11,229 objects
+# from every campaign that ever ran under ONE flat namespace (cg/r<N>/<miner>), so a fresh coordinator
+# discovered dead runs' records forever -- and because every campaign starts from the SAME pristine
+# base, at genesis their base_root/base_slot_root were EQUAL, so those records were lineage-VALID.
+# Identity glm-ea20C873 belongs to no live miner and was MINTED into runs 2, 3 and 4.
+class TestCampaignIdIsAWellFormedNonce:
+
+    def test_a_minted_id_is_hex_and_round_trips(self):
+        cid = N.new_campaign_id()
+        assert N.normalize_campaign_id(cid) == cid and len(cid) == 16
+        assert N.new_campaign_id() != N.new_campaign_id(), "a campaign id is a NONCE, not a constant"
+
+    def test_junk_is_normalized_to_none_so_it_never_reaches_a_name_or_a_hash_seed(self):
+        """The pointer is UNSIGNED on a shared-token lane: anything we cannot validate is treated as NO
+        campaign (fail-closed) rather than pasted into an object name or a digest."""
+        for bad in (None, "", "  ", "not-hex", "../../etc", "r7", "ab/cd", "0123", "G" * 8, "f" * 65):
+            assert N.normalize_campaign_id(bad) is None, bad
+        assert N.normalize_campaign_id("  DEADBEEF12345678 ") == "deadbeef12345678"   # trimmed+lowered
+
+    def test_the_id_can_never_be_read_as_a_round_number(self):
+        """cg/<id>/ and the legacy cg/r<N>/ share a prefix, so an id beginning with 'r' would make the
+        two shapes ambiguous. Hex-only settles it by construction."""
+        assert N.normalize_campaign_id("r0000000") is None
+        assert N.campaign_prefix("ab12cd34ab12cd34") == "cg/ab12cd34ab12cd34/"
+        assert N.campaign_prefix(None) == "cg/"
+
+
+class TestCampaignScopedNames:
+
+    _CID = "ab12cd34ab12cd34"
+
+    def test_records_live_under_the_campaign_prefix(self):
+        assert N.contrib_prefix(7, self._CID) == "cg/%s/r7/" % self._CID
+        assert N.contrib_name(7, "glm-abc", self._CID) == "cg/%s/r7/glm-abc" % self._CID
+        assert N.async_publish_name(7, "glm-abc", 2, self._CID) == "cg/%s/r7/glm-abc.2" % self._CID
+
+    def test_no_campaign_is_byte_identical_to_the_pre_campaign_wire(self):
+        """Every name the LIVE lane has ever published is unscoped; the legacy shape must not move."""
+        assert N.contrib_prefix(7) == "cg/r7/"
+        assert N.contrib_name(7, "m") == "cg/r7/m"
+        assert N.async_publish_name(7, "m", 2) == "cg/r7/m.2"
+
+    @coordinator_only
+    def test_both_name_shapes_parse_but_discovery_accepts_only_ours(self):
+        """The parser used by DISCOVERY is campaign-scoped; the generic one only answers "is this a
+        contribution record at all" (the manifest-visibility question)."""
+        import sharddiloco_glm_coordinator as C
+        ours = N.contrib_name(3, "m", self._CID)
+        theirs = N.contrib_name(3, "m", "ff99ff99ff99ff99")
+        legacy = N.contrib_name(3, "m")
+        assert C._parse_contrib_name(ours) == C._parse_contrib_name(theirs) == (3, "m")
+        assert C._parse_contrib_name(legacy) == (3, "m")
+        assert C._parse_contrib_name("sharddiloco/glm/pointer") is None
+        mine = C._contrib_name_parser(self._CID)
+        assert mine(ours) == (3, "m")
+        assert mine(theirs) is None, "another campaign's record must be invisible to discovery"
+        assert mine(legacy) is None, "an unscoped record predates this campaign -- also invisible"
+        # ... and symmetrically, a legacy (unscoped) coordinator does not pick up scoped records,
+        # whose seeded roots it could not validate anyway.
+        assert C._contrib_name_parser(None)(legacy) == (3, "m")
+        assert C._contrib_name_parser(None)(ours) is None
+
+    @coordinator_only
+    def test_an_id_full_of_digits_still_parses(self):
+        """Regression on the matcher itself: it is built by splitting the FORMAT on its %d. Substituting
+        the id first and splitting on a literal digit would cut the pattern INSIDE the id -- and hex ids
+        are mostly digits, so this would have failed on roughly every real campaign."""
+        import sharddiloco_glm_coordinator as C
+        for cid in ("0000000000000000", "0123456789abcdef", "00ff00ff00ff00ff", "9999999999999999"):
+            name = N.contrib_name(12, "glm-x.3", cid)
+            assert name == "cg/%s/r12/glm-x.3" % cid
+            assert C._contrib_name_parser(cid)(name) == (12, "glm-x.3"), cid
+            assert C._parse_contrib_name(name) == (12, "glm-x.3"), cid
+            assert C._contrib_name_parser("aaaaaaaaaaaaaaaa")(name) is None, cid
+
+
+class TestCampaignSeedsTheLineageRoot:
+    """The half that actually stops the merge. Namespacing alone is an optimisation a replayer routes
+    around by renaming; the ROOT is what the coordinator judges."""
+
+    def test_two_campaigns_over_the_identical_base_share_no_root(self, h):
+        a = h
+        base_slot, base_model = N.slot_root(a, 0), N.model_root(a)
+        N.bind_campaign_id(a, "aaaaaaaaaaaaaaaa")
+        s_a, m_a = N.slot_root(a, 0), N.model_root(a)
+        N.bind_campaign_id(a, "bbbbbbbbbbbbbbbb")
+        s_b, m_b = N.slot_root(a, 0), N.model_root(a)
+        assert len({base_slot, s_a, s_b}) == 3, "identical weights must NOT hash alike across campaigns"
+        assert len({base_model, m_a, m_b}) == 3
+
+    def test_an_unbound_host_reproduces_the_pre_campaign_digest_exactly(self, h):
+        """Protects every root the live campaign has already published: no campaign -> nothing is fed
+        into the digest, so model_root/slot_root are byte-identical to v3.4.1."""
+        import hashlib
+        import numpy as np
+        assert N.host_campaign_id(h) is None
+        want = hashlib.sha256()
+        d = h.read_slot(0)
+        L, E = h.slots[0]
+        want.update(("L%dE%d|" % (L, E)).encode())
+        for k in sorted(d):
+            want.update(k.encode())
+            want.update(np.ascontiguousarray(d[k], dtype=np.float32).tobytes())
+        assert N.slot_root(h, 0) == want.hexdigest()
+        N.bind_campaign_id(h, None)                       # explicit None is also "unscoped"
+        assert N.slot_root(h, 0) == want.hexdigest()
+
+    def test_the_seed_is_a_prefix_and_the_scope_rides_the_host(self, h):
+        """A suffix could be appended by anyone holding the inner digest; a prefix scopes the whole
+        hash. And the scope lives on the HOST, so two hosts in one process cannot leak into each
+        other -- which is exactly what a coordinator + a foreign miner in one test are."""
+        import hashlib
+        N.bind_campaign_id(h, "abcdef0123456789")
+        want = hashlib.sha256()
+        want.update(b"campaign:abcdef0123456789|")
+        N._slot_digest_into(want, h, 0)
+        assert N.slot_root(h, 0) == want.hexdigest()
+        assert N.host_campaign_id(h) == "abcdef0123456789"
+        assert N.host_campaign_id(types.SimpleNamespace()) is None      # any host object is tolerated
+
+
+@coordinator_only
+class TestCampaignSurvivesACoordinatorRestart:
+    """THE failure mode this must not introduce: a legitimate restart that MINTED a new id would orphan
+    the campaign's own records (their names and their seeded roots both move), which is worse than the
+    cross-campaign replay the id exists to prevent. So: mint once, persist, load on every resume."""
+
+    @staticmethod
+    def _args(tmp_path, **kw):
+        a = types.SimpleNamespace(campaign=None, campaign_file=str(tmp_path / "glm_campaign.json"),
+                                  coord_data_dir=str(tmp_path), no_resume=False, resume=False,
+                                  url="http://lane-a:8710")
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a
+
+    def test_a_restart_resumes_the_same_id(self, tmp_path):
+        import sharddiloco_glm_coordinator as C
+        first, minted = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert minted is True and N.normalize_campaign_id(first) == first
+        again, minted2 = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert (again, minted2) == (first, False), "a restart must NOT mint a new campaign"
+        third, _ = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert third == first
+
+    def test_no_resume_means_a_deliberately_fresh_campaign(self, tmp_path):
+        """--no-resume already means "start from the frozen base"; a fresh base with a REUSED campaign
+        id would put the new run back in the old run's namespace."""
+        import sharddiloco_glm_coordinator as C
+        first, _ = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        fresh, minted = C._campaign_id_for_run(self._args(tmp_path, no_resume=True), environ={})
+        assert minted is True and fresh != first
+        # ... and the new id is what the NEXT restart resumes.
+        again, _ = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert again == fresh
+
+    def test_a_pinned_id_wins_and_is_persisted(self, tmp_path):
+        import sharddiloco_glm_coordinator as C
+        C._campaign_id_for_run(self._args(tmp_path), environ={})
+        pinned, minted = C._campaign_id_for_run(
+            self._args(tmp_path, campaign="C0FFEE00C0FFEE00"), environ={})
+        assert (pinned, minted) == ("c0ffee00c0ffee00", False)
+        assert C._load_campaign_id(str(tmp_path / "glm_campaign.json")) == "c0ffee00c0ffee00"
+
+    def test_a_fresh_run_on_ANOTHER_lane_does_not_clobber_this_lane(self, tmp_path):
+        """The state file lives in --coord-data-dir, which every run on this box shares (the SECRET
+        probe/heldout splits are there). A from-scratch A/B baseline (--no-resume) against a different
+        --url must not overwrite the LIVE lane's id: the damage would only appear at the live
+        coordinator's NEXT restart, as a rollback to the frozen base plus every miner dropping out."""
+        import sharddiloco_glm_coordinator as C
+        live, _ = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        other, minted = C._campaign_id_for_run(
+            self._args(tmp_path, url="http://lane-b:8711", no_resume=True), environ={})
+        assert minted is True and other != live
+        again, minted2 = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert (again, minted2) == (live, False), "the baseline run clobbered the live lane's campaign"
+        # both entries coexist, keyed by lane
+        state = C._read_campaign_state(str(tmp_path / "glm_campaign.json"))
+        assert len(state) == 2
+        assert sorted(v["url"] for v in state.values()) == ["http://lane-a:8710", "http://lane-b:8711"]
+
+    def test_an_unknown_lane_says_what_the_file_does_hold_before_minting(self, tmp_path):
+        """A URL change (moved tunnel, new VPS) must not resume silently onto a fresh base with nothing
+        said: name the lanes we DO have and the way to adopt one."""
+        import sharddiloco_glm_coordinator as C
+        live, _ = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        said = []
+        fresh, minted = C._campaign_id_for_run(self._args(tmp_path, url="http://moved:9000"),
+                                               log=said.append, environ={})
+        assert minted is True and fresh != live
+        assert any("no campaign persisted for lane" in s and "http://lane-a:8710" in s for s in said), \
+            said
+        assert any("--campaign <id> to adopt" in s for s in said), said
+
+    def test_an_unusable_pinned_id_stops_the_run_instead_of_minting_a_different_one(self, tmp_path):
+        import sharddiloco_glm_coordinator as C
+        with pytest.raises(SystemExit):
+            C._campaign_id_for_run(self._args(tmp_path, campaign="nonsense!"), environ={})
+
+    def test_a_corrupt_or_missing_state_file_is_treated_as_no_campaign_not_as_a_crash(self, tmp_path):
+        import sharddiloco_glm_coordinator as C
+        p = tmp_path / "glm_campaign.json"
+        assert C._load_campaign_id(str(p)) is None
+        p.write_text("{not json", encoding="utf-8")
+        assert C._load_campaign_id(str(p)) is None
+        p.write_text('{"campaign_id": "zzzz"}', encoding="utf-8")
+        assert C._load_campaign_id(str(p)) is None
+        cid, minted = C._campaign_id_for_run(self._args(tmp_path), environ={})
+        assert minted is True and C._load_campaign_id(str(p)) == cid
+
+    def test_the_documented_opt_out_turns_scoping_off_entirely(self, tmp_path):
+        import sharddiloco_glm_coordinator as C
+        assert C._campaign_id_for_run(self._args(tmp_path),
+                                      environ={"NEURAHASH_SD_CAMPAIGN_SCOPE": "0"}) == (None, False)
+        assert not (tmp_path / "glm_campaign.json").exists(), "the opt-out must not mint anything"
+        assert N.campaign_scope_on({}) is True                       # default ON
+        assert N.campaign_scope_on({"NEURAHASH_SD_CAMPAIGN_SCOPE": "off"}) is False
+
+    def test_main_binds_the_campaign_before_anything_hashes_a_root(self):
+        """Ordering is load-bearing: the resume replay verifies THIS campaign's accepted records against
+        campaign-seeded roots, and the genesis pointer publishes one. Binding after either would make a
+        resumed campaign unable to verify its own history."""
+        import inspect
+        import sharddiloco_glm_coordinator as C
+        src = inspect.getsource(C.main)
+        i_bind = src.index("N.bind_campaign_id(host, campaign)")
+        assert i_bind < src.index("_resume_from_lane("), "bind BEFORE the resume replay"
+        assert i_bind < src.index("_publish_async_genesis("), "bind BEFORE the genesis pointer"
+        assert "_campaign_id_for_run(args" in src
+
+
+@coordinator_only
+class TestDiscoveryIgnoresForeignCampaigns:
+    """The namespace half, measured where it hurts: the live store's manifest is 11,229 objects and one
+    lane.manifest() call takes 23.79 s. Scoping discovery is not only a correctness fix -- it is what
+    stops a fresh run from FETCHING (one get_json each) every dead record it can see."""
+
+    _MINE = "1111222233334444"
+    _THEIRS = "aaaabbbbccccdddd"
+
+    def _names(self):
+        return ([N.contrib_name(0, "m%d" % i, self._THEIRS) for i in range(3)]
+                + [N.contrib_name(0, "legacy")]
+                + [N.contrib_name(0, "mine", self._MINE)])
+
+    def test_only_this_campaigns_names_are_collected(self):
+        import sharddiloco_glm_coordinator as C
+        got = C._collect_unprocessed(self._names(), set(), C._contrib_name_parser(self._MINE),
+                                     max_base_event=0)
+        assert [n for n, _b, _m in got] == [N.contrib_name(0, "mine", self._MINE)]
+        assert len(got) == 1, "1 of 5 names, and the other 4 are never even dated"
+
+    def test_the_loop_never_fetches_a_foreign_record(self, monkeypatch):
+        """End-to-end through the REAL loop: a foreign record must cost ZERO get_json calls. Pre-fix
+        every one of them was fetched and only then dropped by the lineage guard."""
+        import sharddiloco_glm_coordinator as C
+        TestFixAManifestIsNotReReadEveryPass._env(monkeypatch)
+        recs = {n: _contrib_rec(0, n.rsplit("/", 1)[1]) for n in self._names()}
+        lane = _CountingLane(recs)
+        host = _RegistryHost([_A_COORD])
+        args = _loop_args()
+        args.campaign_id = self._MINE
+        logs = []
+        rc = C.run_async_events(None, None, host, lane, _PooledProbe(),
+                                types.SimpleNamespace(verify=0.0, fwd=1.0), None, [], host.slots,
+                                {}, args, 1.0, lambda *a: logs.append(" ".join(str(x) for x in a)))
+        assert rc == 0
+        assert lane.fetched == ["sha-" + N.contrib_name(0, "mine", self._MINE).replace("/", "-")], \
+            "expected exactly our own record to be fetched, got %r" % (lane.fetched,)
+        assert any("campaign=%s" % self._MINE in ln for ln in logs), "the loop must log its campaign"
+
+    def test_the_pointer_advertises_the_campaign_so_a_miner_can_latch_it(self):
+        import neurahash.diloco_merge as dm
+        import sharddiloco_glm_coordinator as C
+        ptr = C._build_pointer(dm.SlotClock(), [(1, 0)], "ROOT",
+                               domains={"domains": ["code"], "domains_digest": "dd"},
+                               campaign=self._MINE)
+        assert ptr[N.CAMPAIGN_POINTER_KEY] == self._MINE
+        assert N.pointer_campaign_id(ptr) == self._MINE
+        assert ptr["domains_digest"] == "dd" and ptr["v"] == 2      # additive, nothing displaced
+        plain = C._build_pointer(dm.SlotClock(), [(1, 0)], "ROOT")
+        assert N.CAMPAIGN_POINTER_KEY not in plain, "no campaign -> the pre-campaign pointer bytes"
+
+
+class TestAMinerRefusesAnUnscopedLane:
+    """FAIL-CLOSED, and it has to SAY WHY: a public miner operator reading one line must be able to act.
+    Publishing into the shared namespace anyway is what let a dead campaign's delta be minted."""
+
+    _CID = "1234abcd1234abcd"
+
+    def test_a_pointer_without_a_campaign_is_refused_by_name(self):
+        msg = N.campaign_refusal({"v": 2, "event": 0, "rounds": {}, "model_root": "R"}, environ={})
+        assert msg and "REFUSING to publish" in msg
+        assert "NEURAHASH_SD_CAMPAIGN_SCOPE=0" in msg, "the way out must be in the same line"
+        assert "campaign" in msg.lower()
+
+    def test_a_pointer_with_a_campaign_is_accepted_and_latched(self):
+        ptr = {"v": 2, "event": 0, "rounds": {}, "model_root": "R", "campaign_id": self._CID}
+        assert N.campaign_refusal(ptr, environ={}) is None
+        assert N.pointer_campaign_id(ptr) == self._CID
+
+    def test_a_malformed_campaign_id_is_refused_like_a_missing_one(self):
+        """Fail-closed: an id we cannot validate must not be pasted into names or hash seeds."""
+        ptr = {"v": 2, "event": 0, "rounds": {}, "model_root": "R", "campaign_id": "../etc/passwd"}
+        assert N.pointer_campaign_id(ptr) is None
+        assert N.campaign_refusal(ptr, environ={}) is not None
+
+    def test_the_opt_out_re_enables_publishing_on_a_legacy_lane(self):
+        env = {"NEURAHASH_SD_CAMPAIGN_SCOPE": "0"}
+        assert N.campaign_refusal({"v": 2, "event": 0, "rounds": {}, "model_root": "R"}, environ=env) is None
+
+    def test_a_v1_SYNC_lane_is_never_refused_because_it_cannot_carry_a_campaign(self):
+        """A v1 pointer has no field to advertise a campaign in, and the coordinator makes scoping inert
+        in sync mode for exactly that reason. Refusing there would stop a DEFAULT-configured miner from
+        joining ANY legacy v1 lane -- so the refusal must sit AFTER the mode decision and fire only on
+        the async path. (Regression: it was first written before _select_async_mode.)"""
+        import inspect
+        v1 = {"round": 3, "state_cid": "ROOT", "done": False}
+        assert N._select_async_mode(v1, {}) is False
+        src = inspect.getsource(N.main)
+        i_mode = src.index("_mode_async = _select_async_mode(")
+        i_ref = src.index("campaign_refusal(ptr)")
+        assert i_mode < i_ref, "the refusal must not run before the mode is known"
+        assert src[i_ref - 400:i_ref].count("if _mode_async:") == 1, \
+            "the campaign block must be gated on the ASYNC path"
+
+    def test_main_actually_refuses_and_binds_before_publishing(self):
+        """A pure helper nobody calls is worthless (same reason as the affinity wiring test): main()
+        must exit on the refusal, bind the id to the host, and both publish paths must name-scope."""
+        import inspect
+        src = inspect.getsource(N.main)
+        assert "campaign_refusal(ptr)" in src
+        assert "return RC_NO_CAMPAIGN" in src and N.RC_NO_CAMPAIGN == 11
+        assert "bind_campaign_id(host, pointer_campaign_id(ptr))" in src
+        i_bind = src.index("bind_campaign_id(host, pointer_campaign_id(ptr))")
+        assert i_bind < src.index("_run_async("), "bind BEFORE the async cadence starts publishing"
+        assert "contrib_name(rnd, miner, host_campaign_id(host))" in src, "sync publish must scope too"
+        asrc = inspect.getsource(N._run_async)
+        assert "async_publish_name(base_event, miner, publish_k, host_campaign_id(host))" in asrc
+
+    def test_a_campaign_change_mid_flight_exits_instead_of_starving_silently(self):
+        """If the coordinator restarts into a NEW campaign, an already-running miner would publish where
+        nobody looks -- and an undiscovered record is never even DROPPED, so no log anywhere would say
+        so. The loop must notice and exit. (Wiring assertion: driving _run_async needs a real model.)"""
+        import inspect
+        asrc = inspect.getsource(N._run_async)
+        assert "pointer_campaign_id(ptr)" in asrc
+        assert "campaign CHANGED on the lane" in asrc
+        i_guard = asrc.index("_ptr_camp != host_campaign_id(host)")
+        assert i_guard < asrc.index("async_publish_name("), "check BEFORE publishing, not after"
+        assert "return RC_NO_CAMPAIGN" in asrc[i_guard:i_guard + 800]
+
+
+# ============================== v3.4.2 SEAT SQUATTING: the lineage verdict is taken BEFORE a seat is given
+def _goodput(logs):
+    """The FINAL goodput counters exactly as an operator reads them out of the log."""
+    return json.loads([ln for ln in logs if "goodput FINAL" in ln][-1].split("goodput FINAL ", 1)[1])
+
+
+@coordinator_only
+class TestTerminalLineageTaxonomy:
+    """WHICH lineage verdicts may be acted on BEFORE a coordinate is registered.
+
+    Getting this list wrong has teeth in both directions. Too narrow and the measured seat squat stays:
+    a lineage-dead record registers its coordinate, holds one of --max-active-slots and DEFERs an honest
+    claimant out. Too wide and a record that is merely EARLY (`future-base-event`) or UNDECIDED
+    (`unknown-coordinate`) is destroyed instead of queued -- silent theft of a miner's GPU hours, which
+    on this lane is indistinguishable, miner-side, from a rejected delta."""
+
+    _ROOTS = {0: "G0"}
+
+    @staticmethod
+    def _C():
+        import sharddiloco_glm_coordinator as C
+        return C
+
+    def _verdict(self, rec, coord=(1, 0), cur=0, root_hist=None, srh=None, host=None):
+        return self._C()._terminal_lineage_verdict(
+            rec, coord, rec.get("base_event"), cur,
+            self._ROOTS if root_hist is None else root_hist, {} if srh is None else srh, host=host)
+
+    # ---------------------------------------------------------------------------- TERMINAL (safe to drop)
+    def test_a_wrong_slot_root_is_terminal(self):
+        """The measured squat: the record asserts it trained against weights we never had for this
+        coordinate. No later event can make that true."""
+        assert self._verdict(dict(base_event=0, base_slot_root="THEIRS"),
+                             srh={(1, 0): [(0, "OURS")]}) == (True, "wrong-lineage-slot-root")
+
+    def test_a_wrong_global_root_is_terminal_for_a_pre_shard_claim_record(self):
+        assert self._verdict(dict(base_event=0, base_root="THEIRS")) == (True, "wrong-lineage-root")
+
+    def test_a_legacy_record_against_a_grown_slot_list_is_terminal_and_keeps_its_own_name(self):
+        """`legacy-miner-vs-dynamic-slots` is the same drop with an honest cause attached (an old client,
+        not a forgery). Still terminal: that client cannot retroactively send a base_slot_root."""
+        assert self._verdict(dict(base_event=0, base_root="THEIRS"), cur=3,
+                             srh={(1, 9): [(3, "seeded-later")]}) == (True,
+                                                                      "legacy-miner-vs-dynamic-slots")
+
+    def test_a_height_we_cannot_even_parse_is_terminal(self):
+        assert self._verdict(dict(base_event=None, base_root="G0")) == (True, "bad-base-event")
+        assert self._verdict(dict(base_event="nope", base_root="G0")) == (True, "bad-base-event")
+
+    # ------------------------------------------------------------------- RETRYABLE (must stay queued)
+    def test_a_future_base_event_is_retryable(self):
+        """A "not yet", not a rejection: the same record is valid once the clock reaches it."""
+        assert self._verdict(dict(base_event=5, base_slot_root="X")) == (False, "future-base-event")
+
+    def test_an_undecidable_coordinate_is_retryable(self):
+        """At this point the coordinate is usually NOT registered, so the slot-root comparison often
+        cannot be decided at all. Undecided must never read as "dead"."""
+        assert self._verdict(dict(base_event=0, base_slot_root="X")) == (False, "unknown-coordinate")
+
+    def test_an_unknown_event_is_retryable_even_though_the_loop_cannot_reach_it(self):
+        """Unreachable here (the clock starts at 0 and root_hist gains a contiguous entry per commit),
+        so it is classified fail-safe rather than relied upon."""
+        assert self._verdict(dict(base_event=1, base_slot_root="X"), cur=2,
+                             root_hist={0: "G0", 2: "G2"}) == (False, "unknown-event")
+
+    def test_a_valid_record_is_never_dead(self):
+        assert self._verdict(dict(base_event=0, base_slot_root="OURS"),
+                             srh={(1, 0): [(0, "OURS")]}) == (False, "ok")
+
+    def test_every_reason_lineage_ok_can_emit_is_deliberately_classified(self):
+        """A reason added to _lineage_ok later falls through as RETRYABLE -- fail-safe, but SILENTLY. Pin
+        the whole set so the next author has to look at this classification on purpose."""
+        import inspect
+        import re
+        C = self._C()
+        emitted = set(re.findall(r'return False, "([a-z-]+)"', inspect.getsource(C._lineage_ok)))
+        assert emitted == {"bad-base-event", "future-base-event", "unknown-event", "unknown-coordinate",
+                           "wrong-lineage-slot-root", "legacy-miner-vs-dynamic-slots",
+                           "wrong-lineage-root"}
+        assert set(C._TERMINAL_LINEAGE_REASONS) < emitted
+        assert emitted - set(C._TERMINAL_LINEAGE_REASONS) == {"future-base-event", "unknown-event",
+                                                             "unknown-coordinate"}
+
+    # --------------------------------------------------------------------- nothing may be REMEMBERED
+    def test_a_lineage_rollback_revives_a_record_that_was_dead_before_it(self):
+        """_resume_from_lane can roll back and REWRITE root_hist, so a memo of "terminally dead" would
+        wrongly exclude records that are valid for the NEW lineage. The same record object must be
+        re-judged from live state every time."""
+        C = self._C()
+        rec = dict(base_event=1, base_root="G1-theirs")
+        rh = {0: "G0", 1: "G1-ours"}
+        assert C._terminal_lineage_verdict(rec, (1, 0), 1, 1, rh, {}) == (True, "wrong-lineage-root")
+        rh[1] = "G1-theirs"                       # what a rollback to that lineage leaves behind
+        assert C._terminal_lineage_verdict(rec, (1, 0), 1, 1, rh, {}) == (False, "ok")
+
+    def test_a_rollback_of_a_per_coordinate_root_revives_it_too(self):
+        C = self._C()
+        rec = dict(base_event=0, base_slot_root="THEIRS")
+        srh = {(1, 0): [(0, "OURS")]}
+        assert C._terminal_lineage_verdict(rec, (1, 0), 0, 0, {0: "G0"}, srh)[0] is True
+        srh[(1, 0)] = [(0, "THEIRS")]
+        assert C._terminal_lineage_verdict(rec, (1, 0), 0, 0, {0: "G0"}, srh) == (False, "ok")
+
+
+@coordinator_only
+class TestProspectiveSlotRoot:
+    """_prospective_slot_root: OUR root for a coordinate we have NOT registered.
+
+    Without it the FIRST record on an unseen coordinate is undecidable (`unknown-coordinate`), so a
+    forged or dead-campaign root would still have to be given a seat before it could be judged -- which
+    is exactly the deadlock. Its load-bearing property is therefore an EQUALITY: it must return what
+    _admit_coordinate would seed, or it would call honest first-contact claims dead."""
+
+    @staticmethod
+    def _C():
+        import sharddiloco_glm_coordinator as C
+        return C
+
+    _UNSEEN = (2, 3)                     # claimable on the `h` fixture's host, never registered
+
+    def test_it_equals_the_root_the_registry_would_seed_on_registration(self, h):
+        got = self._C()._prospective_slot_root(h, self._UNSEEN)
+        assert got is not None
+        idx = h.register(*self._UNSEEN)
+        assert N.slot_root(h, idx) == got, "a first-contact claim would be dropped as wrong-lineage"
+
+    def test_it_takes_no_seat_and_leaves_no_slot_behind(self, h):
+        """The whole point: deciding lineage must not cost the thing we are protecting."""
+        before_slots, before_active = list(h.slots), set(h.active)
+        self._C()._prospective_slot_root(h, self._UNSEEN)
+        assert h.slots == before_slots and h.active == before_active
+        assert h.index_of(*self._UNSEEN) is None
+
+    def test_the_campaign_seed_is_carried_across(self, h):
+        """That seed is what separates two campaigns over one pristine base. A prospective root computed
+        without it would declare every campaign-scoped record dead -- the whole lane, not just replays."""
+        C = self._C()
+        unscoped = C._prospective_slot_root(h, self._UNSEEN)
+        N.bind_campaign_id(h, "aaaa1111aaaa1111")
+        scoped = C._prospective_slot_root(h, self._UNSEEN)
+        assert scoped != unscoped
+        assert N.slot_root(h, h.register(*self._UNSEEN)) == scoped
+
+    def test_an_unhostable_coordinate_is_undecidable_not_dead(self, h):
+        """(9,9) is outside the claimable set; _admit_coordinate refuses it with no seat, so there is
+        nothing here to decide -- and None must mean "undecidable", never "mismatch"."""
+        assert self._C()._prospective_slot_root(h, (9, 9)) is None
+
+    def test_a_host_that_is_not_a_lane_host_is_undecidable(self):
+        """Fails soft on any duck-typed host (test fakes, future host classes) instead of raising inside
+        the event loop."""
+        assert self._C()._prospective_slot_root(_RegistryHost([(1, 0)]), (1, 5)) is None
+
+
+@coordinator_only
+class TestALineageDeadRecordTakesNoSeat:
+    """MEASURED DEADLOCK (2026-07-25). `_admit_coordinate` ran BEFORE the lineage check, so an
+    authenticated-but-lineage-DEAD record REGISTERED its coordinate and took one of --max-active-slots.
+    With one free seat, two dead records and one honest miner, the run measured:
+
+        REGISTER (L1,E1) -> slot 1 on first contribution from glm-deadcamp (active=2, ...)
+        LINEAGE-DROP cg/r0/glm-deadcamp.0 base_event=0 (wrong-lineage-slot-root)
+        DEFER glm-live5090: max_active_slots=2 reached; cannot admit (L1,E3) yet
+        events=0 ... -> live miner merged: False | dead coordinates registered: [(1, 1)]
+
+    and it could not self-heal: idle eviction is counted in EVENTS, and events were stuck at 0 precisely
+    because the honest miner could not merge. The same shape was observed on the live lane, where foreign
+    identity glm-E2223497 held 1 of 6 seats.
+
+    The dead records here get every advantage: on the roster, correctly signed, and claiming coordinates
+    this node really hosts. Only `base_slot_root` is a root we never produced -- which is free to forge,
+    because that field is not covered by the signature."""
+
+    _DEAD = ((2, 0), (2, 1))             # coordinates the dead records claim
+    _LIVE = (2, 2)                       # the honest miner's coordinate
+    _DEAD_ROOT = "de" * 32               # a per-coordinate root this coordinator never produced
+
+    @pytest.fixture(autouse=True)
+    def _fast_idle(self, monkeypatch):
+        """Pre-fix this scenario ends with the loop waiting for work it will never be able to merge, so
+        the 600 s default idle guard would hang the suite. Set INSIDE the class so the file stays fast
+        standalone and never depends on the caller's environment."""
+        monkeypatch.setenv("NEURAHASH_SD_IDLE_EXIT_S", "1")
+        monkeypatch.setenv("NEURAHASH_SD_POLL_S", "0.05")
+
+    @classmethod
+    def _run(cls, loop_model, store_harness, rounds=1):
+        """ONE free seat (start slot (1,0), --max-active-slots=2), two dead claims, then the honest one."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=rounds, max_active=2)
+        G = loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        for n, coord in enumerate(cls._DEAD):
+            mh.register(*coord)
+            _publish_claim(env, coord, "dead%d" % n, wire_idx=1, host=mh, seed=40 + n,
+                           slot_root=cls._DEAD_ROOT)
+        mh.register(*cls._LIVE)
+        _publish_claim(env, cls._LIVE, "honest", wire_idx=1, host=mh, seed=9)
+        return env, _drive_loop(env, ["dead0", "dead1", "honest"])
+
+    def test_the_dead_coordinates_are_not_registered_and_the_honest_miner_merges(self, loop_model,
+                                                                                store_harness):
+        """THE load-bearing assertion, on the REGISTRY and the accepted record -- not on a log string."""
+        env, logs = self._run(loop_model, store_harness)
+        host = env["host"]
+        assert [host.index_of(*c) for c in self._DEAD] == [None, None], \
+            "a lineage-dead record still took a seat:\n" + "\n".join(logs[-14:])
+        assert host.index_of(*self._LIVE) == 1, \
+            "the honest claimant did not get the only free seat:\n" + "\n".join(logs[-14:])
+        assert sorted(host.slots[i] for i in host.active) == [(1, 0), self._LIVE]
+        rec = env["store"].accepted(1)
+        assert rec is not None and rec["accepted"], \
+            "the honest miner earned nothing:\n" + "\n".join(logs[-14:])
+        assert (rec["accepted"][0]["layer"], rec["accepted"][0]["glm_expert"]) == self._LIVE
+        assert N.accepted_names_me(rec, "honest") is True
+
+    def test_nothing_is_deferred_because_no_seat_was_ever_squatted(self, loop_model, store_harness):
+        """DEFER was the visible symptom on the live lane, and the state that froze idle eviction."""
+        _env, logs = self._run(loop_model, store_harness)
+        assert not [ln for ln in logs if "DEFER" in ln], \
+            "an honest claim was still deferred:\n" + "\n".join(logs[-14:])
+
+    def test_the_seat_gate_pool_belongs_to_the_coordinate_that_really_claimed(self, loop_model,
+                                                                             store_harness):
+        """The secondary cost: registration also builds the secret gate pool (keyed by the coordinate's
+        DATA domain) and, once begin_round has run, copies the whole ~75.5 MB fp32 slot on the real model.
+        Pre-fix slot 1's pool was built for the dead coordinate. ensure_pool is idempotent and returns the
+        pool already present, so asking for it with a sentinel reads back what registration installed."""
+        env, logs = self._run(loop_model, store_harness)
+        import sharddiloco_glm_coordinator as C
+
+        def _same(a, b):
+            return len(a) == len(b) and all(np.array_equal(x, y) for x, y in zip(a, b))
+
+        want, dead = (C._slot_probe_pool(env["args"], self._LIVE),
+                      C._slot_probe_pool(env["args"], self._DEAD[0]))
+        assert not _same(want, dead), "the two coordinates share a data domain: this test proves nothing"
+        assert env["probe"].has_pool(1), "\n".join(logs[-12:])
+        # ensure_pool is idempotent and returns the pool already present, so a sentinel call READS BACK
+        # what registration installed without changing it.
+        assert _same(env["probe"].ensure_pool(1, ("sentinel",)), want), \
+            "slot 1's gate pool belongs to another coordinate's data domain"
+
+    def test_the_early_drops_are_counted_and_named_apart_from_gate_rejections(self, loop_model,
+                                                                             store_harness):
+        """A silent filter is indistinguishable from a broken lane. The drops are PRE-gate, so they must
+        not land in processed/rejected_gate (which would either fake work or fake failure) -- they get
+        their own counter, stay inside the existing `staled` accounting, and say "pre-register" in the
+        log so they cannot be confused with the post-registration lineage pass."""
+        env, logs = self._run(loop_model, store_harness)
+        early = [ln for ln in logs if "LINEAGE-DROP(pre-register)" in ln]
+        assert len(early) == 2, "\n".join(logs[-14:])
+        assert all("wrong-lineage-slot-root" in ln for ln in early), early
+        assert all(("(L%d,E%d)" % self._DEAD[i]) in early[i] for i in (0, 1)), early
+        gp = _goodput(logs)
+        assert gp["lineage_dead_pregate"] == 2, gp
+        assert gp["staled"] >= 2, gp
+        assert (gp["processed"], gp["accepted"], gp["rejected_gate"]) == (1, 1, 0), gp
+
+    def test_the_counter_is_reported_even_when_it_never_fires(self, loop_model, store_harness):
+        """A counter that only appears once it fires cannot be used to rule the drop OUT."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=1, max_active=2)
+        G = loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        mh.register(*self._LIVE)
+        _publish_claim(env, self._LIVE, "honest", wire_idx=1, host=mh, seed=9)
+        logs = _drive_loop(env, ["honest"])
+        assert _goodput(logs)["lineage_dead_pregate"] == 0
+        assert env["store"].accepted(1)["accepted"], "\n".join(logs[-12:])
+
+    def test_neutralising_the_pre_register_gate_brings_the_deadlock_straight_back(self, loop_model,
+                                                                                 store_harness,
+                                                                                 monkeypatch):
+        """RED WITNESS. The tests above would also pass on a coordinator that simply never sees these
+        records, so pin the mechanism: with the pre-registration verdict forced to "alive" (the v3.4.1
+        order, where registration ran first) the measured deadlock returns EXACTLY -- dead coordinate on
+        the seat, honest claim deferred, nothing merged."""
+        import sharddiloco_glm_coordinator as C
+        monkeypatch.setattr(C, "_terminal_lineage_verdict", lambda *a, **k: (False, "ok"))
+        env, logs = self._run(loop_model, store_harness)
+        host = env["host"]
+        assert host.index_of(*self._DEAD[0]) == 1, "\n".join(logs[-14:])
+        assert host.index_of(*self._LIVE) is None
+        assert [ln for ln in logs if "DEFER" in ln], "\n".join(logs[-14:])
+        assert env["store"].accepted(1) is None, "the honest miner should have earned nothing here"
+
+
+@coordinator_only
+class TestRetryableRecordsStillMergeThroughTheLoop:
+    """The other half of the fix, end-to-end on the real loop: a record the early check could not
+    condemn must still be picked up and merged. Dropping these would be worse than the squat -- the
+    squat costs a seat, this would silently burn a miner's GPU hours."""
+
+    @pytest.fixture(autouse=True)
+    def _fast_idle(self, monkeypatch):
+        monkeypatch.setenv("NEURAHASH_SD_IDLE_EXIT_S", "1")
+        monkeypatch.setenv("NEURAHASH_SD_POLL_S", "0.05")
+
+    def test_a_future_base_event_record_is_merged_once_the_clock_reaches_it(self, loop_model,
+                                                                           store_harness):
+        """`future-base-event` is a "not yet": at event 0 the r1 name is not even fetched, and after the
+        event-0 record commits event 1 the SAME record must be discovered, judged and merged. It also
+        exercises the undecidable path -- (2,3) is unregistered when it arrives, so its verdict rests on
+        the prospective root, and it is registered only once it has been judged alive."""
+        env = _loop_env(loop_model, store_harness, [(1, 0)], rounds=2, max_active=8)
+        G = loop_model[0]
+        mh = G.GlmExpertLaneHost(loop_model[1], loop_model[2], [(1, 0)], claimable=env["claimable"])
+        _publish_claim(env, (1, 0), "now", wire_idx=0, host=mh, seed=11)
+        mh.register(2, 3)
+        late = _publish_claim(env, (2, 3), "later", base_event=1, wire_idx=1, host=mh, seed=12)
+        assert late.startswith("cg/r1/"), late
+
+        logs = _drive_loop(env, ["now", "later"])
+        rec2 = env["store"].accepted(2)
+        assert rec2 is not None and rec2["accepted"], \
+            "the deferred-discovery record never merged:\n" + "\n".join(logs[-16:])
+        assert (rec2["accepted"][0]["layer"], rec2["accepted"][0]["glm_expert"]) == (2, 3)
+        assert N.accepted_names_me(rec2, "later") is True
+        assert not [ln for ln in logs if "LINEAGE-DROP" in ln and "later" in ln], \
+            "\n".join([ln for ln in logs if "LINEAGE-DROP" in ln][:4])
+        assert _goodput(logs)["lineage_dead_pregate"] == 0

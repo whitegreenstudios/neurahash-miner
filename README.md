@@ -108,12 +108,30 @@ held-out improvement, so there is no fragile torch/BLAS determinism requirement 
 it, and the network admits you on your first valid signed contribution. Your miner name *is* your
 address (`glm-<addr[2:10]>`), so nobody can impersonate you and no operator can gate you:
 
+Two commands, no placeholders to fill in. Step 1 downloads and verifies the model pieces; step 2
+mines:
+
+```bash
+python tools/fetch_glm_base.py --dest ~/glm_base --pieces 0
+```
+
+```bash
+python tools/sharddiloco_glm_contributor.py --mode glm --device cuda --shard-dir ~/glm_base --config-dir ~/glm_base/config
+```
+
+Nothing else is required: `--url` and `--token` default to the public anchor lane, `--data-dir`
+downloads and sha256-verifies the corpus into place by itself, and `--expert` auto-claims a free
+coordinate. Add `--domains daily` only if you want to pin the domain set explicitly.
+
+<details><summary>Older placeholder form (kept for reference — no longer needed)</summary>
+
 ```bash
 python tools/sharddiloco_glm_contributor.py --mode glm \
   --shard-dir <glm-shards> --config-dir <glm-config> \
   --data-dir <empty-dir> --domains daily \
   --url <content-store-url> --token <store-token> --device cuda
 ```
+</details>
 
 **You do not pick a slot number any more.** Omit the expert entirely and the miner derives its
 starting coordinate from a hash of its own wallet address, so independent miners spread across the
@@ -235,7 +253,20 @@ across **three physically separate machines** (a 5090, a 4060, and a cloud datac
 elected leader was crashed, the two survivors formed a real 2-of-3 quorum and one took over with **no
 chain fork**. This means the operator running the pool cannot silently cheat miners on payouts. Full
 production activation (a real on-chain validator set + an external audit) is still gated on the
-operator; the mechanism is proven and ships **default-off** until then.
+operator.
+
+**Corrected 2026-07-25 — read this before relying on the quorum.** Two things this section used to
+get wrong:
+
+- It is **not default-off any more.** `NEURAHASH_GLM_QUORUM` defaults to `"1"`, so the quorum is
+  **ACTIVE** on a default coordinator and mints settle M-of-N or are withheld.
+- **But no validator can currently refuse.** The live wiring passes `authorize=None`, so the
+  validators co-sign whatever they are handed; the forged-mint veto only passes in tests because the
+  test injects a refusing validator. The "trust root" is also 3 private keys in one local JSON file
+  read by the coordinator process itself — so today it proves the coordinator did not *silently alter*
+  a mint after the fact, and does **not** yet prove an independent party could have *stopped* one.
+
+Treat it as tamper-evidence, not tamper-prevention, until a real external validator set exists.
 
 ## Being a good GPU neighbor — elastic VRAM (2026-07-22)
 
@@ -447,6 +478,15 @@ verified → training, first try.**)
   the training plateau demanded. Verdict: the plateau is a base-model *capability* ceiling, not a
   data/storage one — so the roadmap now points at verifiable-reward post-training (alpha-4). Details
   land with the alpha-4 release.
+  - **RETRACTED 2026-07-25 by measurement.** That verdict was wrong, and it was wrong in the
+    expensive direction: it told the roadmap to stop looking at the data. The plateau was
+    **corpus-shaped**. Growing the `daily` train split 128x (262,144 -> 33,554,432 tokens) against a
+    **frozen, byte-identical** probe/held-out yardstick moved held-out CE **7.66078 -> 6.44438**. A
+    control run on the *same* grown corpus but with expert claiming disabled reached only 6.68232,
+    and was worse at all five matched checkpoints — so of the 1.21640 total gain, roughly **80%
+    is the corpus and 20% is Shard Claim**. The old sentence was written from a single plateaued
+    run, which is exactly the sample size that cannot distinguish "the model can't" from "the data
+    ran out".
 
 ## Alpha 2.0 (2026-07-24) — truly decoupled, self-syncing corpus, trustless-settled
 
@@ -460,6 +500,10 @@ RTX 4060 training over the real internet as fresh stranger clones, then a 12-hou
   the pair, the 5090 went from ~33 rounds/hr (old lock-step) to **~60**, while the 4060 ran free at its
   own ~36 — the fast card is never barriered on the slow one again. Behind `NEURAHASH_SD_ASYNC`;
   default-off and byte-identical on today's synchronous lanes.
+  - **Corrected 2026-07-25: this is now default-ON, not default-off.** `NEURAHASH_SD_ASYNC` defaults
+    to `"1"`, so a default coordinator publishes a v2 pointer and runs the decoupled event loop; the
+    miner follows a v2 pointer into the async cadence automatically. It is an **opt-OUT** flag now —
+    set `NEURAHASH_SD_ASYNC=0` to force the old synchronous lane.
 - **Corpus auto-sync.** You no longer stage the corpus by hand: the coordinator advertises a **sha256
   manifest**, and the miner auto-downloads any missing/mismatched file (HuggingFace CDN first) and
   **verifies it fail-closed** before training. Proven: both boxes started with empty data dirs and

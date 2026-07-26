@@ -112,7 +112,7 @@ Two commands, no placeholders to fill in. Step 1 downloads and verifies the mode
 mines:
 
 ```bash
-python tools/fetch_glm_base.py --dest ~/glm_base --pieces 0
+python tools/fetch_glm_base.py --dest ~/glm_base --pieces 0-11
 ```
 
 ```bash
@@ -122,6 +122,13 @@ python tools/sharddiloco_glm_contributor.py --mode glm --device cuda --shard-dir
 Nothing else is required: `--url` and `--token` default to the public anchor lane, `--data-dir`
 downloads and sha256-verifies the corpus into place by itself, and `--expert` auto-claims a free
 coordinate. Add `--domains daily` only if you want to pin the domain set explicitly.
+
+**Why `--pieces 0-11` in step 1.** Those twelve pieces are every expert of one MoE layer, and the
+miner defaults to keeping that whole layer resident — **60 trainable coordinates instead of 5**, at a
+*measured byte-identical* parameter count, because the loader allocates all 64 expert rows whether you
+fill them or not. Fetching fewer just means fewer coordinates to mine, not less memory. Piece 12 is
+deliberately excluded: it straddles into the next layer, which costs a real +1.126 GiB for one extra
+coordinate — pass `--pieces` yourself if you want to buy it.
 
 <details><summary>Older placeholder form (kept for reference — no longer needed)</summary>
 

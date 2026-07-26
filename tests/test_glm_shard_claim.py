@@ -303,6 +303,125 @@ class TestStraddlingAnchor:
         assert N.default_piece_ids(man, cfg, anchor=30) == ([30], [])
 
 
+def _materialise_pieces(shard_dir, present):
+    """Give a metadata-only fixture a REAL pieces/ dir holding the trunk plus exactly `present`.
+
+    Contents are irrelevant: every disk check on this path -- ours and
+    piece_loader.load_manifest's (piece_loader.py:178-181) -- is os.path.exists, so empty files
+    reproduce a partial fetch exactly, at zero bytes and with no torch."""
+    pdir = os.path.join(shard_dir, "pieces")
+    os.makedirs(pdir, exist_ok=True)
+    for nm in ["trunk"] + ["experts_%d" % int(p) for p in present]:
+        open(os.path.join(pdir, nm + ".safetensors"), "wb").close()
+    return shard_dir
+
+
+# ============================ the DEFAULT is BEST-EFFORT over what was actually fetched (no torch)
+# WHY: the layer-filling default asks for pieces 0-11, but the published quickstart tells a new joiner
+# to fetch `--pieces 0`. MEASURED on the live fleet 2026-07-26: a 4060 holding only experts_0 stopped
+# starting at all --
+#   File "C:\Users\User\nu_4060\tools\piece_loader.py", line 181, in load_manifest
+#     raise FileNotFoundError("piece file missing: %s" % fp)
+#   FileNotFoundError: piece file missing: C:/Users/User/glm_base\pieces\experts_1.safetensors
+# reached from build_node_model -> build_partial_model -> load_manifest(require_pieces=...). A node
+# that CAN train 5 coordinates must not refuse to train because it cannot train 60, and every new
+# joiner following the README hit this. An EXPLICIT selection is the opposite case: those pieces were
+# named by a human, so a missing one still has to be fatal.
+class TestTheDefaultDegradesToWhatIsOnDisk:
+    """Best effort when nobody named the pieces; unchanged hard failure when somebody did."""
+
+    def test_a_dir_holding_only_the_anchor_starts_instead_of_dying(self, live_shape_shard_dir):
+        """RED then GREEN on the exact live crash, in one test: the set the pre-fix default handed the
+        loader (0-11) still raises FileNotFoundError on experts_1 -- that is the bug, reproduced --
+        while the resolved set now loads and yields the anchor's five coordinates."""
+        sd = _materialise_pieces(live_shape_shard_dir, [0])
+        args = _default_args(sd)
+        with pytest.raises(FileNotFoundError) as ex:
+            PL.load_manifest(sd, require_pieces=list(range(12)))      # what the old default asked for
+        assert "experts_1.safetensors" in str(ex.value)
+        assert N.node_piece_ids(args) == [0]
+        PL.load_manifest(sd, require_pieces=N.node_piece_ids(args))   # the same call, now fine
+        assert N.node_claimable_coords(args) == [(1, E) for E in range(5)]
+
+    def test_a_partial_fetch_uses_exactly_the_pieces_present(self, live_shape_shard_dir):
+        """Three fetched pieces = three resident pieces = 15 coordinates. Not 12 pieces (crash), not
+        1 (throwing away two thirds of what the operator already paid to download)."""
+        args = _default_args(_materialise_pieces(live_shape_shard_dir, [0, 1, 2]))
+        assert N.node_piece_ids(args) == [0, 1, 2]
+        assert len(N.node_claimable_coords(args)) == 15
+
+    def test_the_startup_line_names_what_was_skipped_and_how_to_get_it(self, live_shape_shard_dir):
+        """Silently training a smaller set is how run 4 burned 7.5 h at a plateau nobody could
+        explain. The operator must see BOTH that they are below the layer's ceiling and the one
+        command that fixes it."""
+        sd = _materialise_pieces(live_shape_shard_dir, [0, 1, 2])
+        txt = N.fmt_piece_selection(_default_args(sd))
+        assert "using 3 of 12 piece(s)" in txt and "SKIPPED" in txt
+        assert "fetch_glm_base.py --dest %s --pieces 3,4,5,6,7,8,9,10,11" % sd in txt
+        assert N.resolve_piece_selection(_default_args(sd))["absent"] == list(range(3, 12))
+
+    def test_an_explicit_pieces_range_still_fails_loudly_on_a_partial_dir(self, live_shape_shard_dir):
+        """The operator NAMED 0-11. Quietly handing back 1 piece would train 5 coordinates while they
+        believe they bought 60 -- worse than the crash, because nothing would ever say so."""
+        sd = _materialise_pieces(live_shape_shard_dir, [0])
+        assert N.node_piece_ids(_piece_args(sd, pieces="0-11")) == list(range(12))
+        with pytest.raises(FileNotFoundError, match="experts_1.safetensors"):
+            PL.load_manifest(sd, require_pieces=N.node_piece_ids(_piece_args(sd, pieces="0-11")))
+
+    def test_an_explicit_single_piece_on_a_full_dir_is_still_exactly_five(self, live_shape_shard_dir):
+        """--piece pins residency; the disk filter must not widen OR narrow an explicit selection."""
+        sd = _materialise_pieces(live_shape_shard_dir, range(26))
+        assert N.node_piece_ids(_piece_args(sd, piece=0)) == [0]
+        assert len(N.node_claimable_coords(_piece_args(sd, piece=0))) == 5
+
+    def test_a_fully_fetched_dir_still_gets_the_whole_layer(self, live_shape_shard_dir):
+        """No regression: when every piece is there the default is the same 12 pieces / 60
+        coordinates it resolved before this filter existed, with nothing reported skipped."""
+        sd = _materialise_pieces(live_shape_shard_dir, range(26))
+        args = _default_args(sd)
+        assert N.node_piece_ids(args) == list(range(12))
+        assert len(N.node_claimable_coords(args)) == 60
+        assert N.resolve_piece_selection(args)["absent"] == []
+        assert "SKIPPED" not in N.fmt_piece_selection(args)
+
+    def test_a_metadata_only_dir_still_resolves_the_full_default(self, live_shape_shard_dir):
+        """THE THIRD STATE. A shard dir with no pieces/ at all is the PRE-FETCH case
+        load_manifest(require_files=False) exists for (piece_loader.py:146-150): a cold node asks what
+        it SHOULD fetch before anything is on disk. Intersecting there would answer 'nothing'."""
+        assert not os.path.isdir(os.path.join(live_shape_shard_dir, "pieces"))
+        assert N.node_piece_ids(_default_args(live_shape_shard_dir)) == list(range(12))
+
+    def test_not_even_the_anchor_present_is_fatal_and_says_how_to_fix_it(self, live_shape_shard_dir):
+        """Empty intersection is not a degrade -- there is no expert to train at all. Failing with the
+        dir AND the command beats booting a node that would train nothing and never say why."""
+        sd = _materialise_pieces(live_shape_shard_dir, [])            # trunk only
+        with pytest.raises(SystemExit) as ex:
+            N.node_piece_ids(_default_args(sd))
+        msg = str(ex.value)
+        assert sd in msg and "fetch_glm_base.py --dest %s --pieces 0," % sd in msg
+
+    def test_pieces_fetched_mid_run_do_not_widen_a_running_nodes_claims(self, live_shape_shard_dir):
+        """The hazard this fix's own advice creates: an operator pastes the printed fetch command
+        WITHOUT restarting. The model was loaded with piece 0 only, so a claimable set that grew to
+        the new pieces would hand the miner rows that are writable but router-masked to -inf
+        (piece_loader.py:366-385) -- train forever, rejected forever. Residency is frozen at first
+        resolution instead; the log line tells the operator to restart."""
+        sd = _materialise_pieces(live_shape_shard_dir, [0])
+        args = _default_args(sd)
+        assert N.node_piece_ids(args) == [0]
+        _materialise_pieces(sd, [0, 1, 2])                   # fetched while the node is running
+        assert N.node_piece_ids(args) == [0]
+        assert "RESTART" in N.fmt_piece_selection(args)
+
+    def test_both_roles_agree_on_the_degraded_set(self, live_shape_shard_dir):
+        """LOCKSTEP still holds after the filter: a miner that degraded to piece 0 while the
+        coordinator held 0-11 would be told 'not hostable here' for coordinates it does hold."""
+        C = pytest.importorskip("sharddiloco_glm_coordinator")
+        args = _default_args(_materialise_pieces(live_shape_shard_dir, [0, 1]))
+        assert C.N.node_piece_ids(args) == N.node_piece_ids(args) == [0, 1]
+        assert C.N.node_claimable_coords(args) == N.node_claimable_coords(args)
+
+
 class TestBothRolesResolveTheSameDefault:
     """THE LOCKSTEP GUARD. A miner that auto-expanded to 60 coordinates while the coordinator hosted 5
     would simply be told `not hostable here` for 55 of them, which looks like a miner bug and is not.

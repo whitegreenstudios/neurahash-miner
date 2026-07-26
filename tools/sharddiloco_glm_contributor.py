@@ -399,6 +399,77 @@ def default_piece_ids(manifest, config, anchor=DEFAULT_ANCHOR_PIECE):
     return keep, excluded
 
 
+def _piece_path(shard_dir, pid):
+    """Where the loader will look for expert piece `pid`. Deliberately a literal mirror of the path
+    piece_loader.load_manifest builds before raising 'piece file missing' (piece_loader.py:178-181):
+    if those two ever disagree, the best-effort filter below silently stops protecting anything."""
+    return os.path.join(str(shard_dir), "pieces", "experts_%d.safetensors" % int(pid))
+
+
+def pieces_on_disk(shard_dir, piece_ids):
+    """Split `piece_ids` into (present, absent) for THIS shard dir. Never raises; stat work only.
+
+    WHY THIS EXISTS (measured live 2026-07-26): the layer-filling default asks for pieces 0-11, but a
+    real miner on the fleet had fetched only experts_0 -- the README quickstart literally says
+    `--pieces 0` -- and build_node_model died at startup with
+    `FileNotFoundError: piece file missing: C:/Users/User/glm_base\\pieces\\experts_1.safetensors`
+    (piece_loader.py:181, reached via build_partial_model -> load_manifest(require_pieces=...)). A
+    node that CAN train 5 coordinates must not refuse to train at all because it cannot train 60, and
+    every new joiner walked into that same wall.
+
+    THE THIRD STATE MATTERS. A shard dir with NO pieces/ subdirectory at all is the PRE-FETCH METADATA
+    case that load_manifest(require_files=False) exists for (piece_loader.py:146-150): a cold node
+    reads the expert map to decide what to fetch BEFORE fetching anything, and the claim probe reads
+    it without ever loading a weight. Nothing is being loaded there, so there is nothing to intersect
+    with and the requested set passes through untouched -- filtering it to [] would break cold-start
+    planning to fix a warm-start crash. Once pieces/ exists the dir is a real (possibly partial)
+    fetch, and what is in it is the truth about what can be loaded."""
+    ids = sorted(int(p) for p in piece_ids)
+    pdir = os.path.join(str(shard_dir or ""), "pieces")
+    if not shard_dir or not os.path.isdir(pdir):
+        return ids, []
+    here = [p for p in ids if os.path.exists(_piece_path(shard_dir, p))]
+    absent = [p for p in ids if p not in set(here)]
+    return here, absent
+
+
+# (abspath(shard_dir), requested ids) -> the (present, absent) split measured the FIRST time this
+# process asked. See _frozen_disk_filter.
+_DISK_FILTER_MEMO = {}
+
+
+def _frozen_disk_filter(shard_dir, piece_ids):
+    """pieces_on_disk, but the answer is frozen for the life of the PROCESS.
+
+    RESIDENCY IS A STARTUP DECISION. build_node_model loads the weights once; node_claimable_coords
+    is then re-read on every plateau check. Without this freeze, an operator who pasted the fetch
+    command this module prints WITHOUT restarting would widen the claimable set at the next check to
+    coordinates the running model does not hold -- and a non-resident row of a resident layer is
+    writable but router-masked to -inf (piece_loader.py:366-385), i.e. it would train forever and be
+    gate-rejected forever with nothing in any log. The advice printed alongside says 'then restart';
+    this makes forgetting to harmless instead of silently poisonous."""
+    key = (os.path.abspath(str(shard_dir)) if shard_dir else None,
+           tuple(int(p) for p in piece_ids))
+    if key not in _DISK_FILTER_MEMO:
+        _DISK_FILTER_MEMO[key] = pieces_on_disk(shard_dir, piece_ids)
+    return _DISK_FILTER_MEMO[key]
+
+
+def fetch_pieces_cmd(shard_dir, piece_ids):
+    """The exact command that fetches the named pieces into this shard dir. An operator told WHAT is
+    missing must not then have to work out HOW to get it -- that gap is why the single-piece quickstart
+    silently became a five-coordinate ceiling in the first place.
+
+    `--skip-trunk` is appended only when trunk.safetensors is already there: it saves a multi-GB
+    re-download in the normal case (a node that is already training obviously has the trunk), but
+    pasting it at a node that lacks the trunk would hand back a dir that still cannot load."""
+    cmd = ("python tools/fetch_glm_base.py --dest %s --pieces %s"
+           % (shard_dir, ",".join(str(int(p)) for p in sorted(piece_ids))))
+    if os.path.exists(os.path.join(str(shard_dir or ""), "pieces", "trunk.safetensors")):
+        cmd += " --skip-trunk"
+    return cmd
+
+
 def _default_pieces_for(args, anchor):
     """(ids, excluded, layers, why) for the layer-filling default. NEVER raises.
 
@@ -440,7 +511,8 @@ def resolve_piece_selection(args):
 
     Returns a dict: `ids` (sorted piece ids), `source` ('--pieces' | '--piece' | 'default' | 'none'),
     `anchor`, `layers` (the real layers the anchor covers, or None when unknown), `excluded`
-    ([(piece id, [layers it would add])]) and `note` (one line of plain English for the startup log).
+    ([(piece id, [layers it would add])]), `absent` (default-set pieces dropped because their files
+    are not on disk) and `note` (one line of plain English for the startup log).
 
     LOCKSTEP. The coordinator imports this module as N and calls the same function, which is the whole
     reason it lives here: a miner that widened its residency alone would just be told `not hostable
@@ -451,25 +523,55 @@ def resolve_piece_selection(args):
     (NEURAHASH_GLM_PIECES / NEURAHASH_GLM_PIECE are the same request typed elsewhere and count as
     explicit), and ONLY when the operator named neither does the layer-filling default apply. So
     `--piece 0` still means exactly the five coordinates it meant yesterday: the new default can never
-    silently change a launch command that already exists."""
+    silently change a launch command that already exists.
+
+    AND THE DEFAULT IS BEST-EFFORT OVER WHAT IS ACTUALLY FETCHED (pieces_on_disk). The layer-filling
+    rule asks for pieces 0-11 on the live manifest, but the published quickstart tells a new joiner to
+    fetch `--pieces 0`, so on 2026-07-26 a live 4060 that had only experts_0 died at startup with
+    `FileNotFoundError: piece file missing: .../pieces/experts_1.safetensors`. A node that can train 5
+    coordinates must not refuse to train because it cannot train 60: the default intersects with disk,
+    logs what it skipped and the fetch command for it, and only an EMPTY intersection is fatal.
+    EXPLICIT selections keep failing loudly instead -- the operator named those exact pieces, and
+    quietly handing back a smaller set than someone asked for is worse than the crash."""
     spec = getattr(args, "pieces", None)
     if spec is not None and str(spec).strip() != "":
         return {"ids": parse_pieces(spec), "source": "--pieces", "anchor": None, "layers": None,
-                "excluded": [], "note": "explicit --pieces %s" % str(spec).strip()}
+                "excluded": [], "absent": [], "note": "explicit --pieces %s" % str(spec).strip()}
     p = getattr(args, "piece", None)
     if p is not None:
         return {"ids": [int(p)], "source": "--piece", "anchor": int(p), "layers": None,
-                "excluded": [],
+                "excluded": [], "absent": [],
                 "note": "explicit --piece %d -- residency PINNED to that one piece, the "
                         "layer-filling default is off" % int(p)}
     if not hasattr(args, "piece") and not hasattr(args, "pieces"):
         # A namespace predating both flags (the async lane's dirty-namespace test builds one). It
         # cannot express a selection at all, and [] keeps claims UNCHECKED exactly as they were.
         return {"ids": [], "source": "none", "anchor": None, "layers": None, "excluded": [],
-                "note": "no piece selection in this namespace"}
+                "absent": [], "note": "no piece selection in this namespace"}
     anchor = DEFAULT_ANCHOR_PIECE
     ids, excluded, layers, why = _default_pieces_for(args, anchor)
+    shard_dir = getattr(args, "shard_dir", None)
+    ids, absent = _frozen_disk_filter(shard_dir, ids)
+    if not ids:
+        # Genuinely unusable, not a degrade: pieces/ exists and holds none of them, so there is no
+        # expert to train at all. Naming the dir AND the command is the difference between a stranger
+        # fixing this in one paste and a stranger giving up.
+        raise SystemExit(
+            "[glm-node] FATAL: no expert piece is on disk. The DEFAULT resident set for anchor piece "
+            "%d is %s, and %s/pieces holds none of them, so this node has nothing to train. Fetch at "
+            "least the anchor:\n    %s"
+            % (anchor, fmt_coord_pieces(absent) or "(empty)", shard_dir,
+               fetch_pieces_cmd(shard_dir, absent or [anchor])))
     note = "DEFAULT (no --pieces/--piece given), " + why
+    if absent:
+        # BEST EFFORT, and SAID OUT LOUD. Training fewer coordinates than the layer offers is a
+        # legitimate state (it is what one fetched piece buys), but a silent one would recreate the
+        # five-coordinate ceiling with nothing in any log to explain the plateau -- run 4 exactly.
+        note += ("; using %d of %d piece(s) -- SKIPPED %s because %s does NOT have those files (a "
+                 "partial fetch; this node trains proportionally fewer coordinates than its layer "
+                 "offers). Get the rest with (then RESTART -- residency is fixed at load): %s"
+                 % (len(ids), len(ids) + len(absent), fmt_coord_pieces(absent),
+                    os.path.join(str(shard_dir), "pieces"), fetch_pieces_cmd(shard_dir, absent)))
     if excluded:
         note += ("; excluded straddler(s) %s because each would ADD layer(s) %s -- a new layer is a "
                  "full-width MoE slab (measured +1.126 GiB on GLM-4.7-Flash), not a free fill; pass "
@@ -477,7 +579,7 @@ def resolve_piece_selection(args):
                  % (", ".join(str(pid) for pid, _ in excluded),
                     ", ".join(str(L) for _, ls in excluded for L in ls)))
     return {"ids": ids, "source": "default", "anchor": anchor, "layers": layers,
-            "excluded": excluded, "note": note}
+            "excluded": excluded, "absent": absent, "note": note}
 
 
 def node_piece_ids(args):
@@ -541,7 +643,14 @@ def check_residency(n_resident, claimable, piece_ids):
     writable-but-inert (zero weights, router pinned to -inf). A miner claiming one of them would be
     gate-rejected forever with nothing in any log to say why -- the failure mode this whole
     claimability guard exists to prevent. `claimable is None` means residency is unchecked (tiny mode
-    / no manifest), which stays a no-op exactly as before."""
+    / no manifest), which stays a no-op exactly as before.
+
+    "REQUESTED" IS THE POST-DISK-FILTER SET, not the ideal one. Both sides of this comparison come
+    from resolve_piece_selection (piece_ids here, and `claimable` via node_claimable_coords ->
+    node_piece_ids), so a best-effort default that dropped un-fetched pieces is compared against what
+    it actually asked the loader for. Comparing against the ideal set instead would make this fire on
+    every partially-fetched node -- turning a working 5-coordinate miner into a crash, which is the
+    bug this whole path exists to remove."""
     if claimable is None or n_resident is None:
         return None
     got, want = int(n_resident), len(claimable)
@@ -1157,6 +1266,9 @@ def add_common_args(ap):
     # Residency now defaults to FULL-LAYER (see default_piece_ids): giving NEITHER flag fills every
     # piece whose experts lie entirely inside the layer(s) anchor piece 0 already makes resident, and
     # excludes straddlers. Both flags still override it, so no existing launch script changes.
+    # That default is BEST-EFFORT over what is on disk (pieces_on_disk): a node that fetched only the
+    # quickstart's `--pieces 0` runs on piece 0 and says so, instead of dying on experts_1.safetensors
+    # the way the live 4060 did on 2026-07-26. An EXPLICIT selection is never quietly shrunk.
     ap.add_argument("--pieces", default=os.environ.get("NEURAHASH_GLM_PIECES") or None,
                     help="expert piece ids to keep resident: a single id, a comma list, or an "
                          "INCLUSIVE range ('0-12'). DEFAULT WHEN NEITHER --pieces NOR --piece IS "
@@ -1169,10 +1281,17 @@ def add_common_args(ap):
                          "experts_12 holds (1,60)..(1,63) PLUS (2,0), a second full-width MoE slab at "
                          "+1.126 GiB) are EXCLUDED from that default and named in the startup log -- "
                          "filling a layer is free, buying one is a spending decision, so name them "
-                         "here to buy them. ALL selected experts stay resident on every node so "
-                         "contributor and coordinator route identically (plan risk 5); only the "
-                         "CLAIMED coordinate trains, so optimizer state does not scale. Overrides "
-                         "--piece when both are given. Env: NEURAHASH_GLM_PIECES.")
+                         "here to buy them. That default is BEST-EFFORT over what you actually "
+                         "fetched: pieces whose files are not under <shard-dir>/pieces/ are skipped "
+                         "(named in the startup log together with the fetch_glm_base.py command that "
+                         "gets them), so fetching only piece 0 gives you a working 5-coordinate node "
+                         "instead of a FileNotFoundError. NAMING pieces here is NOT best-effort -- a "
+                         "piece you asked for and did not fetch is still a hard failure, because "
+                         "silently training a smaller set than you asked for is worse. ALL selected "
+                         "experts stay resident on every node so contributor and coordinator route "
+                         "identically (plan risk 5); only the CLAIMED coordinate trains, so optimizer "
+                         "state does not scale. Overrides --piece when both are given. "
+                         "Env: NEURAHASH_GLM_PIECES.")
     ap.add_argument("--piece", type=int, default=os.environ.get("NEURAHASH_GLM_PIECE") or None,
                     help="DEPRECATED single expert piece id. Passing it PINS residency to that ONE "
                          "piece (5 coordinates on the live manifest) and turns the layer-filling "

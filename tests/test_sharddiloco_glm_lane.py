@@ -17,8 +17,10 @@ it WITHOUT loading torch or any model, so the suite stays fast and hermetic:
 Run: C:/Python313/python.exe -m pytest tests/test_sharddiloco_glm_lane.py -q
 """
 import os
+import random
 import subprocess
 import sys
+import zlib
 
 import numpy as np
 import pytest
@@ -245,8 +247,19 @@ def test_prep_probe_heldout_go_to_coord_only_dir(tmp_path):
     coord.mkdir()
     seq = 4
     n_tokens = sum(n for _, n in prep.SPLITS) * seq
-    fake_tok = lambda text, add_special_tokens=False: {"input_ids": list(range(n_tokens))}  # noqa: E731
-    _arr, written, _used = prep.build_domain(fake_tok, "x", seq, str(miner), str(coord), "code",
+    # Token ids must DEPEND on the text: the old fixture returned list(range(n_tokens)) for every
+    # input, so all four splits got byte-identical tokens and the frozen-leak scan added by C14
+    # correctly reported a 4096-token overlap and aborted. The check was right; the fixture was
+    # degenerate. Deterministic per-text ids keep this test's own assertions unchanged.
+    fake_tok = lambda text, add_special_tokens=False: {                  # noqa: E731
+        "input_ids": random.Random(zlib.crc32(text.encode())).choices(range(1, 900), k=n_tokens)}
+    # One document per LINE, and enough distinct lines that every split draws some: build_domain
+    # assigns documents to splits by content hash and tokenizes each split separately, so a
+    # single-line corpus would leave three splits empty. (The fake tokenizer ignores the text and
+    # always returns n_tokens, so any populated split has enough rows.)
+    # 400 documents: `val` is only ~8% of the mix, so a 40-line corpus can leave it empty by chance.
+    corpus = "\n".join("doc-%03d unique body %d" % (i, i * 7919) for i in range(400))
+    _arr, written, _used = prep.build_domain(fake_tok, corpus, seq, str(miner), str(coord), "code",
                                              vocab_size=n_tokens + 1)
     where = {name: os.path.dirname(path) for name, _shape, path in written}
     assert where["train"] == str(miner) and where["val"] == str(miner)

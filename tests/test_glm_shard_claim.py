@@ -1265,7 +1265,9 @@ class TestResumeToOwnCoordinate:
         applied, reached = N.resume_to_root(host, lane, "unreachable-global", lambda m: None,
                                            own_coord=(1, 0))
         assert reached is True, "our coordinate WAS reproduced; the global root is irrelevant"
-        assert applied == 3
+        # V0.1: event 2 advertises 2_3, which cannot move OUR coordinate, so it is skipped instead of
+        # folded-and-rolled-back. 2 folds, not 3 -- the reached target below is what this test asserts.
+        assert applied == 2
         assert state["1_0"] == "mine2"                  # newest advertisement for us wins
         assert host.writes == 0, "a reached target must not roll back"
 
@@ -2025,7 +2027,9 @@ class TestF5bAdvanceLandsOnTheCoordinatorsBase:
                              model_root="g2")})
         applied, reached = N.resume_to_root(host, lane, "global-root-we-can-never-reach",
                                             lambda *_a: None, own_coord=(1, 1))
-        assert (applied, reached) == (2, True)
+        # V0.1: ONE fold, not two -- event 1 moves (1,0) and a slot root digests only its own slot, so
+        # skipping it reaches (1,1)'s advertised root just the same. `reached` is the claim here.
+        assert (applied, reached) == (1, True)
         assert N.slot_root(host, 1) == r1, "the freshly claimed coordinate is on the coordinator's base"
 
     def test_the_advance_branch_is_actually_wired_to_it(self):
@@ -4231,18 +4235,22 @@ class TestV0CatchUpBounds:
         assert host.writes == len(host.slots), "fail-closed: every slot restored, exactly as before"
 
     def test_the_wall_budget_aborts_a_replay_that_is_moving_but_too_slow(self, monkeypatch):
-        """Option A of design 1.2: some replays make progress forever. B_wall is the backstop."""
+        """Option A of design 1.2: some replays make progress forever. B_wall is the backstop.
+
+        V0.1: the records must ADVERTISE our coordinate, or the applicability filter skips them for
+        free and there is no slow replay left to bound. Each folds cleanly but never moves our slot
+        root onto the advertised value, so the loop keeps going -- which is exactly "moving but too
+        slow"."""
         clk = _FakeClock()
         state = {"global": "base"}
         TestResumeToOwnCoordinate._patch(monkeypatch, state)
-        real_fold = N._fold_accepted_checked
 
-        def slow_fold(*a, **kw):
+        def slow_fold(*_a, **_kw):
             clk.t += 10.0                                   # 10 s of wall clock per record
-            return real_fold(*a, **kw)
+            return True, "ok", []                           # folds, but moves nothing -> never reached
         monkeypatch.setattr(N, "_fold_accepted_checked", slow_fold)
         host = _CoordFakeHost([(1, 0)])
-        lane = _CoordFakeLane({e: {"2_9": "theirs%d" % e} for e in range(1, 9)})
+        lane = _CoordFakeLane({e: {"1_0": "mine%d" % e} for e in range(1, 9)})
         out = {}
         applied, reached = N.resume_to_root(host, lane, "unreachable", lambda *_a: None,
                                             own_coord=(1, 0), budget_s=25.0, stall_s=1e9,
@@ -4280,7 +4288,7 @@ class TestV0CatchUpBounds:
         out = {}
         applied, reached = N.resume_to_root(host, lane, "unreachable-global", lambda *_a: None,
                                             own_coord=(1, 0), outcome=out)
-        assert (applied, reached) == (3, True)
+        assert (applied, reached) == (2, True)              # V0.1: event 2 (2_3) is not ours to fold
         assert out["reason"] == "ok" and out["aborted"] is False and host.writes == 0
 
     def test_the_deadline_also_covers_the_delta_fetch_inside_the_fold(self):
@@ -4591,3 +4599,243 @@ class TestCowRollbackIsExactAndCheap:
         ok, reason, _rej = N._fold_accepted_checked(host, _FoldLane({"c0": d}), rec, None, -1,
                                                     log=None)
         assert (ok, reason) == (True, "ok") and N.slot_root(host, 1) == want
+
+
+class _CostLane(_CoordFakeLane):
+    """_CoordFakeLane wearing the LIVE lane's MEASURED cost structure on an injected clock.
+
+    Every number here is anchored, not invented:
+      * MANIFEST_S -- lane.manifest() was measured at 23.79 s over an 11,051-object store (memory
+        glm-lane-manifest-throughput-bound, quoted at sharddiloco_glm_coordinator.py:339); the live
+        store is at 23,503 objects / 13.9 GB (scratchpad/wan_coord.log:4), so ~50 s.
+      * GET_JSON_S -- 0.06 s, measured in the same pass (sharddiloco_glm_coordinator.py:340).
+      * FOLD_S -- one _fold_accepted_checked: a 278,731 B delta fetch over WAN + the _CowSlots copy +
+        the slot_root hash + (on a running miner) the rollback. 1.0 s is the conservative end.
+    That is what makes the elapsed numbers below comparable to the 55.9-92.8 s measured live."""
+
+    MANIFEST_S = 50.0
+    GET_JSON_S = 0.06
+    FOLD_S = 1.0
+
+    def __init__(self, adv, clk):
+        super().__init__(adv)
+        self.clk = clk
+        self.manifests = 0
+
+    def manifest(self):
+        self.manifests += 1
+        self.clk.t += self.MANIFEST_S
+        return super().manifest()
+
+    def get_json(self, sha):
+        self.clk.t += self.GET_JSON_S
+        return super().get_json(sha)
+
+
+class TestNothingToFoldIsNotAStall:
+    """V0.1. MEASURED LIVE 2026-07-26, both miners, 12 of 12 advances:
+
+        resume: ABORTED catch-up for 1_50 after 61.8s (stall, 0 record(s) folded, budget=180s
+        stall=30s call-timeout=90s); rolled back to the frozen base
+        COOLDOWN (L1,E50): catch-up stall after 61.8s -- parked for 900s / 10 event(s)
+
+    Every one said `0 record(s) folded`, and not one said `call-timeout` -- so no single fetch was
+    hung; the miner was paying ~50 s for a second whole-store manifest read plus the FULL 30 s stall
+    window to discover that no accepted record has anything to do with the coordinate it just
+    claimed. The coordinator advertises exactly ONE coordinate per accepted record
+    (sharddiloco_glm_coordinator.py:1974), so `slot_roots` answers that question for 0.06 s a record
+    -- V0's rule instead answered it by FOLDING each record and rolling it back, which on a running
+    miner (whose base the main loop has already advanced) fails every time and so never resets the
+    no-fold clock. Correct, complete and EMPTY was charged like BLOCKED, then parked for 900 s.
+
+    The bounds themselves are unchanged and re-asserted below: applicable records that fail still
+    stall, park and walk on; unreachable-but-non-empty still trains through and is lineage-dropped."""
+
+    # 79 accepted records: the live coordinator was at base_event 70-79 when the aborts were logged
+    # (scratchpad/wan_miner5090.log:296-312), and NONE of them advertises the coordinate we claim.
+    N_RECORDS = 79
+    OURS = (1, 50)
+
+    def _empty_lane(self, clk):
+        """Records for OTHER coordinates only -- the live `no record advertised it` case."""
+        return _CostLane({e: {"1_%d" % (12 + e % 5): "theirs%d" % e}
+                          for e in range(1, self.N_RECORDS + 1)}, clk)
+
+    @staticmethod
+    def _dead_fold(clk, monkeypatch):
+        """A running miner's base has already folded the live records, so re-folding one fails
+        `replica_root_ok` and rolls back -- costly, and it never resets the no-fold clock."""
+        def fold(*_a, **_kw):
+            clk.t += _CostLane.FOLD_S
+            return False, "lineage", []
+        monkeypatch.setattr(N, "_fold_accepted_checked", fold)
+        return fold
+
+    def test_a_coordinate_with_nothing_to_fold_completes_instead_of_stalling(self, monkeypatch):
+        """THE GOAL METRIC. Same scenario that produced `61.8s (stall, 0 record(s) folded)` live."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+        self._dead_fold(clk, monkeypatch)
+        host = _CoordFakeHost([self.OURS])
+        lane = self._empty_lane(clk)
+        man = lane.manifest()                                # the caller's manifest, as live
+        clk.t = 0.0                                          # time the catch-up, not the caller
+        out, said = {}, []
+        applied, reached = N.resume_to_root(host, lane, "target", said.append, own_coord=self.OURS,
+                                            budget_s=180.0, stall_s=30.0, now=clk, outcome=out,
+                                            man=man)
+        elapsed = out["elapsed_s"]
+        assert out["reason"] == "empty", "a catch-up with nothing to fold is COMPLETE, not stalled"
+        assert out["aborted"] is False, "empty must never read as BLOCKED -> never a cooldown"
+        assert (applied, reached) == (0, False)
+        assert out["applicable"] == 0 and out["scanned"] == self.N_RECORDS, out
+        # V0 spent MANIFEST_S + the whole 30 s stall window + one more record: >= 80 s. V0.1 pays
+        # only 0.06 s a record to read slot_roots, and reuses the manifest the caller already has.
+        assert elapsed < 6.0, "empty catch-up still slow (%.1fs)" % elapsed
+        assert any("NOTHING TO FOLD" in s for s in said), said
+        assert not any("ABORTED" in s for s in said), said
+
+    def test_the_records_that_cannot_move_our_coordinate_are_never_folded(self, monkeypatch):
+        """The cost fix itself: `slot_roots` is read BEFORE the fold, not discovered by attempting
+        one. A fold here means a delta fetch + a slot copy + a hash + a rollback, for nothing."""
+        clk = _FakeClock()
+        folds = []
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+        monkeypatch.setattr(N, "_fold_accepted_checked",
+                            lambda *a, **k: (folds.append(a[2]), (False, "lineage", []))[1])
+        lane = self._empty_lane(clk)
+        N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target", lambda *_a: None,
+                         own_coord=self.OURS, now=clk, man=lane.manifest())
+        assert folds == [], "%d record(s) folded that could not move our coordinate" % len(folds)
+
+    def test_a_legacy_record_carrying_no_slot_roots_is_still_folded(self, monkeypatch):
+        """The filter keys on an ADVERTISEMENT. A pre-shard-claim record advertises no coordinate at
+        all, so skipping it would silently change what the replay folds -- keep folding it."""
+        clk, folds = _FakeClock(), []
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+        monkeypatch.setattr(N, "_fold_accepted_checked",
+                            lambda *a, **k: (folds.append(a[2]), (True, "ok", []))[1])
+        lane = _CostLane({}, clk)
+        lane.names[N.accepted_name(1)] = {"sha256": "shaL"}
+        lane.recs["shaL"] = {"event": 1, "model_root": "g1"}          # no slot_roots at all
+        N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target", lambda *_a: None,
+                         own_coord=self.OURS, now=clk, man=lane.manifest())
+        assert len(folds) == 1, "a record with no slot_roots must keep its pre-V0.1 handling"
+
+    def test_the_global_root_path_keeps_V0s_stall_rule_exactly(self, monkeypatch):
+        """own_coord=None has NO applicability filter -- every record is a candidate for the global
+        root -- so its arming signal must stay "a record was scanned", not "a record was applicable"
+        (which never becomes true there). Without this, V0.1 would silently delete the stall bound
+        from the global path."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        self._dead_fold(clk, monkeypatch)
+        lane = _CostLane({e: {"1_%d" % e: "theirs%d" % e} for e in range(1, 61)}, clk)
+        out = {}
+        applied, reached = N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target",
+                                            lambda *_a: None, budget_s=180.0, stall_s=30.0,
+                                            now=clk, outcome=out, man=lane.manifest())
+        assert out["reason"] == "stall" and out["aborted"] is True, out
+        assert (applied, reached) == (0, False)
+
+    def test_applicable_records_that_fail_to_fold_STILL_stall_park_and_walk_on(self, monkeypatch):
+        """V0's guarantee, un-regressed: when records DO name our coordinate and none of them folds,
+        that is a real stall -- abort, park for 900 s, advance to the next claimable coordinate."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+        self._dead_fold(clk, monkeypatch)
+        ours_key = "%d_%d" % self.OURS
+        lane = _CostLane({e: {ours_key: "mine%d" % e} for e in range(1, 61)}, clk)
+        out = {}
+        applied, reached = N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target",
+                                            lambda *_a: None, own_coord=self.OURS, budget_s=180.0,
+                                            stall_s=30.0, now=clk, outcome=out, man=lane.manifest())
+        assert out["reason"] == "stall" and out["aborted"] is True, out
+        assert (applied, reached) == (0, False) and out["applicable"] > 0
+
+        cd = N.CoordCooldown(seconds=900.0, events=10, now=_FakeClock())
+        host = TestAdvanceClaimWalksPastBlockedCoordinates._Host(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS)
+        order = [c for c in N.claim_walk_order(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS, "wallet0")
+                 if c != (1, 0)]
+
+        def fake_resume(_h, _l, _root, _log, own_coord=None, outcome=None, **_kw):
+            reason = "stall" if tuple(own_coord) == order[0] else "empty"
+            if outcome is not None:
+                outcome.update(reason=reason, elapsed_s=1.0, records=0,
+                               aborted=reason in N._CATCHUP_ABORTED)
+            return 0, False
+        monkeypatch.setattr(N, "resume_to_root", fake_resume)
+        got = N.advance_claim(host, object(), list(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS), (1, 0), "wallet0",
+                              None, "root", 7, cd, lambda *_a: None, "m0")
+        assert cd.blocked(order[0], 7) is True, "a real stall must still park the coordinate"
+        assert got is not None and got[0] == order[1], "and the walk must still move on"
+
+    def test_an_empty_catch_up_is_never_parked_by_the_walk(self, monkeypatch):
+        """The second half of the goal metric, at the caller: `empty` lands, trains, no cooldown."""
+        cd = N.CoordCooldown(seconds=900.0, events=10, now=_FakeClock())
+        host = TestAdvanceClaimWalksPastBlockedCoordinates._Host(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS)
+        order = [c for c in N.claim_walk_order(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS, "wallet0")
+                 if c != (1, 0)]
+        logs = []
+
+        def fake_resume(_h, _l, _root, _log, own_coord=None, outcome=None, **_kw):
+            if outcome is not None:
+                outcome.update(reason="empty", elapsed_s=0.9, records=0, aborted=False)
+            return 0, False
+        monkeypatch.setattr(N, "resume_to_root", fake_resume)
+        got = N.advance_claim(host, object(), list(TestAdvanceClaimWalksPastBlockedCoordinates.COORDS), (1, 0), "wallet0",
+                              None, "root", 7, cd, logs.append, "m0")
+        assert got is not None and got[0] == order[0], "empty must not make the walk skip past it"
+        assert cd.blocked(order[0], 7) is False, "a healthy empty coordinate must NOT be parked"
+        assert not any("COOLDOWN" in ln for ln in logs), logs
+        assert any("NOTHING TO FOLD" in ln for ln in logs), logs
+
+    def test_an_unreachable_but_non_empty_coordinate_keeps_todays_semantics(self, monkeypatch):
+        """Guarantee 4: records DO advertise our coordinate and DO fold, but our replay never
+        reproduces the advertised root. That is the honest `unreachable` -- roll back to the frozen
+        base, train anyway, be lineage-dropped. It must not become `empty` and must not be parked."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "not-what-was-advertised")
+        monkeypatch.setattr(N, "_fold_accepted_checked", lambda *_a, **_k: (True, "ok", []))
+        ours_key = "%d_%d" % self.OURS
+        lane = _CostLane({e: {ours_key: "mine%d" % e} for e in range(1, 5)}, clk)
+        host = _CoordFakeHost([self.OURS])
+        out, said = {}, []
+        applied, reached = N.resume_to_root(host, lane, "target", said.append, own_coord=self.OURS,
+                                            now=clk, outcome=out, man=lane.manifest())
+        assert out["reason"] == "unreachable" and out["aborted"] is False, out
+        assert (applied, reached) == (0, False) and out["applicable"] == 4
+        assert host.writes == len(host.slots), "fail-closed rollback, exactly as before"
+        assert any("lineage-dropped" in s for s in said), said
+
+    def test_the_callers_manifest_is_reused_instead_of_read_a_second_time(self, monkeypatch):
+        """The other half of the 55.9-92.8 s. The async loop reads a manifest every pass
+        (sharddiloco_glm_contributor._run_async, `man = lane.manifest()`) seconds before it calls
+        advance_claim, and a walk past N parked coordinates used to buy N more of them."""
+        clk = _FakeClock()
+        monkeypatch.setattr(N, "model_root", lambda h: "ours")
+        monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
+        self._dead_fold(clk, monkeypatch)
+        lane = self._empty_lane(clk)
+        man = lane.manifest()
+        assert lane.manifests == 1
+        N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target", lambda *_a: None,
+                         own_coord=self.OURS, now=clk, man=man)
+        assert lane.manifests == 1, "resume_to_root re-read a manifest it was handed"
+        N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target", lambda *_a: None,
+                         own_coord=self.OURS, now=clk)
+        assert lane.manifests == 2, "man=None must still read one, exactly as before"
+
+    def test_the_async_loop_hands_its_manifest_down_to_the_walk(self):
+        """Wiring: the parameter is worthless if the live call sites do not pass it."""
+        import inspect
+        src = inspect.getsource(N._run_async)
+        assert src.count("advance_claim(host, lane, claim_coords") == 2
+        assert src.count("man=man)") == 2, "both advance_claim call sites must pass the manifest"
+        walk = inspect.getsource(N.advance_claim)
+        assert "man=man)" in walk, "advance_claim must hand it to resume_to_root"

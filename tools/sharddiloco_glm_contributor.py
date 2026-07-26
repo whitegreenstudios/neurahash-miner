@@ -2774,7 +2774,8 @@ class CoordCooldown:
 
 
 def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
-                   budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None):
+                   budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None,
+                   man=None):
     """CONTRIBUTOR-SIDE RESUME SYMMETRY: replay accepted records until our base reproduces the
     coordinator's advertised genesis root, so a RESUMED coordinator can accept our work.
 
@@ -2813,12 +2814,36 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         legitimately slow manifest cannot trip it).
     `outcome`, if a dict is passed, is filled in place with reason/elapsed_s/records/aborted -- the
     caller needs to tell "BLOCKED, park this coordinate" (reason in _CATCHUP_ABORTED) apart from the
-    honest "unreachable" it has always tolerated. Return arity is unchanged: (n_applied, reached)."""
+    honest "unreachable" it has always tolerated. Return arity is unchanged: (n_applied, reached).
+
+    NEVER-BLOCK V0.1 (2026-07-26): V0's stall rule could not tell "there is NOTHING to fold" apart
+    from "records exist but are not folding", so a correct, COMPLETE, empty catch-up was charged the
+    full 30 s stall window and then punished with a 900 s cooldown -- measured on the live fleet at
+    55.9-92.8 s per advance, `stall, 0 record(s) folded`, on 12 of 12 advances. Three changes, none
+    of which touches the rollback or the bounds:
+      * APPLICABILITY FILTER. On the per-coordinate path only records that advertise `coord_key` in
+        `slot_roots` can move our coordinate (the coordinator advertises exactly the ONE coordinate
+        each event moved -- sharddiloco_glm_coordinator.py:1974), so every other record is now
+        SKIPPED instead of fetched-folded-and-rolled-back. That was the 30 s: on a running miner the
+        main loop has already folded the live records, so re-folding them fails `replica_root_ok`,
+        never resets the stall clock, and burns a delta fetch + a slot copy + a hash each. A record
+        carrying NO `slot_roots` at all (legacy/global-only) is still folded exactly as before.
+      * `empty`: the scan completed and NO record advertises this coordinate -> the coordinator has
+        never merged it, the frozen base IS its state, and the catch-up is COMPLETE. Not in
+        _CATCHUP_ABORTED, so the caller trains here and does NOT park it.
+      * The no-fold stall is armed only once an APPLICABLE record has been seen, and timed from
+        there -- "nothing folded" is only a stall when there was something to fold.
+    `man`: reuse the caller's manifest instead of reading our own. lane.manifest() is 23.79 s on an
+    11,051-object store (memory glm-lane-manifest-throughput-bound) and the live store is at 23,503
+    objects, so the second read this function used to do WAS the other half of the 55.9-92.8 s. The
+    async loop already reads one per pass, seconds before it calls us. None -> read one, as before."""
     t0 = (now or time.monotonic)()
     _now = now or time.monotonic
     budget = _catchup_budget_s() if budget_s is None else float(budget_s)
     stall = _catchup_stall_s() if stall_s is None else float(stall_s)
     call_to = _catchup_call_timeout_s() if call_timeout_s is None else float(call_timeout_s)
+
+    n_scanned = n_applicable = 0              # records fetched / records that advertise own_coord
 
     def _done(reason, applied, reached, records=None):
         # `records` is what the replay actually TRIED (it can be non-zero while `applied` is 0: a
@@ -2826,6 +2851,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         if outcome is not None:
             outcome.update(reason=reason, elapsed_s=_now() - t0,
                            records=int(applied if records is None else records),
+                           scanned=n_scanned, applicable=n_applicable,
                            aborted=reason in _CATCHUP_ABORTED)
         return applied, reached
     if not target_root or model_root(host) == str(target_root):
@@ -2840,15 +2866,17 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
                 "the frozen base" % (int(own_coord[0]), int(own_coord[1])))
             return _done("not-registered", 0, False)
     lane = _DeadlineLane(lane, call_to, deadline=t0 + budget, now=_now)
-    try:
-        man = lane.manifest()
-    except CatchupTimeout as e:
-        log("[glm-contrib] resume: BLOCKED reading the manifest after %.1fs (%s) -- staying on the "
-            "frozen base" % (_now() - t0, e))
-        return _done("call-timeout", 0, False)
-    except Exception as e:                                       # noqa: BLE001
-        log("[glm-contrib] resume: manifest unavailable (%r) -- staying on the frozen base" % (e,))
-        return _done("manifest-unavailable", 0, False)
+    if man is None:
+        try:
+            man = lane.manifest()
+        except CatchupTimeout as e:
+            log("[glm-contrib] resume: BLOCKED reading the manifest after %.1fs (%s) -- staying on "
+                "the frozen base" % (_now() - t0, e))
+            return _done("call-timeout", 0, False)
+        except Exception as e:                                   # noqa: BLE001
+            log("[glm-contrib] resume: manifest unavailable (%r) -- staying on the frozen base"
+                % (e,))
+            return _done("manifest-unavailable", 0, False)
     prefix = ACCEPTED_NAME_FMT % 0
     prefix = prefix[:prefix.rfind("0")]
     events = sorted(int(n[len(prefix):]) for n in man
@@ -2866,7 +2894,13 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         if _now() - t0 > budget:
             aborted = "budget"
             break
-        if stall > 0 and (_now() - last_fold_t) > stall:
+        # V0.1: the stall rule is armed only once a record that CAN move this coordinate has been
+        # seen. Until then "nothing folded" means "nothing to fold", which is completeness, not a
+        # stall -- and it exits below as `empty` instead of parking a healthy coordinate for 900 s.
+        # On the GLOBAL path there is no per-coordinate filter, so every record IS applicable and the
+        # arming signal stays "we have scanned one" -- i.e. V0's rule, unchanged, for own_coord=None.
+        armed = (n_applicable > 0) if coord_key is not None else (n_scanned > 0)
+        if stall > 0 and armed and (_now() - last_fold_t) > stall:
             aborted = "stall"
             break
         entry = man.get(accepted_name(e))
@@ -2879,6 +2913,22 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             break
         except Exception:                                        # noqa: BLE001
             break
+        n_scanned += 1
+        # V0.1 APPLICABILITY FILTER (per-coordinate path only). Each accepted record advertises the
+        # ONE coordinate its event moved, so a record that does not name ours cannot move ours --
+        # folding it costs a delta fetch, a slot copy, a hash and (on a running miner, whose base the
+        # main loop has already advanced past it) a rollback, all to learn what `slot_roots` already
+        # said. A record with NO slot_roots at all is legacy/global-only: fold it exactly as before.
+        adv = None
+        if coord_key is not None:
+            sr = rec.get("slot_roots")
+            if isinstance(sr, dict) and sr:
+                adv = sr.get(coord_key)
+                if adv is None:
+                    continue
+                if n_applicable == 0:
+                    last_fold_t = _now()      # arm the stall window from the FIRST applicable record
+                n_applicable += 1
         try:
             ok, _reason, _rej = _fold_accepted_checked(host, lane, rec, None, -1, log=None)
         except CatchupTimeout:                                   # a delta fetch INSIDE the fold hung
@@ -2897,9 +2947,8 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         # Per-coordinate target: only a FOLDED record that advertised our coordinate can move it, and
         # the LAST such record is the coordinator's current state for it -- so keep replaying (a later
         # record may advance our coordinate again) and judge the newest advertisement at the end.
-        adv = (rec.get("slot_roots") or {}).get(coord_key)
         if adv is None:
-            continue
+            continue                                             # legacy record: no advertisement
         coord_want = str(adv)
         coord_hit = (slot_root(host, own_idx) == coord_want)
     if coord_key is not None and coord_hit and aborted is None:
@@ -2918,6 +2967,16 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             % (coord_key or ("root %s.." % target[:12]), _now() - t0, aborted, applied, budget,
                stall, call_to))
         return _done(aborted, 0, False, records=applied)
+    if coord_key is not None and n_applicable == 0:
+        # V0.1 COMPLETE-AND-EMPTY, not a stall and not unreachable: the whole record list was scanned
+        # and NOT ONE record advertises this coordinate, so the coordinator has never merged it and
+        # its state for it IS the frozen base -- which is exactly what we hold. Nothing to fold means
+        # the catch-up SUCCEEDED at doing nothing; train here, and do not park a healthy coordinate.
+        log("[glm-contrib] resume: NOTHING TO FOLD for coordinate %s -- no accepted record advertises "
+            "it (%d record(s) scanned in %.1fs), so the coordinator has never merged it and the "
+            "frozen base already IS its state; catch-up COMPLETE, training here"
+            % (coord_key, n_scanned, _now() - t0))
+        return _done("empty", 0, False, records=applied)
     if coord_key is not None:
         log("[glm-contrib] resume: could NOT reach the coordinator's root for coordinate %s (%s, %d "
             "record(s) tried, %.1fs); rolled back to the frozen base -- our contributions will be "
@@ -2933,7 +2992,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
 
 def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_root, event,
                   cooldown, log, miner, plateau_rejects=0, budget_s=None, call_timeout_s=None,
-                  stall_s=None, now=None):
+                  stall_s=None, now=None, man=None):
     """NEVER-BLOCK 1.4: walk this identity's claim order from `current` to the first coordinate the
     miner can actually START on, parking every one that BLOCKS it on the way.
 
@@ -2947,7 +3006,11 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
     Termination: the candidate list is one pass over a finite per-identity permutation of the
     claimable set (claim_walk_order), current excluded, so the walk cannot cycle. Returns
     ((L, E), local_idx, records_folded, reached) or None when the whole pass is blocked -- the
-    caller's 1.5 repair mode."""
+    caller's 1.5 repair mode.
+
+    V0.1: `man` is the caller's already-read manifest, handed down so a walk past N blocked
+    coordinates costs ONE manifest read instead of N (23.79 s each at 11k objects, and the live store
+    is at 23,503) -- and `empty` joins "unreachable" as a NON-blocking outcome (see resume_to_root)."""
     order = claim_walk_order(claim_coords, identity, ranked=ranked)
     cur = tuple(current)
     if len(order) <= 1:
@@ -2977,7 +3040,8 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
         outcome = {}
         n_res, reached = resume_to_root(host, lane, pointer_root, log, own_coord=cand,
                                         outcome=outcome, budget_s=budget_s,
-                                        call_timeout_s=call_timeout_s, stall_s=stall_s, now=now)
+                                        call_timeout_s=call_timeout_s, stall_s=stall_s, now=now,
+                                        man=man)
         if outcome.get("aborted"):
             cooldown.park(cand, event, "catch-up %s" % outcome.get("reason"))
             log("[glm-contrib %s] COOLDOWN (L%d,E%d): catch-up %s after %.1fs -- parked for %.0fs / "
@@ -2987,8 +3051,10 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
             continue
         log("[glm-contrib %s] post-advance catch-up for (L%d,E%d): folded %d record(s), coordinator "
             "root %s (%.1fs)"
-            % (miner, cand[0], cand[1], n_res, "REACHED" if reached else "NOT reached (frozen base)",
-               outcome.get("elapsed_s", 0.0)))
+            % (miner, cand[0], cand[1], n_res,
+               "REACHED" if reached else
+               "NOTHING TO FOLD -- frozen base IS its state" if outcome.get("reason") == "empty" else
+               "NOT reached (frozen base)", outcome.get("elapsed_s", 0.0)))
         return (cand[0], cand[1]), ni, n_res, reached
     return None
 
@@ -3355,7 +3421,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             # the miner (measured 23-minute hang, docs/NEVER_BLOCK_HANDOVER.md 0-PRE).
             landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked,
                                    pointer_root, dec.get("event"), cooldown, log, miner,
-                                   plateau_rejects=reject_streak)
+                                   plateau_rejects=reject_streak, man=man)
             reject_streak = 0
             if landed is None:
                 if len(claim_coords) <= 1:
@@ -3383,7 +3449,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             # every coordinate is parked this costs zero lane calls (advance_claim skips them all
             # before it can register or fetch anything).
             landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked,
-                                   pointer_root, dec.get("event"), cooldown, log, miner)
+                                   pointer_root, dec.get("event"), cooldown, log, miner, man=man)
             if landed is not None:
                 (L, E), i, _n_res, _reached = landed
                 log("[glm-contrib %s] REPAIR CLEARED after %.0fs: resuming on (L%d,E%d)"

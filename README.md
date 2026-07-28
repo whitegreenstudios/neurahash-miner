@@ -27,7 +27,10 @@ else runs (or that you run from the full node package).
   coordinator/full-node side, which is not part of this repo.
 - **The store write token is a PUBLIC demo credential.** It opens the shared content store but
   secures nothing (and doesn't need to): integrity comes from content-addressing + signatures, and
-  the model is protected by the held-out gate — garbage deltas simply pay zero and are not folded.
+  the model is protected by the held-out gate. **Corrected 2026-07-28:** that protection held for
+  *garbage* (random/forged deltas pay zero and are not folded) but it did **not** hold for
+  *subtly harmful* work — run 5's accepted deltas passed the gate and damaged the model. See
+  "What we found in run 5" below; the product-shaped judge is the fix.
 - **Your wallet key is yours, generated locally.** The miner creates a per-node secp256k1 identity on
   your machine (gitignored, never uploaded). Back it up; losing it loses the address your work
   credits. No private key ships in this repo.

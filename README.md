@@ -37,6 +37,59 @@ else runs (or that you run from the full node package).
 
 ---
 
+## 🔬 What we found in run 5, and what changes for you (2026-07-28)
+
+**Read this if you mined run 5.** We measured, on a real benchmark, that run 5's *accepted* work
+made the model **worse**: ARC-Easy accuracy fell **0.8107 → 0.6940 (−11.7 points**, McNemar
+p=1.25e-40) and the full model's held-out cross-entropy worsened **+13.4%** — while the pool's
+accept gate reported a 15.9% *improvement* and paid for it.
+
+**No miner did anything wrong, and no miner could have noticed.** The cause was ours: the gate
+scored a stand-in network with **1 of 46 expert layers switched on**, and that network is not the
+model we ship. Every number visible from a miner's seat improved the entire time it was damaging
+the real model — we reproduced that on a second GPU to be sure. This is the same lesson this
+project learned once before (verified work ≠ useful work), reproduced against the very gate built
+to prevent it.
+
+### What is changing before the next campaign
+
+1. **The gate now judges a product-shaped network.** We measured where a stand-in starts agreeing
+   with the real 47-layer model: the verdict flips at **19 resident layers** and is stable above
+   it, so the new judge runs **24 layers resident** (~36 s per accept check) and **fails closed** —
+   if the judge cannot run, work is not accepted rather than waved through.
+2. **The unit of work grows from one expert to one whole LAYER.** Training a single expert with a
+   low-rank adapter turned out to be too small to be payable: its best honest yield was ~1/6 of the
+   accept margin, and it was fragile (half the dose flipped the sign). Training **all 64 experts of
+   one layer** (604 M parameters, full-rank) against **true gradients from the real model** measured
+   **15.3× the accept margin** — and **93×** the per-expert yield at the same weight movement.
+3. **Still 8 GB-friendly.** A layer claim needs the trunk (4.02 GiB) + one layer (1.125 GiB) — a
+   consumer 8 GB card remains a first-class miner. That is a hard requirement here, not a
+   nice-to-have.
+4. **Doses will be specified as a drift target, not a learning rate.** We measured a razor-thin
+   stability window: **+6.9% learning rate → 10× the weight movement; +14.4% → divergence (NaN)**.
+   So the coordinator will hand out a target and your client will find the rate by local bisection,
+   reporting the movement it achieved. This protects your GPU hours; the judge would reject a
+   diverged dose anyway.
+
+### What you should do
+
+- **Expect a new signed release before the next campaign (run 6).** `3.5.2` predates all of the
+  above; do not point it at the new campaign.
+- **Keep your clone clean.** Self-update applies releases with a clean checkout — local edits make
+  an update **silently do nothing** while the miner still looks healthy. If you patched files by
+  hand, revert them before updating.
+- **Nothing about your wallet, keys, or earned credit changes.**
+
+### What we have NOT proven yet
+
+The layer result above is measured on the **gate metric** (held-out cross-entropy). The
+capability benchmark on that same dose is **still running**, and given this project already
+measured one case where cross-entropy and capability disagreed, **the new trainer does not ship
+until that benchmark confirms it.** We will publish the number either way, including if it kills
+the approach.
+
+---
+
 ## One lane: GLM shardDiLoCo (deprecation notice, 2026-07-24)
 
 This repo now ships **exactly one way to contribute**: the GLM shardDiLoCo lane — your GPU trains

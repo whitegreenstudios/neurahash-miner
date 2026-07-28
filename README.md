@@ -93,6 +93,31 @@ the approach.
 
 ---
 
+## Which sections below are still current? (status guide, 2026-07-28)
+
+This README keeps its full dated history (nothing is deleted), so here is what still applies after
+the run-5 findings above. **Current** = works as described. **Changing at run 6** = the feature
+stays, its granularity or inputs change. **Historical** = kept as the record, not a roadmap item.
+
+| Feature | Status at 2026-07-28 |
+|---|---|
+| shardDiLoCo lane (per-slot sharding, all-outbound, signed deltas) | **Changing at run 6** — a claim becomes one *layer* instead of one expert; transport, records and lineage unchanged |
+| Shard Claim (claim / advance / evict / cooldown) | **Changing at run 6** — same mechanism, coarser coordinate; cooldowns and the walk cursor carry over |
+| Truly-decoupled per-slot event clocks | **Current** — matters more, not less (cache refresh and training are asynchronous) |
+| Corpus automation (daily extract + auto-resync, no restart) | **Current** — proven live; the 2.01 B-token corpus builds on it |
+| VRAM cap guard / elastic good-neighbour | **Current** — now structural; every measurement this week ran under a per-process cap |
+| `NEURAHASH_CAPACITY_AWARE` | **Current, gaining a job** — it will also classify your node: gradient-cache producer (~20 GB VRAM) vs layer trainer (~5 GB) |
+| Trustless coordinator (staked M-of-N quorum) | **Current** — unchanged as the settlement trust root |
+| Auto-resume / OOM self-heal | **Current** |
+| Signed self-update | **Current, with a known gap** — a hand-modified clone makes an update silently do nothing; keep your clone clean until the loud-failure fix ships |
+| Zero-config defaults | **Current** — a few gaps still being closed |
+| Fleet-hosted pipeline (v3.3.0, bit-exact fleet forward) | **Current and promoted** — it is the working half of the endgame where miners pass activations and no card waits |
+| G1 / RLVR post-training | **Deferred, not dropped** — re-sequenced behind the gate redesign |
+| DMoE capacity experiment | **Historical** — measured negative (wins on recall, never moved the plateau); kept as a record |
+| Rung B fleet training (OLMoE) | **Historical** — achieved 2026-07-16, superseded by the GLM lane |
+
+---
+
 ## One lane: GLM shardDiLoCo (deprecation notice, 2026-07-24)
 
 This repo now ships **exactly one way to contribute**: the GLM shardDiLoCo lane — your GPU trains

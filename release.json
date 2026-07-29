@@ -1,7 +1,7 @@
 {
-  "git_commit": "4aa930c9a73da0dd9c9d416ccffc962ca3cbf600",
-  "published_ts": 1785062976,
-  "signature": "1608550d1bd8d8a9c2fd3d5f2261eaab577fb2861ea7b3aa474ead87173c61965bf9f646eb0e9b8048ccc1180960dc2f3c7e6982dcf5b441f507bde7b9fad78a1b",
+  "git_commit": "3f037975fd875368120a14b3d940fd70203b8fe5",
+  "published_ts": 1785300022,
+  "signature": "2fd51bba1c9d4f0042521f13f6a84bc27619c5034ce17e1d7f721e51fc26965b7770fe0d715000c33146967f5702cdc48c0887e1132b292e6f6f5f40c580e1491c",
   "signer": "0x5168F6cc4cc05bfd6d4714906d68e083c02dDC66",
-  "version": "3.5.2"
+  "version": "3.6.0"
 }

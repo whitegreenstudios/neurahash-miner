@@ -160,9 +160,20 @@ scores exactly 0.*
 **The interference tax** — the project's current #1 open problem, measured 2026-07-29: two layers
 that each *individually improve* the model kept only **1.8%** of their combined promise when
 applied together, and three at once actively damaged it. Training many layers in parallel is
-therefore not yet safe, and the pool will not pretend otherwise. The candidate fix (everyone takes
-proportionally smaller steps as more miners join — a shared "drift budget") is being tested now.
-*Status: open — this is the honest reason the next campaign has not launched.*
+therefore not yet safe, and the pool will not pretend otherwise. We promised to publish the test of
+the first candidate fix either way — here it is: **it failed.** Making everyone take smaller steps
+(a shared "drift budget") did not shrink the interference — cutting the dose 3× left it essentially
+unchanged, and a pair of two correctly-dosed *improving* layers was the worst combination measured.
+The tax comes from *combining separately-trained trajectories*, not from step size. The two designs
+now on the table: **sequential** (one layer's work is folded in, fresh caches are cut, then the
+next) and the **fleet-hosted pipeline** (miners chained per layer segment — nothing to combine at
+all). *Status: open — this is the honest reason the next campaign has not launched.*
+
+**A finding worth knowing as a miner (2026-07-29 evening):** "good layer" and "bad layer" are not
+fixed labels. The layer that *damaged* the model at full dose became the **best contributor
+measured** at a tenth of the dose, and the best full-dose layer *damaged* at a third. This is
+exactly why your miner shrinks the dose on a rejection instead of abandoning the layer — an
+auto-drop rule would have blacklisted the strongest layer in the model.
 
 ### The transport and the pool
 

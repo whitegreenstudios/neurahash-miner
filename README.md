@@ -492,6 +492,35 @@ hardened to work on multi-GPU boxes (`cuda:1`) and to size from *free* memory ra
 and unified with the capacity-aware work assignment so the coordinator only ever hands you work that
 fits what you can currently spare.
 
+## Alpha 3.6.0 (2026-07-29) — GradCast ships: the client that trains a layer without holding the model
+
+Signed release `3f03797` (VERSION 3.6.0, signer `0x5168…DC66`). **Updating is safe and changes
+nothing today** — every new feature is default-OFF or opt-in, and with the flags off this client is
+byte-identical to what you are running now (proven by mutation-tested suites; 609 tests pass from
+this exact tree). The features arm at the next campaign.
+
+What is in the box:
+
+- **GradCast layer-claim training** (`NEURAHASH_SD_LAYER_CLAIMS`, default OFF) — your miner claims
+  a whole layer, downloads its gradient cache, and trains it at a drift target. No forward pass, no
+  trunk, no copy of the model. See the glossary above for the full plain-English tour.
+- **The dose ladder** — a rejected delta retries the *same* layer at one-third, then one-tenth of
+  the dose before the layer is ever given up; an accepted delta resets it. Built the same day we
+  measured that "good layer / bad layer" are not fixed labels (the full-dose damager became the
+  best contributor at a tenth of the dose).
+- **Trunk-free mode** (`NEURAHASH_SD_TRUNK_FREE=1`, opt-in) — drops the 4.0 GB trunk at build
+  time. **Measured on a real RTX 4060: a full layer dose completed at 6.0 GiB peak, no OOM.** This
+  is what makes an 8 GB card a first-class trainer. Trade-off, stated plainly: in this mode the
+  miner cannot run its local own-slot re-check (no trunk = no forward pass), and it says so loudly
+  in the log rather than pretending — leave the flag off unless the campaign asks for it.
+- **The k=24 product judge** (`tools/glm_product_judge.py`) — the accept gate that scores deltas
+  against the real model, shipped here so future validators can re-run the exact judge the
+  coordinator uses. Miners do not run it; its coordinator-integration tests stay server-side.
+- **Two fixes without which none of the above works:** the learning-rate search now backs off
+  instead of dying on its first step (the defect that stopped every dose in the last campaign),
+  and cache names now resolve through the store manifest (the defect that made a miner silently
+  train nothing).
+
 ## Alpha 3.4.0 (2026-07-25) — Shard Claim: pick an expert, finish it, move to the next
 
 Until this release the miner needed `--slot <n>`: a **positional index** into a list of experts the

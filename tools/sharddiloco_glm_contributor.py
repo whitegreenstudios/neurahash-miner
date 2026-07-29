@@ -56,6 +56,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -83,7 +84,8 @@ from neurahash import diloco_merge as dm                         # noqa: E402  (
 GLM_POINTER_NAME = "sharddiloco/glm/pointer"
 CONTRIB_PREFIX_FMT = "cg/r%d/"                     # LEGACY (pre-campaign) shape; see CAMPAIGN SCOPING
 CONTRIB_CAMPAIGN_PREFIX_FMT = "cg/%s/r%d/"         # campaign-scoped shape: cg/<campaign_id>/r<base_event>/
-ACCEPTED_NAME_FMT = "sharddiloco/glm/accepted/r%d"
+ACCEPTED_NAME_FMT = "sharddiloco/glm/accepted/r%d"           # LEGACY (unscoped) shape
+ACCEPTED_CAMPAIGN_NAME_FMT = "sharddiloco/glm/accepted/%s/r%d"   # campaign-scoped shape
 
 # ---- corpus-over-WAN auto sync (W6) --------------------------------------------------------------
 # The coordinator advertises DATA_RECORD_NAME (same trust surface + name shape as GLM_POINTER_NAME);
@@ -95,6 +97,7 @@ DATA_MANIFEST_NAME = "data_manifest.json"
 RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither locally-valid nor fetched+verified
 RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)
 RC_NO_CAMPAIGN = 11                 # exit code: the pointer advertises no campaign_id (see campaign_refusal)
+RC_TRUNK_FREE_SYNC = 12             # exit code: trunk-free base on a v1 SYNC lane (sync trains with forwards)
 _ALLOWED_DATA_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)\.npy\Z")
 
 
@@ -190,8 +193,50 @@ def contrib_prefix(rnd, campaign=None):
     return CONTRIB_CAMPAIGN_PREFIX_FMT % (cid, int(rnd))
 
 
-def accepted_name(rnd):
-    return ACCEPTED_NAME_FMT % int(rnd)
+def accepted_prefix(campaign=None):
+    """"sharddiloco/glm/accepted/[<campaign_id>/]r" -- the prefix EVERY accepted record of one
+    campaign shares, and therefore the only slice of the manifest a catch-up has to scan.
+
+    WHY (MEASURED 2026-07-27, docs/research/STORE_BOTTLENECK_2026-07-27.md sec 2d): accepted records
+    were the ONE name family the 2026-07-25 campaign fix missed. Contributions were scoped
+    (contrib_prefix), pointers are rewritten in place, but accepted records kept a flat
+    event-keyed sequence shared by every campaign that ever ran -- 1,345 of them, r0..r1344, on the
+    live store. Two harms, both measured:
+      1. resume_to_root scans that whole sequence one HTTP GET at a time (93 s floor, and growing
+         forever), which is why 160 catch-ups aborted for 7.15 h of wall time in run 5;
+      2. event numbers COLLIDE across campaigns -- a fresh run's r5 overwrites a dead run's r5 --
+         which is the cross-campaign replay bug recorded in memory `cross-campaign-record-replay`.
+    Scoping is the fix for both: at genesis a fresh campaign's scan list is EMPTY and grows only
+    with its own events.
+
+    Mirrors campaign_prefix/contrib_prefix exactly, including the unscoped case: `campaign=None`
+    reproduces the legacy prefix byte-for-byte, so a legacy lane is untouched. The two families can
+    never be confused because a campaign id is lowercase hex (_CAMPAIGN_RE) and "r" is not a hex
+    digit -- ".../accepted/r12" can only be legacy, ".../accepted/<hex>/r12" only scoped. Pure."""
+    cid = normalize_campaign_id(campaign)
+    stem = ACCEPTED_NAME_FMT % 0 if cid is None else ACCEPTED_CAMPAIGN_NAME_FMT % (cid, 0)
+    return stem[:stem.rfind("0")]
+
+
+def accepted_name(rnd, campaign=None):
+    cid = normalize_campaign_id(campaign)
+    if cid is None:
+        return ACCEPTED_NAME_FMT % int(rnd)                       # legacy lane, byte-identical
+    return ACCEPTED_CAMPAIGN_NAME_FMT % (cid, int(rnd))
+
+
+def accepted_events_in(manifest_names, campaign=None):
+    """Every accepted EVENT number this campaign advertises in `manifest_names`, sorted ascending.
+
+    DUAL-READ, the transition rule (see accepted_prefix): a SCOPED campaign reads only its own
+    family -- reading the legacy one too would re-import exactly the 1,345 foreign records the
+    scoping exists to exclude, and folding a foreign campaign's record is the replay bug. An
+    UNSCOPED context (legacy lane, or NEURAHASH_SD_CAMPAIGN_SCOPE=0) reads the legacy family, which
+    is what every pre-scoping record is named. Nothing is ever renamed or rewritten. Pure."""
+    prefix = accepted_prefix(campaign)
+    n = len(prefix)
+    return sorted(int(str(nm)[n:]) for nm in manifest_names
+                  if str(nm).startswith(prefix) and str(nm)[n:].isdigit())
 
 
 def pointer_campaign_id(ptr):
@@ -940,8 +985,21 @@ def resolve_claim(args, slots, log=print, identity=None):
     elif args.slot is None and not os.environ.get("NEURAHASH_SD_EXPERT") and claimable:
         # Nothing was asked for -> SPREAD. A stranger who just runs the miner must not collide with
         # every other default-configured miner on coordinate 0.
-        L, E = pick_start_coord(claimable, identity if identity is not None else "anonymous")
-        src = "wallet-hash (auto-spread)"
+        #
+        # RESTART DURABILITY (run 5, see ClaimState): pick_start_coord is a CONSTANT for a given
+        # wallet, so without a durable cursor every restart re-claims the same head and re-walks
+        # ground the previous process already covered -- measured 25 of 28 restart cycles training the
+        # one head coordinate. Resume the saved cursor when it is still claimable here. ONLY this
+        # branch resumes: an operator who pinned --expert / --slot still wins, and a cursor pointing
+        # at a coordinate this node no longer holds falls back to the hash pick.
+        _ident = identity if identity is not None else "anonymous"
+        _resumed = ClaimState.for_args(args, _ident, log=log).cursor()
+        if _resumed is not None and tuple(_resumed) in [tuple(c) for c in claimable]:
+            L, E = _resumed
+            src = "resumed walk cursor"
+        else:
+            L, E = pick_start_coord(claimable, _ident)
+            src = "wallet-hash (auto-spread)"
     else:
         idx = int(os.environ.get("NEURAHASH_SD_EXPERT", "0") if args.slot is None else args.slot)
         if not (0 <= idx < len(slots)):
@@ -979,6 +1037,725 @@ def claim_all_coords(args, slots):
     straight into the inert-slot trap (writable, never routed, rejected forever, silent)."""
     c = node_claimable_coords(args)
     return [tuple(x) for x in (c if c else slots)]
+
+
+# ==================================================== LAYER CLAIMS (task #47, flag-gated, DEFAULT OFF)
+# WHY (measured): the per-expert rank-16 micro-dose is CLOSED as payable currency -- best honest yield
+# -0.000985 CE, one sixth of the accept margin, in a well centred on the optimizer's exact endpoint
+# (docs/GLM_TRAINER_SYNTHESIS_2026-07-28.md). Training ALL 64 experts of ONE layer, full-rank, on cached
+# TRUE layer-output gradients moved full-47 held-out CE 4.816991 -> 4.725587 (-0.091404 = 15.3x the
+# accept margin) -- a 92.83x yield ratio at matched drift (docs/research/B3_LAYER_RUN_2026-07-28.md).
+# The unit was too SMALL, not the wrong mechanism.
+#
+# A LAYER CLAIM IS NOT A NEW SUBSYSTEM. It is the SET of existing (L,E) coordinates that share a layer,
+# and one of them -- the HEAD, the lowest expert index -- carries the claim in the existing table: the
+# same claim_walk_order, the same next_claim_coord, the same CoordCooldown park table, the same
+# ClaimState cursor and restart persistence. Full-layer residency is already how a node is loaded
+# ("--pieces accepts a range, e.g. 0-12 for all 64 experts of layer 1", resolve_claim above), so the
+# claimable set a node reports ALREADY spans whole layers; layer_claim_layers just reads that set.
+#
+# FLAG NEURAHASH_SD_LAYER_CLAIMS, DEFAULT OFF. Off => nothing here is constructed, tools/glm_grad_cache.py
+# is never imported, and the per-expert path at the training site below is byte-identical to today.
+LAYER_CLAIM_FLAG = "NEURAHASH_SD_LAYER_CLAIMS"
+LAYER_CACHE_RECORD_FMT = "sharddiloco/glm/gradcache/%d"     # advertised per CLAIMED layer
+LAYER_CACHE_DIRNAME = "grad_cache"
+
+
+def layer_claim_enabled(environ=None):
+    """Master gate. Same default-OFF idiom as _maybe_build_product_judge in the coordinator: the
+    string test happens BEFORE any import, so a box without tools/glm_grad_cache.py is unaffected."""
+    env = os.environ if environ is None else environ
+    return (env.get(LAYER_CLAIM_FLAG, "0") or "0").strip().lower() \
+        not in ("", "0", "false", "no", "off")
+
+
+TRUNK_FREE_FLAG = "NEURAHASH_SD_TRUNK_FREE"
+
+
+def trunk_free_enabled(environ=None):
+    """OPT-IN, default OFF = today's behaviour byte-identical: build the GLM base WITHOUT the
+    frozen trunk so a GradCast layer-claim dose fits an 8 GB card. MEASURED (2026-07-29,
+    safetensors headers): trunk-resident dose budget 9.180 GiB OOMs a 7.996 GiB 4060; trunk-free
+    5.156 GiB fits (trunk = 4.024 GiB / 659 tensors the dose never reads -- glm_grad_cache.
+    inner_step consumes only the fused slabs + act_fn, no forward, no router, no attention).
+
+    THE PRICE, stated once here and logged loudly everywhere it bites: the F2 own-slot re-gate
+    (heldout_ce = a full trunk forward, the local check that catches a forged/poisoned accepted
+    record for THIS node's own coordinate) is IMPOSSIBLE without the trunk. Flipping this flag
+    FORFEITS it: make_regate_ce hands out REGATE_UNAVAILABLE instead of a working closure, and
+    apply_accepted logs SECURITY WAIVED on every own-slot fold it performs unjudged. It never
+    silently passes. build_node_model refuses every OTHER forward-needing combination at config
+    time (tiny mode, the classic LoRA lane, --claim-by affinity); main refuses a v1 sync lane."""
+    env = os.environ if environ is None else environ
+    return (env.get(TRUNK_FREE_FLAG, "0") or "0").strip().lower() \
+        not in ("", "0", "false", "no", "off")
+
+
+def model_is_trunk_free(model):
+    """True iff `model` was built without its trunk (piece_loader include_trunk=False stamps
+    `_nh_trunk_free = True` on it). Anything that FORWARDS the model (heldout_ce,
+    probe_expert_affinity, LoRA training) must check this first: a meta-tensor trunk raises on
+    first touch -- loud, but only after the work leading up to it was already wasted."""
+    return bool(getattr(model, "_nh_trunk_free", False))
+
+
+def layer_claim_layers(coords):
+    """The layers a node can claim WHOLE, i.e. every layer present in its claimable set. Sorted, so
+    the walk order is deterministic across restarts."""
+    return sorted({int(c[0]) for c in (coords or ())})
+
+
+def layer_claim_coords(coords, L):
+    """Every claimable coordinate of layer L, in expert order -- the layer claim, expressed in the
+    coordinate type the claim table already speaks. No sentinel, no second type."""
+    return sorted((tuple(c) for c in (coords or ()) if int(c[0]) == int(L)),
+                  key=lambda c: int(c[1]))
+
+
+def layer_claim_head(coords, L):
+    """The ONE coordinate that represents this layer claim in the claim table, the cooldown park
+    table and the ClaimState cursor: the lowest expert index the node holds on that layer. Parking
+    or advancing the head parks or advances the whole layer claim, which is exactly why the layer
+    claim needs no state of its own."""
+    got = layer_claim_coords(coords, L)
+    return got[0] if got else None
+
+
+def layer_claim_of(coords, coord):
+    """The layer claim a per-expert coordinate belongs to: (L, [coords of L]). Lets the walk keep
+    stepping in (L,E) space while the TRAINER works at layer granularity."""
+    if coord is None:
+        return None, []
+    L = int(coord[0])
+    return L, layer_claim_coords(coords, L)
+
+
+def _layer_cache_dir(args, environ=None):
+    env = os.environ if environ is None else environ
+    d = (env.get("NEURAHASH_SD_LAYER_CACHE_DIR") or "").strip()
+    if d:
+        return d
+    return os.path.join(getattr(args, "data_dir", ".") or ".", LAYER_CACHE_DIRNAME)
+
+
+# ============================================================ the DOSE-BACKOFF LADDER (task #47b)
+# WHY BACKOFF COMES BEFORE ABANDONMENT -- MEASURED, do not re-derive from intuition
+# (docs/research/LAYER_COMPOSITION_TRUEGRAD_2026-07-29.md):
+#
+# The obvious policy is "detect a bad layer, drop it, claim another". The measurements say that
+# treats the wrong cause. Three layers dosed at the SAME relative drift from ONE multi-tap backward
+# (identical batches) moved full-47 held-out CE by: layer 1 -0.095165, layer 5 -0.054498, layer 2
+# +0.217781 (damage). So far, so "layer 2 is bad". But layers 1 and 5 TOGETHER -- two layers that
+# each individually IMPROVE the model -- returned -0.002736 against a linear prediction of
+# -0.149663: 1.8% of their predicted joint gain. Good layers interfere with each other.
+#
+# The mechanism sets the policy. Interference is CROSS-CURVATURE, which is quadratic in the dose,
+# while the gain is linear in it -- so halving the dose costs half the gain and a QUARTER of the
+# interference, and shrinking the dose is the lever that recovers value. Releasing the layer is not:
+# a drop-first miner spends GPU hours re-discovering, one layer at a time, that every layer is "bad
+# in company", and arrives back where it started with a colder cache.
+#
+# Hence: a rejected delta shrinks the dose on the SAME layer (rho -> rho/3 -> rho/10) and only a
+# rejection at the SMALLEST rung gives the layer up (park + advance, both existing machinery).
+LAYER_RHO_MAP_ENV = "NEURAHASH_SD_LAYER_RHO_MAP"          # "L:rho,L:rho" per-layer dose overrides
+LAYER_RHO_LADDER_ENV = "NEURAHASH_SD_LAYER_RHO_LADDER"    # "1.0,0.333,0.1" backoff multipliers
+DOSE_LADDER_DEFAULT = (1.0, 1.0 / 3.0, 1.0 / 10.0)
+
+
+class DoseConfigError(ValueError):
+    """A malformed per-layer dose override or ladder. FAIL-CLOSED BY DESIGN, and this is the whole
+    point of the class: a dose knob that is silently ignored produces a run that looks like it
+    tested rho/10 and actually tested rho, i.e. a confident WRONG measurement -- exactly the class
+    of bug that has already voided published numbers here (memory cross-campaign-record-replay).
+    Refusing to start is cheap; a week of mislabelled GPU hours is not."""
+
+
+def parse_layer_rho_map(raw, GC=None):
+    """"L:rho,L:rho" -> {L: rho}. Empty/unset -> {}. ANY malformed entry RAISES DoseConfigError.
+
+    Each rho is validated through glm_grad_cache.dose_spec_from_config -- the SAME gate the campaign
+    dose passes -- so a per-layer override cannot smuggle in a value the campaign dose would refuse
+    (non-finite, <= 0), and the "never name a learning rate" protocol keeps exactly one owner."""
+    out = {}
+    for chunk in str(raw or "").replace(";", ",").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise DoseConfigError(
+                "%s entry %r is not 'L:rho' -- a dose override that cannot be parsed is REFUSED, "
+                "never silently replaced by the campaign rho" % (LAYER_RHO_MAP_ENV, item))
+        k, _sep, v = item.partition(":")
+        try:
+            L = int(k.strip())
+        except (TypeError, ValueError):
+            raise DoseConfigError("%s entry %r has a non-integer layer index %r"
+                                  % (LAYER_RHO_MAP_ENV, item, k.strip()))
+        if L < 0:
+            raise DoseConfigError("%s entry %r names a negative layer" % (LAYER_RHO_MAP_ENV, item))
+        if L in out:
+            raise DoseConfigError("%s names layer %d twice -- which dose did you mean?"
+                                  % (LAYER_RHO_MAP_ENV, L))
+        try:
+            rho = float(v.strip())
+        except (TypeError, ValueError):
+            raise DoseConfigError("%s entry %r has a non-numeric drift target %r"
+                                  % (LAYER_RHO_MAP_ENV, item, v.strip()))
+        if GC is not None:
+            try:
+                rho = float(GC.dose_spec_from_config({"target_rho": rho})["target_rho"])
+            except Exception as ex:                      # noqa: BLE001 -- re-raised as OUR error type
+                raise DoseConfigError("%s entry %r: %s" % (LAYER_RHO_MAP_ENV, item, ex))
+        elif not (rho > 0.0 and rho == rho and rho not in (float("inf"), float("-inf"))):
+            raise DoseConfigError("%s entry %r: target_rho must be finite and > 0"
+                                  % (LAYER_RHO_MAP_ENV, item))
+        out[L] = rho
+    return out
+
+
+def parse_dose_ladder(raw):
+    """"1.0,0.333,0.1" -> (1.0, 0.333, 0.1). Empty/unset -> DOSE_LADDER_DEFAULT. Malformed RAISES.
+
+    Constraints, each with a reason:
+      * rung 0 == 1.0 exactly -- the top rung IS the campaign dose, so `rho * rungs[0]` is the
+        dose the campaign specified and nothing silently re-scales it.
+      * strictly DECREASING and every rung in (0, 1] -- this is a BACKOFF. A rung above 1.0 would
+        push the dose past the campaign target on rejection, and up is precisely where the drift
+        protocol measured NaN (+14.4% on the reference lr diverged)."""
+    items = [c.strip() for c in str(raw or "").replace(";", ",").split(",") if c.strip()]
+    if not items:
+        return tuple(DOSE_LADDER_DEFAULT)
+    try:
+        rungs = tuple(float(c) for c in items)
+    except (TypeError, ValueError):
+        raise DoseConfigError("%s=%r is not a comma-separated list of multipliers"
+                              % (LAYER_RHO_LADDER_ENV, raw))
+    return validate_dose_ladder(rungs, where=LAYER_RHO_LADDER_ENV)
+
+
+def validate_dose_ladder(rungs, where="dose ladder"):
+    rungs = tuple(float(r) for r in rungs)
+    if not rungs:
+        raise DoseConfigError("%s is empty -- a ladder needs at least the campaign dose" % where)
+    if rungs[0] != 1.0:
+        raise DoseConfigError("%s must start at 1.0 (the campaign dose), got %r" % (where, rungs[0]))
+    prev = None
+    for r in rungs:
+        if not (r == r and r not in (float("inf"), float("-inf"))):
+            raise DoseConfigError("%s rung %r is not finite" % (where, r))
+        if not (0.0 < r <= 1.0):
+            raise DoseConfigError(
+                "%s rung %r is outside (0, 1]: this is a BACKOFF ladder, and a rung above the "
+                "campaign dose walks toward the divergence edge (+14.4%% on the reference lr = NaN)"
+                % (where, r))
+        if prev is not None and not (r < prev):
+            raise DoseConfigError("%s must be strictly decreasing, got %r after %r"
+                                  % (where, r, prev))
+        prev = r
+    return rungs
+
+
+class DoseLadder:
+    """Per-layer dose rung: MINER-LOCAL, restart-durable, and the thing that stands between "the
+    judge rejected our delta" and "give this layer up".
+
+    Miner-local for the same reason CoordCooldown is (see its docstring): a coordinator-held rung
+    would be a griefing vector -- a hostile miner could damage a layer on purpose to drive everyone
+    else's dose on it to the floor.
+
+    Rung 0 is the campaign dose. on_reject steps DOWN one rung and returns True while a smaller rung
+    exists; at the smallest rung it returns False, which is the caller's cue to park + advance.
+    on_accept resets to the top, so a layer that recovers is not permanently penalised. Note what
+    does NOT reset it: giving the layer up. The park expires and the walk comes back, and coming
+    back at the SMALLEST rung is the conservative reading of "this layer rejected everything we
+    tried" -- re-inflicting the largest dose is the failure this whole ladder exists to avoid."""
+
+    def __init__(self, rungs=None, log=None):
+        self.rungs = (tuple(DOSE_LADDER_DEFAULT) if rungs is None
+                      else validate_dose_ladder(rungs))
+        self._rung = {}                      # L -> index into self.rungs; absent == 0 == campaign dose
+        self._log = log or (lambda *_a: None)
+
+    def rung(self, L):
+        return int(self._rung.get(int(L), 0))
+
+    def multiplier(self, L):
+        return float(self.rungs[self.rung(L)])
+
+    def at_bottom(self, L):
+        return self.rung(L) >= len(self.rungs) - 1
+
+    def on_reject(self, L):
+        """One rung DOWN. True = retry the same layer at the smaller dose; False = this layer just
+        failed at the smallest dose we have, so the caller parks it and advances."""
+        if self.at_bottom(L):
+            return False
+        self._rung[int(L)] = self.rung(L) + 1
+        return True
+
+    def on_accept(self, L):
+        """Back to the campaign dose. True iff a rung was actually reset (lets the caller persist
+        only on a real change instead of on every accepted record)."""
+        return self._rung.pop(int(L), 0) != 0
+
+    def describe(self, L):
+        return "rung %d/%d (x%.4g)" % (self.rung(L), len(self.rungs) - 1, self.multiplier(L))
+
+    # ---- restart durability (ClaimState) -------------------------------------------------------
+    def export(self):
+        """Serializable snapshot. The MULTIPLIER travels next to the index on purpose: an index
+        alone means nothing if the operator changed the ladder between runs, and the restore below
+        uses the multiplier to land on a rung that is never LARGER than the one we left."""
+        return dict(rungs=[float(r) for r in self.rungs],
+                    layers=[dict(L=int(L), rung=int(i), mult=float(self.rungs[i]))
+                            for L, i in sorted(self._rung.items()) if i])
+
+    def restore(self, blob):
+        """Re-seat saved rungs. Returns (restored, dropped). TOLERANT like CoordCooldown.restore --
+        a garbage entry is skipped, never raised: this runs at boot, before the loop, on a file an
+        operator may well have hand-edited."""
+        blob = blob if isinstance(blob, dict) else {}
+        rows = blob.get("layers")
+        rows = rows if isinstance(rows, (list, tuple)) else []
+        restored, dropped = 0, 0
+        for r in rows:
+            try:
+                L, idx, mult = int(r["L"]), int(r["rung"]), float(r.get("mult", float("nan")))
+            except (TypeError, ValueError, KeyError, IndexError):
+                dropped += 1
+                continue
+            if idx <= 0:
+                dropped += 1                                  # top rung is the default; nothing to do
+                continue
+            if 0 <= idx < len(self.rungs) and mult == self.rungs[idx]:
+                self._rung[L] = idx                           # same ladder -> same rung, exactly
+            elif mult == mult and 0.0 < mult <= 1.0:
+                # The ladder CHANGED between runs. Land on the largest live rung that is still no
+                # larger than what we left, so a config edit can never silently raise the dose on a
+                # layer that had already backed off.
+                pick = next((i for i, v in enumerate(self.rungs) if v <= mult), len(self.rungs) - 1)
+                if pick <= 0:
+                    dropped += 1
+                    continue
+                self._rung[L] = pick
+            else:
+                dropped += 1
+                continue
+            restored += 1
+        return restored, dropped
+
+
+class LayerClaimTrainer:
+    """CONSUMER + TRAINER for one claimed layer: fetch the advertised gradient cache, VERIFY it
+    fail-closed, then train all experts of the layer full-rank at the campaign's DRIFT TARGET.
+
+    THE DOSE IS A DRIFT TARGET, NEVER A LEARNING RATE. Measured: lr 1.8006e-04 -> rho 6.05e-03, but
+    +6.9% lr = 10x the drift and +14.4% = NaN divergence. The campaign specifies rho*; this client
+    bisects locally to land it within tolerance and reports the ACHIEVED rho next to its delta. A
+    config carrying an lr is REFUSED by glm_grad_cache.dose_spec_from_config -- that path does not
+    exist on purpose."""
+
+    def __init__(self, cache_dir, target_rho, tol=None, k_chunk=None, campaign_id=None,
+                 corpus_sha=None, fold=None, log=None, rho_map=None, ladder=None):
+        import glm_grad_cache as GC
+        self._GC = GC
+        self.cache_dir = cache_dir
+        self.target_rho = float(target_rho)
+        self.tol = GC.RHO_TOL if tol is None else float(tol)
+        self.k_chunk = GC.K_CHUNK if k_chunk is None else int(k_chunk)
+        self.campaign_id = campaign_id
+        self.corpus_sha = corpus_sha
+        self.fold = fold
+        # PER-LAYER DOSE. `target_rho` alone was a single campaign scalar, which made a per-layer
+        # dose INEXPRESSIBLE -- so the only available response to a rejection was to abandon the
+        # layer. Layers do not respond alike (full-47 held-out CE: L1 -0.095165, L5 -0.054498,
+        # L2 +0.217781 at the same relative drift), so the dose has to be addressable per layer.
+        self.rho_map = {int(k): float(v) for k, v in dict(rho_map or {}).items()}
+        self.ladder = DoseLadder(log=log) if ladder is None else ladder
+        self._log = log or (lambda *_a: None)
+
+    def cache_path(self, L):
+        return os.path.join(self.cache_dir, "layer_%d" % int(L))
+
+    def base_rho(self, L):
+        """This layer's TOP-rung dose: its override when one is configured, else the campaign
+        scalar. No ladder applied -- this is what an accepted layer gets."""
+        return float(self.rho_map.get(int(L), self.target_rho))
+
+    def dose_rho(self, L):
+        """The drift target the NEXT attempt on layer L is dosed at: base_rho(L) scaled by the
+        ladder's current rung. THE single source of the number train_layer hands the dose call --
+        a second copy of this expression is how a dose override gets silently ignored."""
+        return self.base_rho(L) * self.ladder.multiplier(L)
+
+    def expectations(self, L):
+        """What verify_cache must match. Every field the producer stamped is checked; a None here
+        means the caller genuinely does not know it, never 'skip the check'."""
+        exp = {"layer": int(L)}
+        if self.campaign_id:
+            exp["campaign_id"] = self.campaign_id
+        if self.corpus_sha:
+            exp["corpus_sha"] = self.corpus_sha
+        if self.fold is not None:
+            exp["fold"] = int(self.fold)
+        return exp
+
+    def fetch_cache(self, lane, L, http_get=None, man=None):
+        """Resolve the advertised record for layer L, download any missing chunk, then VERIFY.
+        Mirrors glm_data_autosync's fetch+verify shape (record -> files{name:{url,sha256,size}}).
+        Returns the verified cache path, or raises -- an unverified cache is never trained on.
+
+        The record is published under a NAME, and the store's /o/ is keyed by CID, so resolution
+        goes NAME -> manifest -> sha256 -> blob (`get_json_named`). Fetching the name AS a CID 404s
+        every time; that bug cost run 6 a night of miners training nothing. `man` reuses a manifest
+        the caller already holds -- it is 1.65 MB / ~24 s on the live store."""
+        GC = self._GC
+        http_get = http_get or data_http_get
+        dst = self.cache_path(L)
+        name = LAYER_CACHE_RECORD_FMT % int(L)
+        rec, rec_err = None, None
+        getter = getattr(lane, "get_json_named", None)
+        if getter is None:
+            # NOT a soft skip: the record is published under a NAME and /o/ is keyed by CID, so a
+            # lane without name resolution cannot fetch this cache at all -- ever, on any layer.
+            raise GC.CacheVerifyError(
+                "lane %s exposes no get_json_named(): layer cache records are published under a "
+                "NAME (%s) and cannot be fetched as a CID" % (type(lane).__name__, name))
+        try:
+            rec = getter(name, man=man)
+        except Exception as ex:                              # noqa: BLE001 -- re-raised LOUDLY below
+            rec_err = ex
+            self._log("[glm-contrib] *** CANNOT READ layer cache record %r from the lane (%s: %s). "
+                      "Layer %d has NO advertised cache for this miner; it proceeds only if a "
+                      "verified cache is already staged at %s, and FAILS otherwise rather than "
+                      "quietly training nothing."
+                      % (name, type(ex).__name__, str(ex)[:120], int(L), dst))
+        if rec:
+            os.makedirs(dst, exist_ok=True)
+            for fname, meta in sorted((rec.get("files") or {}).items()):
+                if not _is_allowed_layer_cache_name(fname):
+                    raise GC.CacheVerifyError("record advertises a disallowed file name %r" % fname)
+                out = os.path.join(dst, fname)
+                if os.path.exists(out) and _sha256_stream(out) == meta.get("sha256"):
+                    continue                                 # already local and byte-correct
+                url = meta.get("url")
+                if not url:
+                    raise GC.CacheVerifyError("record file %r carries no url" % fname)
+                got, _n = http_get(url, expected_size=meta.get("size"), dest_path=out)
+                if got != meta.get("sha256"):
+                    _rm_quiet(out)
+                    raise GC.CacheVerifyError("%s downloaded with sha256 %s, record says %s"
+                                              % (fname, got[:16], str(meta.get("sha256"))[:16]))
+        try:
+            GC.verify_cache(dst, **self.expectations(L))
+        except GC.CacheVerifyError as ex:
+            if rec_err is not None:
+                raise GC.CacheVerifyError(
+                    "layer %d has NO usable gradient cache: the lane record %r is unreadable (%s: "
+                    "%s) AND the local cache at %s does not verify (%s). Refusing to continue -- a "
+                    "miner that cannot fetch its cache must fail loudly, because in a log "
+                    "'skipped' and 'trained and found nothing' look identical."
+                    % (int(L), name, type(rec_err).__name__, str(rec_err)[:120], dst, ex))
+            raise
+        return dst
+
+    def train_layer(self, L, gu_all, dn_all, I, act_fn, dev="cpu", cache_path=None, torch_mod=None):
+        """Train the whole layer from the verified cache. Returns the dose report (which carries
+        the ACHIEVED rho the miner must publish). Raises DriftBisectionError when the target cannot
+        be landed and NonFiniteDoseError the moment a step diverges -- in both cases NOTHING is
+        applied and nothing is published, which is the point: an unmatched or diverged dose is work
+        the k=24 judge would reject anyway."""
+        GC = self._GC
+        path = cache_path or self.cache_path(L)
+        units = [u for _s, u in GC.iter_cache(path, torch_mod=torch_mod, **self.expectations(L))]
+        rho = self.dose_rho(L)                  # per-layer override x dose-backoff rung, never a bare scalar
+        if self.ladder.rung(L):
+            self._log("[glm-contrib] layer %d is dosed at %s of its %.6e target -> rho=%.6e: this "
+                      "layer's last delta was rejected, and cross-curvature interference is "
+                      "QUADRATIC in the dose while the gain is linear, so shrink before releasing."
+                      % (int(L), self.ladder.describe(L), self.base_rho(L), rho))
+        rep = GC.train_layer_dose(units, gu_all, dn_all, I, act_fn, rho, tol=self.tol,
+                                  K=self.k_chunk, dev=dev, log=self._log, torch_mod=torch_mod)
+        rep["layer"] = int(L)
+        rep["n_experts"] = int(gu_all.shape[0])
+        return rep
+
+
+def _is_allowed_layer_cache_name(name):
+    """Hard allowlist for downloaded cache files -- same defence as _is_allowed_data_name: an
+    advertised record is remote input, so it may never name a path outside the cache dir."""
+    n = str(name or "")
+    if not n or "/" in n or "\\" in n or n.startswith(".") or os.path.isabs(n):
+        return False
+    if ".." in n:
+        return False
+    return n == "manifest.json" or (n.startswith("unit_") and n.endswith(".pt"))
+
+
+def _maybe_build_layer_trainer(args, environ=None, log=None):
+    """Startup constructor for the layer-claim trainer. Returns a LayerClaimTrainer or None.
+
+    Flag OFF => None FIRST, before the import even happens, so the per-expert path is byte-identical
+    and a box without tools/glm_grad_cache.py is unaffected. Flag ON but the module is unusable =>
+    RAISE: 'the trainer is broken' must stop the miner, never silently fall back to the per-expert
+    unit the owner just retired."""
+    env = os.environ if environ is None else environ
+    if not layer_claim_enabled(env):
+        return None                                  # flag OFF: nothing constructed, byte-identical
+    try:
+        import glm_grad_cache as GC
+    except Exception as ex:                          # noqa: BLE001 -- an unimportable trainer is fatal
+        if log:
+            log("[glm-contrib] %s on but tools/glm_grad_cache.py is not importable (%s: %s) -- "
+                "REFUSING to fall back to the retired per-expert unit."
+                % (LAYER_CLAIM_FLAG, type(ex).__name__, ex))
+        raise
+    spec = GC.dose_spec_from_config({                # RAISES if anything names a learning rate
+        # Default = dose B's measured drift (6.065e-02), the one that moved full-47 CE -0.091404.
+        "target_rho": _env_num("NEURAHASH_SD_LAYER_RHO", GC.REFERENCE["dose_b_rho"], float,
+                               environ=env),
+        "tol": _env_num("NEURAHASH_SD_LAYER_RHO_TOL", GC.RHO_TOL, float, environ=env),
+        "k_chunk": _env_num("NEURAHASH_SD_LAYER_K", GC.K_CHUNK, int, environ=env),
+    })
+    # PER-LAYER DOSE + BACKOFF LADDER. Both parse FAIL-CLOSED (DoseConfigError) rather than falling
+    # back to the campaign rho: a silently-ignored dose override mislabels every number the run
+    # produces, and this project has already paid for one of those.
+    rho_map = parse_layer_rho_map(env.get(LAYER_RHO_MAP_ENV), GC=GC)
+    ladder = DoseLadder(parse_dose_ladder(env.get(LAYER_RHO_LADDER_ENV)), log=log)
+    t = LayerClaimTrainer(
+        _layer_cache_dir(args, env), spec["target_rho"], tol=spec["tol"], k_chunk=spec["k_chunk"],
+        campaign_id=(env.get("NEURAHASH_SD_CAMPAIGN_ID") or getattr(args, "campaign_id", None)),
+        corpus_sha=(env.get("NEURAHASH_SD_LAYER_CORPUS_SHA") or None),
+        fold=_env_num("NEURAHASH_SD_LAYER_FOLD", GC.REFERENCE["fold"], int, environ=env),
+        log=log, rho_map=rho_map, ladder=ladder)
+    if log:
+        log("[glm-contrib] %s on: training WHOLE layers full-rank from cached true gradients at "
+            "drift target rho=%.6e (tol %.2f%%, K=%d). The dose is a DRIFT TARGET, never an lr: "
+            "+6.9%% on the reference lr gave 10x the drift and +14.4%% gave NaN."
+            % (LAYER_CLAIM_FLAG, t.target_rho, 100.0 * t.tol, t.k_chunk))
+        log("[glm-contrib] dose backoff ladder: %s (a rejected delta SHRINKS the dose on the same "
+            "layer; only a rejection at the smallest rung releases it). Per-layer overrides: %s"
+            % (" -> ".join("x%.4g" % r for r in ladder.rungs),
+               (", ".join("L%d=%.6e" % (L, r) for L, r in sorted(rho_map.items()))
+                if rho_map else "none")))
+    return t
+
+
+DOSE_ACTION_RESET = "reset"          # accepted -> back to the campaign dose
+DOSE_ACTION_SHRINK = "shrink"        # rejected -> retry the SAME layer one rung down
+DOSE_ACTION_EXHAUSTED = "exhausted"  # rejected at the smallest rung -> park + advance
+
+
+def layer_dose_verdict(trainer, L, accepted=False, log=None, miner=""):
+    """THE SEAM between "the judge ruled on our delta" and "what dose does this layer get next".
+
+    Deliberately narrow: it consumes a per-attempt verdict it is GIVEN (`accepted` True/False for
+    THIS miner's own delta on layer L) and returns an ACTION string. It reads no records, defines no
+    wire format and knows nothing about how the verdict was obtained -- which matters, because the
+    caller's current reject signal (the ABSENCE of our name in an accepted record) cannot yet
+    distinguish "my delta lost the gate" from "another miner won this coordinate". When that signal
+    is made honest, this function does not change; only what the caller passes for `accepted` does.
+
+    Returns DOSE_ACTION_RESET | DOSE_ACTION_SHRINK | DOSE_ACTION_EXHAUSTED.
+
+    `trainer is None` (flag OFF, or the per-expert path) -> EXHAUSTED, i.e. exactly today's
+    behaviour: the plateau releases the coordinate immediately. That default is what keeps the
+    flag-OFF path byte-identical -- nothing is imported, nothing is constructed, and the caller runs
+    the same advance it runs today."""
+    if trainer is None or getattr(trainer, "ladder", None) is None:
+        return DOSE_ACTION_RESET if accepted else DOSE_ACTION_EXHAUSTED
+    ladder = trainer.ladder
+    if accepted:
+        if ladder.on_accept(L) and log:
+            log("[glm-contrib %s] layer %d ACCEPTED -> dose back to the campaign target %.6e (a "
+                "layer that recovers is not permanently penalised)" % (miner, int(L),
+                                                                       trainer.base_rho(L)))
+        return DOSE_ACTION_RESET
+    if ladder.on_reject(L):
+        if log:
+            log("[glm-contrib %s] layer %d REJECTED -> SHRINK the dose to %s = %.6e and retry the "
+                "SAME layer. Releasing it first would only re-discover that every layer under-"
+                "performs in company (L1+L5 kept 1.8%% of their predicted joint gain)."
+                % (miner, int(L), ladder.describe(L), trainer.dose_rho(L)))
+        return DOSE_ACTION_SHRINK
+    if log:
+        log("[glm-contrib %s] layer %d REJECTED at the SMALLEST rung %s -- the ladder is exhausted, "
+            "so now (and only now) the coordinate is parked and released."
+            % (miner, int(L), ladder.describe(L)))
+    return DOSE_ACTION_EXHAUSTED
+
+
+_LAYER_TRAINERS = {}                                 # id(args) -> LayerClaimTrainer or None
+
+
+def layer_claim_trainer_for(args, environ=None, log=None):
+    """Memoized per-args trainer, so the round loop constructs it ONCE. Flag off -> None, cached."""
+    key = id(args)
+    if key not in _LAYER_TRAINERS:
+        _LAYER_TRAINERS[key] = _maybe_build_layer_trainer(args, environ=environ, log=log)
+    return _LAYER_TRAINERS[key]
+
+
+def layer_expert_slabs(model, L):
+    """(module, gate_up[E,2I,H], down[E,H,I], I, act_fn) read off the MODEL'S OWN expert module.
+
+    Never construct an experts module: transformers dispatches its forward on
+    `config._experts_implementation` ('grouped_mm', fp32 accumulation), and a separately built module
+    has that field None and silently falls back to a naive bf16 index_add_ loop whose logits diverge
+    by up to 0.25 (tools/glm_product_judge.py, preserved behaviour 2). Same rule here."""
+    mod = model.model.layers[int(L)].mlp.experts
+    gu, dn = mod.gate_up_proj, mod.down_proj
+    return mod, gu, dn, int(dn.shape[-1]), mod.act_fn
+
+
+def layer_delta_payload(Dgu, Ddn, L, I, coords=None):
+    """The trained layer delta in the per-coordinate shape the merge path already speaks: one
+    {"gate","up","down"} block per expert, keyed by the existing "%d_%d" wire form.
+
+    Slicing matches GlmExpertLaneHost.read_slot exactly -- gate = gate_up[E,:I], up = gate_up[E,I:],
+    down = down[E] -- so a consumer that can read one expert's rows can read all 64.
+
+    WIRE COST, MEASURED: a full-rank layer delta is 1.21 GB bf16 -- ~23 s on the LAN at 53.78 MB/s
+    and ~2.2 h on a 1.2 Mbps home uplink. This is the RAW path, shipped first because correctness
+    comes first. `glm_grad_cache.delta_wire_plan` is the seam a per-expert SVD/low-rank compressor
+    plugs into behind its own flag with its own fidelity check; the project's 67.7x LoRA-factor
+    precedent applies to WEIGHT deltas like this one, and NOT to gradient caches."""
+    import numpy as np
+    want = None if coords is None else {int(c[1]) for c in coords if int(c[0]) == int(L)}
+    out = {}
+    for e in range(int(Dgu.shape[0])):
+        if want is not None and e not in want:
+            continue
+        out["%d_%d" % (int(L), e)] = {
+            "gate": np.asarray(Dgu[e, :I].detach().float().cpu().numpy()),
+            "up": np.asarray(Dgu[e, I:].detach().float().cpu().numpy()),
+            "down": np.asarray(Ddn[e].detach().float().cpu().numpy()),
+        }
+    return out
+
+
+DELTA_SLOT_KEYS = ("gate", "up", "down")           # the ONE dense shape the wire + the merge speak
+
+
+def layer_payload_coords(payload):
+    """The coordinates a LAYER payload addresses -- sorted (L,E) tuples -- or None if `payload` is
+    not one. PURE; the guard that keeps the per-expert path untouched.
+
+    A layer payload is NESTED: {"<L>_<E>": {gate,up,down}}. Every other payload on this lane is FLAT
+    -- a dense {gate,up,down} delta or LoRA factors -- and flat is what pack_arrays and
+    apply_delta_gated understand. Returning None for those two is what makes the publish branch below
+    a no-op for them even with the flag ON (--garbage builds a flat delta on the layer path too)."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    out = []
+    for k, v in payload.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            return None
+        a, _, b = k.partition("_")
+        if not (a.isdigit() and b.isdigit()):
+            return None
+        if any(x not in v for x in DELTA_SLOT_KEYS):
+            return None
+        out.append((int(a), int(b)))
+    return sorted(out)
+
+
+def publish_layer_claim_records(lane, host, payload, coords, miner, base_event, root, key, wallet,
+                                train_flops, steps, tokens, publish_k, log, address=None):
+    """Publish a LAYER claim as ONE RECORD PER COORDINATE -- the only shape the live lane merges.
+
+    WHY THIS EXISTS (measured 2026-07-28, before any layer delta had reached a coordinator). The
+    64-block payload `layer_delta_payload` returns is rejected at BOTH ends of the wire:
+      * tools/sharddiloco_harness.pack_arrays does `named[k].shape` on every value, so
+        `lane.put_delta(<layer payload>)` raises "AttributeError: 'dict' object has no attribute
+        'shape'" -- the delta never even reaches the lane;
+      * and had it reached one, neurahash/diloco_merge.apply_delta_gated:466 intersects the delta's
+        keys with the SLOT's keys ({gate,up,down}). "1_0".."1_63" match none of them, so it returns
+        keys_matched=0 / reason="no matching trunk keys", the secret probe is never evaluated, NOTHING
+        merges (not even the head coordinate), and shard_merge_round counts it as an ordinary gate
+        REJECT -- a whole layer of GPU-hours indistinguishable in every log from a bad delta.
+    So the fix is not a new record format: it is publishing in the currency everything downstream
+    already speaks. `experts[e]`, `probe.batch(e, rnd)`, the per-coordinate lineage root
+    (`base_slot_root`), `_admit_coordinate` and the accepted stamp are all per COORDINATE; none of
+    them is per layer. The coordinator drains these as back-to-back SINGLE-DELTA events
+    (sharddiloco_glm_coordinator.py:1976-1986, "ONE CONTRIBUTION PER EVENT") -- merging 64 blocks as
+    one composite is exactly the ~1 ULP root divergence that rule was written to prevent, because a
+    replica folds an accept list sequentially. Each coordinate is also gated INDEPENDENTLY, so three
+    bad experts can no longer sink the 61 good ones.
+
+    ACCOUNTING. `train_flops` covers ALL the coordinates in this payload (layer_claim_round reports
+    n_units * len(payload) -- the PUBLISHED experts, deliberately not the fused slab width), so each
+    record carries its 1/N share and lands on n_units, the work attributable to one expert. Without
+    the split, 64 records would each claim the whole layer -- 64x -- into gain/FLOP and the FLOP
+    meter. `steps` is per-expert already (every expert saw all n_units) and passes through unchanged.
+
+    Returns (n_published, publish_k, delta_bytes_total). Never raises for a coordinate the host does
+    not hold: it is skipped with a log line, because a mid-publish crash would lose the records
+    already on the lane."""
+    n_pub, total_bytes = 0, 0
+    share = float(train_flops) / float(len(coords)) if coords else 0.0
+    for (cL, cE) in coords:
+        idx = host.index_of(int(cL), int(cE))
+        if idx is None:
+            log("[glm-contrib %s] LAYER-PUBLISH skip (L%d,E%d): this node holds no slot for it, so "
+                "there is no per-coordinate lineage root to sign it against" % (miner, cL, cE))
+            continue
+        block = {k: payload["%d_%d" % (int(cL), int(cE))][k] for k in DELTA_SLOT_KEYS}
+        ecid = lane.put_delta(block)
+        sig = _sign_contrib(key, wallet, ecid, base_event, miner)
+        nbytes = int(len(H.pack_arrays(block, np.float16)))
+        rec = build_async_contrib_record(miner, idx, cL, cE, base_event, root, ecid, sig, share,
+                                         nbytes, steps, tokens, address=address,
+                                         base_slot_root=slot_root(host, idx))
+        lane.put_json_named(async_publish_name(base_event, miner, publish_k,
+                                               host_campaign_id(host)), rec)
+        publish_k += 1
+        n_pub += 1
+        total_bytes += nbytes
+    return n_pub, publish_k, total_bytes
+
+
+def layer_claim_round(model, cfg, host, lane, args, L, E, i, miner, log, round_index=0,
+                      environ=None, torch_mod=None, trainer=None, man=None):
+    """ONE layer-claim training round, shaped like train_glm_expert_contribution's return so the
+    publish path below it is unchanged: {delta, payload, train_flops, best_val_ce, steps_trained,
+    n_tokens, layer_dose}.
+
+    `layer_dose` carries the ACHIEVED drift and the lr the local bisection found. The miner MUST
+    publish it: the campaign specified a target drift, and only the client knows what it landed."""
+    t = trainer or layer_claim_trainer_for(args, environ=environ, log=log)
+    if t is None:
+        raise RuntimeError("layer_claim_round called with %s off" % LAYER_CLAIM_FLAG)
+    _mod, gu_all, dn_all, I, act_fn = layer_expert_slabs(model, L)
+    claimable = claim_all_coords(args, [(int(L), int(E))])
+    coords = layer_claim_coords(claimable, L) or [(int(L), int(E))]
+    # `man=man`: resolving the record's NAME needs a manifest, and the round loop already fetched
+    # one. Without this the fix would re-read 1.65 MB / ~24 s per round on the live store, which is
+    # the lane's measured #1 bottleneck (docs/research/STORE_BOTTLENECK_2026-07-27.md).
+    path = t.fetch_cache(lane, L, man=man) if lane is not None else t.cache_path(L)
+    dev = str(getattr(gu_all, "device", "cpu"))
+    rep = t.train_layer(L, gu_all, dn_all, I, act_fn, dev=dev, cache_path=path,
+                        torch_mod=torch_mod)
+    Dgu, Ddn = rep.pop("delta")
+    payload = layer_delta_payload(Dgu, Ddn, L, I, coords=coords)
+    log("[glm-contrib %s] LAYER %d dose: %d experts full-rank, lr=%.6e -> ACHIEVED drift %.6e "
+        "(target %.6e, rel err %.3f%%) over %d cached units in %.1fs"
+        % (miner, int(L), len(payload), rep["lr"], rep["achieved_rho"], rep["target_rho"],
+           100.0 * rep["rel_err"], rep["n_units"], rep["wall_s"]))
+    return {"delta": payload, "payload": payload, "lora": None,
+            # PUBLISHED experts, NOT the slab width. train_layer trains the whole fused slab (all 64
+            # rows exist in the tensor), but a node whose piece straddles a layer boundary claims only
+            # SOME of them (piece_loader.claimable_expert_ids: "piece 588 straddles layers 46/47 so 1
+            # of its 5 coordinates is unreal") and layer_delta_payload discards the rest. Claiming the
+            # slab width would bill FLOPs for deltas that were never published, and would make
+            # publish_layer_claim_records' 1/N share over-claim by n_experts/len(coords) per record.
+            # With a whole-layer claim -- the design case -- len(payload) IS n_experts and this is
+            # unchanged.
+            "train_flops": float(rep["n_units"]) * float(len(payload)),
+            "best_val_ce": float("nan"),      # the k=24 judge scores the RESULT; no local metric
+            "steps_trained": int(rep["n_units"]), "n_tokens": 0,
+            "layer_dose": {k: v for k, v in rep.items() if k != "base_norms"},
+            "cache_path": path, "coords": coords}
 
 
 # ======================================================== ESFT expert-affinity selection (--claim-by)
@@ -1577,7 +2354,29 @@ def build_node_model(args, log=None, need_gib=None):
     """Build the node's base model. BOTH roles call this, with the same args, so both hold the same
     weights and (critically, plan risk 5) the same resident expert set -- if a contributor held only
     its own expert, piece_loader.py:381-385 would mask the other 63 to -inf and it would optimize a
-    CE the coordinator does not gate on. Returns (model, cfg, seq_len)."""
+    CE the coordinator does not gate on. Returns (model, cfg, seq_len).
+
+    TRUNK-FREE (opt-in NEURAHASH_SD_TRUNK_FREE, see trunk_free_enabled): the GLM branch can build
+    WITHOUT the 4.02 GiB trunk so a layer-claim dose fits an 8 GB card. Every combination that
+    needs a forward pass is refused HERE, at config time, before any bytes move -- not at the
+    first meta-tensor crash mid-run."""
+    _trunk_free = trunk_free_enabled()
+    if _trunk_free:
+        if args.mode != "glm":
+            raise SystemExit("[glm-node] FATAL: %s=1 but --mode=%s. The trunk-free base exists "
+                             "only for the GLM layer-claim lane; every other mode trains with "
+                             "full forward passes." % (TRUNK_FREE_FLAG, args.mode))
+        if not layer_claim_enabled():
+            raise SystemExit("[glm-node] FATAL: %s=1 requires %s=1. Only the layer-claim dose "
+                             "trains without a forward pass (glm_grad_cache.inner_step consumes "
+                             "cached activations + the fused slabs); the classic LoRA lane "
+                             "forwards the model every step and cannot run trunk-free."
+                             % (TRUNK_FREE_FLAG, LAYER_CLAIM_FLAG))
+        if str(getattr(args, "claim_by", "hash")) == "affinity":
+            raise SystemExit("[glm-node] FATAL: %s=1 is incompatible with --claim-by affinity: "
+                             "the ESFT affinity probe forward-passes the model, which a "
+                             "trunk-free base cannot do. Use --claim-by hash."
+                             % TRUNK_FREE_FLAG)
     import torch
     G = _G()
     torch.set_num_threads(max(1, int(args.threads)))
@@ -1616,8 +2415,20 @@ def build_node_model(args, log=None, need_gib=None):
     piece_ids = node_piece_ids(args)
     model, summ = piece_loader.build_partial_model(
         args.shard_dir, piece_ids, device=args.device, dtype=torch.bfloat16,
-        config_dir=args.config_dir, strip_mtp=True)
-    if int(summ.get("meta_params_left", 0)) != 0:
+        config_dir=args.config_dir, strip_mtp=True, include_trunk=not _trunk_free)
+    if _trunk_free:
+        # Trunk params on meta are the POINT here; a fused expert param on meta is still the same
+        # incomplete-piece failure the default branch below refuses on.
+        if int(summ.get("n_nontrunk_meta", -1)) != 0:
+            raise SystemExit("[glm-node] FATAL: %s fused expert param(s) left on meta after a "
+                             "trunk-free load (incomplete piece)" % summ.get("n_nontrunk_meta"))
+        _msg = ("[glm-node] TRUNK-FREE base (opt-in %s=1): %d trunk param(s) left on meta -- 0 "
+                "bytes resident -- so forward passes are IMPOSSIBLE on this node by construction. "
+                "SECURITY: the F2 own-slot re-gate (forged/poisoned accepted-record detection via "
+                "local held-out CE) is FORFEITED until this node runs with the trunk resident."
+                % (TRUNK_FREE_FLAG, int(summ.get("n_trunk_meta", -1))))
+        (log or (lambda m: print(m, flush=True)))(_msg)
+    elif int(summ.get("meta_params_left", 0)) != 0:
         raise SystemExit("[glm-node] FATAL: %d meta params left after load (incomplete piece)"
                          % summ["meta_params_left"])
     # RESIDENCY ASSERTION: what got loaded must equal what was asked for. A piece id indexes the
@@ -1648,7 +2459,40 @@ def node_ids(args, slot, split):
     (probe/heldout) go through coord_secret_ids instead so they are never sought in the miner dir."""
     if args.mode == "tiny":
         return tiny_ids(split, slot=slot)
-    return np.load(_ids_path(args, slot, split))
+    # mmap_mode="r" so a miner's RSS does NOT scale with the corpus. A bare np.load pulls the whole
+    # split into RAM, and this is re-loaded on every expert switch/reclaim (10 call sites) -- merely
+    # wasteful at the 1.07 GB train split, fatal on an 8-16 GB consumer box once the corpus grows to
+    # ~16 GB on disk, which is exactly the hardware this lane targets. Same pattern _infer_seq
+    # already uses (see below). AUDITED 2026-07-27 -- safe because no consumer mutates the array:
+    # the trainer fancy-indexes it (train_glm_expert_contribution: train_ids[idx] -> a fresh
+    # writable copy per batch), while heldout_ce and probe_expert_affinity only read slices under
+    # torch.no_grad(). Anything added here that WRITES must copy its own slice (np.array(ids[i:j])),
+    # never drop the mmap: a read-only memmap raises on in-place assignment, which is the point.
+    return np.load(_ids_path(args, slot, split), mmap_mode="r")
+
+
+def _release_ids(*arrs):
+    """Close the mapping behind any memmap in `arrs`; return True iff at least one was closed.
+    A plain ndarray (mode=tiny), a list, or None is ignored and does NOT set the return flag -- the
+    caller uses it to decide whether it must re-open, so a caller that was handed non-mapped ids
+    keeps its original behaviour and never touches the disk.
+
+    Needed because node_ids now returns a memmap: on Windows an OPEN mapping makes glm_data_autosync's
+    atomic install fail -- os.replace onto a mapped file raises PermissionError [WinError 5] (MEASURED
+    2026-07-27; the same replace succeeds once the mapping is released, and succeeded before under the
+    bare np.load). glm_data_periodic_resync catches only SystemExit, so that error would propagate out
+    of the round loop and turn the Alpha-3.0 corpus hot-reload into a CRASH. Callers release across
+    that boundary and re-open with node_ids immediately after."""
+    closed = False
+    for a in arrs:
+        m = getattr(a, "_mmap", None)
+        if m is not None:
+            try:
+                m.close()
+                closed = True
+            except Exception:                                    # noqa: BLE001
+                pass
+    return closed
 
 
 def coord_secret_ids(args, slot, split):
@@ -1804,6 +2648,50 @@ def accepted_names_me(record, miner):
     return any(str(it.get("miner")) == str(miner) for it in (record.get("accepted") or []))
 
 
+class RegateUnavailable:
+    """Sentinel ce_fn for apply_accepted: the own-slot re-gate is STRUCTURALLY IMPOSSIBLE on this
+    node (trunk-free base -- heldout_ce needs a full trunk forward and there is no trunk). This is
+    deliberately NOT ce_fn=None: None is a caller's chosen bit-exact replay (empty val split /
+    legacy lanes) and has been silent by contract since F2 landed; this sentinel means a security
+    check was FORFEITED, so apply_accepted folds exactly as under None -- refusing the fold would
+    fail replica_root_ok's advertised-root check and freeze the frontier permanently -- but logs
+    SECURITY WAIVED on every own-slot fold it performs unjudged. A node that stopped checking must
+    never be indistinguishable from a node with nothing to check. Calling the sentinel is a bug."""
+
+    reason = "trunk-free base: heldout_ce is a full trunk forward and there is no trunk"
+
+    def __call__(self, host):
+        raise RuntimeError("RegateUnavailable was CALLED (%s) -- apply_accepted must treat this "
+                           "sentinel as 'fold loudly without re-gating', never invoke it"
+                           % self.reason)
+
+    def __repr__(self):
+        return "<RegateUnavailable: %s>" % self.reason
+
+
+REGATE_UNAVAILABLE = RegateUnavailable()
+
+
+def make_regate_ce(G, model, val_ids, miner="", log=None):
+    """The ONE constructor for the F2 own-slot re-gate closure -- every bind site (the async init,
+    the corpus-resync rebind, the two claim-advance rebinds, the sync loop) routes here.
+
+    Trunk-bearing model: byte-identical to the expression this replaced,
+    `(lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None`.
+    Trunk-free model (model_is_trunk_free): returns REGATE_UNAVAILABLE and logs the exact property
+    being given up. NEVER returns None for that case: None already means "replay bit-exact, no
+    gate" and a trunk-free node must never look like a node that legitimately chose that."""
+    if model_is_trunk_free(model):
+        if log:
+            log("[glm-contrib %s] SECURITY: own-slot re-gate DISABLED -- trunk-free base cannot "
+                "run a held-out forward (%s=1). The F2 defense (a forged/poisoned accepted record "
+                "for THIS node's own coordinate is caught by local held-out CE in apply_accepted) "
+                "is FORFEITED on this node until it runs with the trunk resident."
+                % (miner, TRUNK_FREE_FLAG))
+        return REGATE_UNAVAILABLE
+    return (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+
+
 def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None, own_slot=None,
                    skipped=None, folded_slots=None):
     """Replay the coordinator's merge locally: for each accepted delta, in the coordinator's order,
@@ -1834,6 +2722,10 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
                 self-abort the whole replica (rc 8). None -> legacy re-gate-EVERY-slot behaviour.
     When ce_fn is None the replay is UNCONDITIONAL and bit-identical to the coordinator's merge (the
     model_root replication invariant the pointer asserts each round, and what the unit test checks).
+    When ce_fn is the REGATE_UNAVAILABLE sentinel (trunk-free base: no forward pass exists, see
+    make_regate_ce) the replay is the SAME unconditional bit-exact fold, but every own-slot fold
+    logs SECURITY WAIVED -- the check that would have judged it was forfeited, and that must never
+    be silent. The sentinel is never called.
     Returns the count of deltas actually FOLDED (a rejected delta is not counted).
 
     F2 (SHARD CLAIM, 2026-07-25) -- `skipped`: rows this node CANNOT PLACE (a coordinate it does not hold,
@@ -1892,7 +2784,14 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
         # gutenberg delta on a slot-0 code node's code val is a FALSE positive that self-aborted the
         # replica (rc 8). base_ce is measured fresh right before the own-slot fold (i.e. AFTER any
         # cross-domain folds this round), so the check reflects only the own delta's effect.
-        regate = ce_fn is not None and (own is None or slot == own)
+        own_row = own is None or slot == own
+        regate_waived = isinstance(ce_fn, RegateUnavailable)
+        regate = ce_fn is not None and not regate_waived and own_row
+        if regate_waived and own_row and log:
+            # NEVER silent: this is the exact fold the F2 re-gate exists to judge, running unjudged.
+            log("[glm-node] SECURITY WAIVED: folding OWN-SLOT accepted delta for slot %d WITHOUT "
+                "the local held-out re-gate (trunk-free base: no forward pass exists). A forged/"
+                "poisoned accepted record for this coordinate CANNOT be detected here." % slot)
         base_ce = ce_fn(host) if regate else None
         host.write_slot(slot, {k: cur[k] + outer * d[k] for k in cur})
         if regate:
@@ -1915,9 +2814,11 @@ def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=
     return n
 
 
-def fetch_accepted(lane, rnd, timeout=60.0, poll=0.25):
-    """Read the coordinator's per-round ACCEPTED record (named object), waiting for it to appear."""
-    name = accepted_name(rnd)
+def fetch_accepted(lane, rnd, timeout=60.0, poll=0.25, campaign=None):
+    """Read the coordinator's per-round ACCEPTED record (named object), waiting for it to appear.
+    `campaign` selects the name family; the v1 SYNC lane is always unscoped (a v1 pointer has no
+    field to advertise a campaign), so None keeps this path byte-identical."""
+    name = accepted_name(rnd, campaign)
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
@@ -2027,13 +2928,16 @@ def _is_allowed_data_name(name):
     return name == DATA_MANIFEST_NAME or bool(_ALLOWED_DATA_RE.match(name))
 
 
-def _read_data_record(lane):
+def _read_data_record(lane, man=None):
     """Read the coordinator's named data record (DATA_RECORD_NAME) via the manifest -- the same
     name -> sha256 -> get_json resolution read_pointer/fetch_accepted use, because ContentLane.get_json
     takes a CID, not a name. Returns the record dict, or None if the record is absent or unreadable, in
-    which case the caller NO-OPs to today's local --data-dir behavior."""
+    which case the caller NO-OPs to today's local --data-dir behavior.
+    `man`: reuse the caller's manifest (one manifest per tick, 2026-07-27 -- this read is per-round and
+    the re-sync defaults ON, so it was a THIRD 1.65 MB pull per tick). None -> read one, as before."""
     try:
-        man = lane.manifest()
+        if man is None:
+            man = lane.manifest()
         entry = man.get(DATA_RECORD_NAME)
         if not entry:
             return None
@@ -2186,7 +3090,8 @@ def plan_data_resync(prev_record, new_record):
     return True, old_sha, new_sha, changed_files
 
 
-def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=data_http_get, env=None):
+def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=data_http_get, env=None,
+                             man=None):
     """Alpha-3.0 periodic corpus re-sync STEP (Objective 2), safe to call at every async round
     boundary. Returns (record_now, refreshed):
       * flag OFF -> (prev_record, False), ZERO I/O. (_run_async's guard already skips it; the internal
@@ -2199,10 +3104,12 @@ def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=da
         verified files on disk are left untouched -- log the refusal and return (prev_record, False)
         so the miner keeps training on the KNOWN-GOOD corpus and retries next boundary.
     (glm_data_autosync's own F1 guard still protects the disk if the new record names a disallowed
-    file -- it fetches nothing in that case, so no unverified/secret split can ever land.)"""
+    file -- it fetches nothing in that case, so no unverified/secret split can ever land.)
+    `man`: the caller's already-fetched manifest, reused for the record read (one manifest per tick,
+    2026-07-27). None -> read one, as before."""
     if not _data_resync_enabled(env):
         return prev_record, False
-    new_record = _read_data_record(lane)
+    new_record = _read_data_record(lane, man=man)
     changed, old_sha, new_sha, changed_files = plan_data_resync(prev_record, new_record)
     if not changed:
         return prev_record, False
@@ -2328,7 +3235,7 @@ def _select_async_mode(ptr, env=None):
     return optout not in _ASYNC_OPT_OUT
 
 
-def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000):
+def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000, campaign=None):
     """Non-blocking catch-up scan (alpha 2.0 #146). Given the names currently present in the lane
     manifest (any container supporting `in`; a manifest dict's keys work directly) and the last event
     already folded locally, return the ORDERED list of accepted event numbers to apply next:
@@ -2339,18 +3246,20 @@ def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000):
     visible'. We never skip a gap: applying e+1 before e would fold deltas out of the coordinator's
     order and diverge the replica. Returns [] when nothing new is visible -- the caller then trains
     against the current base rather than waiting. `max_scan` is a defensive finite cap so a malformed
-    manifest cannot loop forever; unreached on the happy path. Pure: no I/O."""
+    manifest cannot loop forever; unreached on the happy path. `campaign` selects the name family
+    (see accepted_prefix); None -> the legacy unscoped one. Pure: no I/O."""
     out = []
     e = int(last_applied) + 1
     n = 0
-    while n < int(max_scan) and accepted_name(e) in manifest_names:
+    while n < int(max_scan) and accepted_name(e, campaign) in manifest_names:
         out.append(e)
         e += 1
         n += 1
     return out
 
 
-def scan_accepted_events_bounded(manifest_names, last_applied, frontier, max_scan=1_000_000):
+def scan_accepted_events_bounded(manifest_names, last_applied, frontier, max_scan=1_000_000,
+                                 campaign=None):
     """scan_accepted_events BOUNDED by the pointer's authoritative event frontier (restart hygiene).
     The lane store never deletes, so after a coordinator restart the manifest still lists accepted
     records from the PREVIOUS run at events the new run has not reached yet. The pointer is the
@@ -2358,7 +3267,7 @@ def scan_accepted_events_bounded(manifest_names, last_applied, frontier, max_sca
     e > pointer.event would replay a dead run's merges onto a fresh base (measured live 2026-07-23:
     a restarted lane poisoned a contributor through exactly this). frontier=None -> unbounded
     (identical to scan_accepted_events). Pure: no I/O."""
-    evs = scan_accepted_events(manifest_names, last_applied, max_scan=max_scan)
+    evs = scan_accepted_events(manifest_names, last_applied, max_scan=max_scan, campaign=campaign)
     if frontier is None:
         return evs
     f = int(frontier)
@@ -2653,7 +3562,15 @@ class _DeadlineLane:
     exposes urllib-style knobs we hand the worker a SHALLOW CLONE with a tightened socket timeout and
     at most 2 retries, so an abandoned call dies on its own instead of lingering on a trickling
     socket. The clone is why the live lane's own timeout/retries are never mutated -- other threads
-    (the main loop's manifest scan) share that object."""
+    (the main loop's manifest scan) share that object.
+
+    ABANDONMENT ALSO CLOSES THE SOCKET (2026-07-27). The tightened clone bounds how LONG an abandoned
+    worker can linger, but it still drains bytes until then -- and on a ~1.2 Mbps link that is the
+    congestion which caused the abort in the first place, 160 times in one run log
+    (docs/research/STORE_BOTTLENECK_2026-07-27.md sec 2c). So on abandonment we also ask the clone to
+    close whatever response it is reading (ContentLane.close_inflight). Best-effort by construction:
+    a lane without that method (every in-process test fake) is simply left alone, and a failure to
+    close is swallowed -- we are already on the error path."""
 
     def __init__(self, lane, call_timeout_s, deadline=None, now=None):
         self._now = now or time.monotonic
@@ -2681,6 +3598,17 @@ class _DeadlineLane:
     def remaining(self):
         """Seconds left on the whole-catch-up deadline (None = no deadline set)."""
         return None if self._deadline is None else (self._deadline - self._now())
+
+    def _close_inflight(self):
+        """Best-effort: unblock an ABANDONED worker's socket so it stops draining the link. Named
+        with a leading underscore so __getattr__ never proxies it into another bounded thread."""
+        closer = getattr(self._lane, "close_inflight", None)
+        if not callable(closer):
+            return False
+        try:
+            return bool(closer())
+        except Exception:                                        # noqa: BLE001 -- never fail an abort
+            return False
 
     def __getattr__(self, name):
         # Never proxy our OWN internals. Without this, any access to `_lane` before __init__ finished
@@ -2710,6 +3638,7 @@ class _DeadlineLane:
             th.join(budget)
             if th.is_alive():
                 self.abandoned += 1
+                self._close_inflight()        # stop the abandoned worker draining the contended link
                 raise CatchupTimeout("lane.%s did not return within %.1fs" % (name, budget))
             if "e" in box:
                 raise box["e"]
@@ -2772,6 +3701,240 @@ class CoordCooldown:
                            % (int(c[0]), int(c[1]), self.reason(c), s, e))
         return out
 
+    # ---- restart durability (ClaimState) -------------------------------------------------------
+    def export(self, event=None):
+        """Serializable snapshot of the live parks. Seconds are stored RELATIVE (`left_s`) because
+        `self._now` may be time.monotonic, whose zero is per-process and means nothing to the next
+        one; the caller stamps the wall clock so the reader can decay them. Already-elapsed parks are
+        not exported at all. `at_event` is the event counter these absolute `until_event` deadlines
+        were measured against -- None when the caller does not know it."""
+        out = []
+        for (l, e), p in sorted(self._parked.items()):
+            left = float(p["until_t"]) - self._now()
+            if not (left > 0.0) or not math.isfinite(left):
+                # elapsed -> nothing worth carrying over. non-finite (a nan/inf cooldown length from
+                # the env knob) -> DROP, never persist: every comparison against nan is False, so a
+                # nan deadline is a park that no clock can ever expire and no restart can clear.
+                continue
+            out.append(dict(L=int(l), E=int(e), reason=str(p["reason"]), left_s=left,
+                            until_event=int(p["until_event"])))
+        return dict(at_event=(None if event is None else int(event)), parked=out)
+
+    def restore(self, blob, event=None, elapsed_s=0.0):
+        """Re-park what a previous process parked and is still live. Returns (restored, dropped).
+
+        EXPIRY IS THE POINT, and the two dimensions expire differently:
+          * SECONDS -- a wall-clock park. `elapsed_s` is the wall time since the snapshot, so a
+            restart hours later drops every entry instead of resurrecting stale parks and starving
+            the miner of coordinates, which is the opposite failure to the one this fixes.
+          * EVENTS -- an ABSOLUTE count against the campaign's event counter, so it is meaningless
+            against a DIFFERENT counter. Kept only when the live counter is known and still at or
+            past the one the snapshot was taken against (same campaign, moved forward); otherwise
+            the event half is dropped (until_event=0) and the park expires on wall clock alone. A
+            resumed coordinator republishes genesis at event 0, so honouring 'until event 40'
+            against a counter that just restarted would park the coordinate for a whole campaign.
+        Tolerant by construction: an entry that is not a well-formed park is skipped, never raised."""
+        blob = blob if isinstance(blob, dict) else {}
+        rows = blob.get("parked")
+        rows = rows if isinstance(rows, (list, tuple)) else []
+        at, ev = _int_or_none(blob.get("at_event")), _int_or_none(event)
+        keep_events = (ev is not None and at is not None and ev >= at)
+        restored, dropped = 0, 0
+        for r in rows:
+            try:
+                left = float(r["left_s"]) - float(elapsed_s or 0.0)
+                key = (int(r["L"]), int(r["E"]))
+                # CLAMP, not trust (F2): a park stamped while the counter read `at` cannot honestly
+                # have a deadline past at + events. A LARGER one means the counter moved BACKWARDS
+                # between the park and the save -- the coordinator restarted mid-process and
+                # republished genesis -- so `at` no longer witnesses the same campaign the deadline
+                # was set in, and the raw value would park this coordinate for a whole new campaign.
+                ue = min(int(r.get("until_event") or 0), int(at or 0) + self.events)
+            except (TypeError, ValueError, KeyError, IndexError):
+                dropped += 1
+                continue
+            if not (left > 0.0) or not math.isfinite(left):
+                dropped += 1                       # elapsed, or a nan/inf no clock could ever expire
+                continue
+            self._parked[key] = dict(
+                reason=str(r.get("reason") or "restored"), until_t=self._now() + left,
+                until_event=ue if keep_events else 0)
+            restored += 1
+        return restored, dropped
+
+
+def _int_or_none(v):
+    """int(v) or None -- for hand-editable JSON fields where a wrong type must degrade, never raise."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+CLAIM_STATE_SCHEMA = 1              # bump whenever the on-disk shape changes; a mismatch starts clean
+
+
+def _claim_state_path(args, identity, base=None):
+    """Path to THIS identity's restart-durable claim state, next to the ids files in --data-dir (same
+    `base if base is not None else args.data_dir` convention as _ids_path). None when there is no
+    data dir at all, which makes every ClaimState operation a no-op.
+
+    KEYED BY IDENTITY because a --data-dir is genuinely shareable: the files in it are named by
+    DOMAIN (ids_<dom>_<split>.npy, _ids_path), never by miner, so two miners on one box -- this
+    fleet's 5090 and 4060, say -- can and do point at the same dir. One unkeyed file would have them
+    overwrite each other's cursor and inherit each other's parks, which is worse than no file."""
+    root = base if base is not None else getattr(args, "data_dir", None)
+    if not root or not os.path.isabs(str(root)):
+        # ABSOLUTE ONLY. A relative --data-dir resolves against whatever CWD the process was launched
+        # from, and this state's entire job is to be found again by the NEXT process -- a supervisor
+        # respawn or a self-update re-exec does not promise the same CWD, so a relative path would
+        # scatter half-remembered state around the filesystem instead of persisting anything. The
+        # miner's own default (D:/glm_wan/miner) and the fleet's NEURAHASH_GLM_DATA_DIR are absolute;
+        # anything else disables persistence LOUDLY (see the WARN in _run_async), never silently.
+        return None
+    return os.path.join(root, "claim_state_%s.json"
+                        % hashlib.sha256(str(identity).encode()).hexdigest()[:16])
+
+
+class ClaimState:
+    """The two pieces of claim-walk state that used to die with the process -- the CoordCooldown park
+    table and the walk CURSOR -- in one small JSON file per identity under --data-dir.
+
+    WHY (MEASURED, run 5 -- docs/research/RUN5_CONCENTRATION_2026-07-27.md): the 5090 miner started 28
+    times in 15.7 h, and every start re-claimed the same wallet-hash head (L1,E12) with an EMPTY park
+    table. pick_start_coord is a CONSTANT for a given wallet, so each new process re-walked ground the
+    last one had already covered, re-parked the same 38 coordinates, dropped into repair mode with
+    nothing left to train, and was killed by the supervisor for making no rounds. Net: 25 of 28 cycles
+    trained (L1,E12) and nothing else, and 53 of 60 claimable coordinates were never trained at all.
+
+    NEVER FATAL. Every read and write is best-effort: a missing, truncated, garbage or wrong-schema
+    file is a WARN plus a clean start, and a failed write is a WARN and nothing more. Losing this file
+    costs exactly what we paid before it existed; raising out of it would cost a run."""
+
+    def __init__(self, path, log=print):
+        self.path = path
+        self._log = log or (lambda *_a, **_k: None)
+        self._last_fp = None                          # fingerprint of the last blob we wrote (see save)
+
+    @classmethod
+    def for_args(cls, args, identity, log=print):
+        return cls(_claim_state_path(args, identity), log=log)
+
+    def load(self):
+        """The stored blob, or {} for 'nothing usable here'. Never raises."""
+        if not self.path or not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+            if not isinstance(blob, dict):
+                raise ValueError("top level is %s, not an object" % type(blob).__name__)
+            ver = int(blob.get("schema", 0))
+        except Exception as ex:                          # noqa: BLE001 -- corrupt file != dead miner
+            self._log("[glm-contrib] WARN: claim state %s unreadable (%s) -- starting clean"
+                      % (self.path, str(ex)[:100]))
+            return {}
+        if ver != CLAIM_STATE_SCHEMA:
+            self._log("[glm-contrib] WARN: claim state %s is schema %r, this build writes %d -- "
+                      "starting clean" % (self.path, blob.get("schema"), CLAIM_STATE_SCHEMA))
+            return {}
+        return blob
+
+    def cursor(self, blob=None):
+        """The (L, E) the walk was on when the last process saved, or None. Never raises."""
+        c = (self.load() if blob is None else (blob or {})).get("coord")
+        try:
+            return (int(c[0]), int(c[1]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+
+    def restore_cooldown(self, cooldown, blob=None, event=None, now=None):
+        """Re-park the saved cooldowns into `cooldown`, decayed by the wall time since the save.
+        Returns (restored, dropped)."""
+        b = self.load() if blob is None else (blob or {})
+        try:
+            elapsed = max(0.0, (now or time.time)() - float(b.get("saved_wall")))
+        except (TypeError, ValueError):
+            elapsed = 0.0             # no/garbage stamp -> decay nothing; the deadlines still bound it
+        try:
+            return cooldown.restore(b.get("cooldown"), event=event, elapsed_s=elapsed)
+        except Exception as ex:                          # noqa: BLE001 -- THE choke point, see below
+            # restore() is itself defensive, but this is the ONE call the miner makes before its loop
+            # and it is unguarded there: any escape would be a traceback at boot on a file the dead
+            # process never gets to rewrite -- i.e. a permanent supervisor restart loop over a file
+            # an operator may well have hand-edited to clear a stuck park. Degrade to a clean start.
+            self._log("[glm-contrib] WARN: claim state %s has an unusable cooldown block (%s) -- "
+                      "starting with no parks" % (self.path, str(ex)[:100]))
+            return 0, 0
+
+    def restore_ladder(self, ladder, blob=None):
+        """Re-seat the saved per-layer dose rungs into `ladder`. Returns (restored, dropped).
+
+        WHY THE RUNG IS PERSISTED AT ALL: without it every restart re-inflicts the LARGEST dose on a
+        layer that already rejected it, which is the same shape as the run-5 defect this file exists
+        to fix (28 restarts, each re-walking ground the last process had covered). The 5090 miner
+        restarts often enough that an in-RAM ladder would rarely reach its second rung.
+
+        Same never-fatal contract as restore_cooldown: a missing or unusable block is a clean top
+        rung, never a traceback at boot on a file the dead process cannot rewrite."""
+        b = self.load() if blob is None else (blob or {})
+        try:
+            return ladder.restore(b.get("ladder"))
+        except Exception as ex:                          # noqa: BLE001 -- see restore_cooldown
+            self._log("[glm-contrib] WARN: claim state %s has an unusable dose-ladder block (%s) -- "
+                      "starting every layer at the campaign dose" % (self.path, str(ex)[:100]))
+            return 0, 0
+
+    @staticmethod
+    def _fingerprint(blob):
+        """What actually changed, ignoring the continuously-shrinking `left_s`: a park's deadline is
+        (saved_wall + left_s), which is INVARIANT, so a re-write that only decays left_s stores the
+        same instants. This is what makes 'save on every advance' free in repair mode, where the walk
+        is retried every iteration and normally changes nothing.
+
+        The ladder IS in the fingerprint: a rung change is exactly the kind of state whose whole
+        value is surviving the next restart, so it must never be skipped as 'nothing meaningful'."""
+        cd = (blob.get("cooldown") or {})
+        ld = (blob.get("ladder") or {})
+        return (tuple(blob.get("coord") or ()), cd.get("at_event"),
+                tuple(sorted((p.get("L"), p.get("E"), p.get("until_event"))
+                             for p in (cd.get("parked") or []))),
+                tuple(sorted((r.get("L"), r.get("rung")) for r in (ld.get("layers") or []))))
+
+    def save(self, cooldown, coord, event=None, now=None, ladder=None):
+        """Atomic (tmp + os.replace) whole-file rewrite; True iff bytes landed. Never raises.
+        Skips the write when nothing meaningful changed since our last one (see _fingerprint).
+
+        `ladder` is OPTIONAL and the schema is NOT bumped for it: the key is purely additive, an old
+        file simply has no "ladder" block (-> every layer starts at the campaign dose, today's
+        behaviour) and an older build ignores the key it does not know. Bumping CLAIM_STATE_SCHEMA
+        would discard every live miner's cursor and park table on upgrade -- the exact loss this
+        file was built to prevent."""
+        if not self.path:
+            return False
+        blob = dict(schema=CLAIM_STATE_SCHEMA, saved_wall=float((now or time.time)()),
+                    coord=([int(coord[0]), int(coord[1])] if coord is not None else None),
+                    cooldown=(cooldown.export(event) if cooldown is not None else {}))
+        if ladder is not None:
+            blob["ladder"] = ladder.export()
+        fp = self._fingerprint(blob)
+        if fp == self._last_fp:
+            return False
+        tmp = "%s.tmp.%d" % (self.path, os.getpid())
+        try:
+            d = os.path.dirname(self.path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(blob, fh)
+            os.replace(tmp, self.path)        # same atomic install glm_data_autosync uses; not mmapped
+        except Exception as ex:                          # noqa: BLE001 -- a lost save is not a dead run
+            _rm_quiet(tmp)
+            self._log("[glm-contrib] WARN: could not save claim state %s (%s)" % (self.path, ex))
+            return False
+        self._last_fp = fp
+        return True
+
 
 def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
                    budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None,
@@ -2833,6 +3996,18 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         _CATCHUP_ABORTED, so the caller trains here and does NOT park it.
       * The no-fold stall is armed only once an APPLICABLE record has been seen, and timed from
         there -- "nothing folded" is only a stall when there was something to fold.
+
+    NEVER-BLOCK V0.2 (2026-07-27): the stall clock now measures SCAN PROGRESS, not folds. V0.1's
+    clock was reset only by a successful fold, so a scan walking records at the MEASURED 61-178 ms
+    each (docs/research/STORE_BOTTLENECK_2026-07-27.md sec 2b) tripped `stall` after
+    stall_s/per-record seconds -- 492 records at the 30 s default -- while it was making steady
+    progress. On a 1,345-record list that made the DEFAULT CONFIGURATION arithmetically unable to
+    finish a catch-up, which is the 70 default-knob stall aborts in run 5's log. The clock is now
+    reset ONCE PER RECORD, at the instant that record's processing begins, so the window measures
+    exactly how long ONE record took end to end (fetch + applicability filter + fold): `stall` means
+    what its name says -- no record completed within stall_s, i.e. a wedged link -- and skipping or
+    rolling back any number of records never trips it. Total time is still capped by `budget_s`,
+    unchanged, and the V0.1 arming rule (n_applicable/n_scanned) is unchanged.
     `man`: reuse the caller's manifest instead of reading our own. lane.manifest() is 23.79 s on an
     11,051-object store (memory glm-lane-manifest-throughput-bound) and the live store is at 23,503
     objects, so the second read this function used to do WAS the other half of the 55.9-92.8 s. The
@@ -2843,6 +4018,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
     stall = _catchup_stall_s() if stall_s is None else float(stall_s)
     call_to = _catchup_call_timeout_s() if call_timeout_s is None else float(call_timeout_s)
 
+    campaign = host_campaign_id(host)         # the scope rides the HOST, like every root function
     n_scanned = n_applicable = 0              # records fetched / records that advertise own_coord
 
     def _done(reason, applied, reached, records=None):
@@ -2877,10 +4053,10 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             log("[glm-contrib] resume: manifest unavailable (%r) -- staying on the frozen base"
                 % (e,))
             return _done("manifest-unavailable", 0, False)
-    prefix = ACCEPTED_NAME_FMT % 0
-    prefix = prefix[:prefix.rfind("0")]
-    events = sorted(int(n[len(prefix):]) for n in man
-                    if str(n).startswith(prefix) and str(n)[len(prefix):].isdigit())
+    # CAMPAIGN SCOPE: only THIS campaign's accepted records. A scoped campaign that also scanned the
+    # legacy family would re-import the 1,345 dead-campaign records this scoping exists to exclude
+    # (accepted_prefix). Unscoped host -> the legacy family, byte-identical to before.
+    events = accepted_events_in(man, campaign)
     if not events:
         log("[glm-contrib] resume: no accepted records to replay -- staying on the frozen base")
         return _done("no-records", 0, False)
@@ -2888,7 +4064,9 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             for j in range(len(host.slots))]                     # DEEP copy: read_slot returns VIEWS
     applied = 0
     aborted = None                            # never-block: 'budget' | 'stall' | 'call-timeout'
-    t_loop = last_fold_t = _now()             # the stall clock starts AFTER the manifest, not before
+    # V0.2: the PROGRESS clock (was last_fold_t). Reset by every record that ARRIVES, not only by a
+    # fold -- see the V0.2 note in the docstring. Starts AFTER the manifest, not before.
+    t_loop = last_progress_t = _now()
     coord_want, coord_hit = None, False       # newest advertised root for own_coord + did we reproduce it
     for e in events[:int(max_records)]:
         if _now() - t0 > budget:
@@ -2900,12 +4078,21 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         # On the GLOBAL path there is no per-coordinate filter, so every record IS applicable and the
         # arming signal stays "we have scanned one" -- i.e. V0's rule, unchanged, for own_coord=None.
         armed = (n_applicable > 0) if coord_key is not None else (n_scanned > 0)
-        if stall > 0 and armed and (_now() - last_fold_t) > stall:
+        if stall > 0 and armed and (_now() - last_progress_t) > stall:
             aborted = "stall"
             break
-        entry = man.get(accepted_name(e))
+        entry = man.get(accepted_name(e, campaign))
         if not entry:
             continue
+        # V0.2: the scan is demonstrably ALIVE at this instant, and this is the ONE place the clock
+        # is reset -- once per record, before any work. The check at the top of the next iteration
+        # therefore measures exactly how long the previous record took END TO END (fetch +
+        # applicability filter + fold), whatever the filter and the fold then decided. A scan
+        # advancing at the measured 61-178 ms a record never trips the window however many records
+        # it skips or rolls back; one record that takes longer than stall_s to come back still does.
+        # (V0/V0.1 reset here only on a successful FOLD, so a long run of skipped or rolled-back
+        # records read as one stall -- the defect this replaces.)
+        last_progress_t = _now()
         try:
             rec = lane.get_json(entry["sha256"])
         except CatchupTimeout:
@@ -2926,9 +4113,11 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
                 adv = sr.get(coord_key)
                 if adv is None:
                     continue
-                if n_applicable == 0:
-                    last_fold_t = _now()      # arm the stall window from the FIRST applicable record
-                n_applicable += 1
+                n_applicable += 1             # V0.1's ARMING SIGNAL, unchanged (see `armed` above).
+                                              # V0.1 also reset the clock here; V0.2 does not need
+                                              # to -- the per-record reset above already times from
+                                              # this record, and resetting again would only excuse
+                                              # the first applicable record's own fetch.
         try:
             ok, _reason, _rej = _fold_accepted_checked(host, lane, rec, None, -1, log=None)
         except CatchupTimeout:                                   # a delta fetch INSIDE the fold hung
@@ -2936,8 +4125,8 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             break
         if not ok:
             continue                                             # off-lineage record: already rolled back
-        applied += 1
-        last_fold_t = _now()
+        applied += 1                          # (V0/V0.1 reset the stall clock here; V0.2 resets once
+                                              # per record instead -- see the note above the fetch)
         if coord_key is None:
             if model_root(host) == target:
                 log("[glm-contrib] resume: reached the coordinator's root %s.. after %d record(s) "
@@ -3077,9 +4266,10 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
     against the current base, retry next tick), so the failure SEMANTICS are unchanged."""
     applied_any = False
     skipped_at = None
+    campaign = host_campaign_id(host)      # CAMPAIGN SCOPE: only this campaign's accepted records
     lane = _DeadlineLane(lane, _catchup_call_timeout_s())
-    for e in scan_accepted_events_bounded(man, last_applied, frontier):
-        entry = man.get(accepted_name(e))
+    for e in scan_accepted_events_bounded(man, last_applied, frontier, campaign=campaign):
+        entry = man.get(accepted_name(e, campaign))
         if not entry:
             break                                            # gap: stop -- never fold out of order
         try:
@@ -3256,7 +4446,9 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # LOCAL re-gate closure, IDENTICAL to the sync path: the own-slot delta is re-gated on our own val
     # split (F2 defense-in-depth); cross-domain deltas fold unconditionally on the coordinator's signed
     # accept (own_slot=i scopes the check so a cross-domain accept is not false-positive rejected).
-    regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+    # make_regate_ce is byte-identical to the old inline lambda for a trunk-bearing model; on a
+    # trunk-free base it returns REGATE_UNAVAILABLE (fold-loudly, never silently) instead.
+    regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
     last_applied = 0            # events <= this are folded into our base (event 0 == the fresh base)
     publish_k = 0               # F-Q1: per-miner monotonic publish counter -> a UNIQUE record name every
                                 # publish, so a 2nd H-block against the same base_event never repoints (and
@@ -3284,6 +4476,15 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # The sweep ORDER is per-identity (see next_claim_coord): a shared +1 advance turned a one-off
     # collision between two miners into a permanent one. Same durable identity pick_start_coord used.
     claim_identity = wallet.address if wallet is not None else (miner or "anonymous")
+    # RESTART DURABILITY (run 5): the parks above and the cursor below outlive this process in
+    # <data-dir>/claim_state_<identity>.json, so a restarted miner does not re-walk -- and re-park --
+    # ground the previous one already covered. Restored just below, after the first pointer read.
+    claim_state = ClaimState.for_args(args, claim_identity, log=log)
+    # DOSE-BACKOFF LADDER (flag ON only). `dose_trainer is None` under the flag OFF, and every use
+    # below degrades to today's behaviour on None -- see layer_dose_verdict's docstring. This is the
+    # SAME memoized trainer layer_claim_round uses, so there is one ladder per process, not two.
+    dose_trainer = layer_claim_trainer_for(args, log=log) if layer_claim_enabled() else None
+    dose_ladder = getattr(dose_trainer, "ladder", None)
     log("[glm-contrib %s] shard claim: %d coordinate(s) claimable here, advance_after=%s, order=%s, "
         "walk=%s"
         % (miner, len(claim_coords),
@@ -3312,6 +4513,25 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         _root0 = _dec0.get("model_root") if _dec0 else None
     except Exception:                                            # noqa: BLE001 -- pointer races are normal
         _dec0, _root0 = None, None
+    # RESTART DURABILITY: re-park what the previous process parked, DROPPING whatever has expired.
+    # Placed after the first pointer read so the event half can be scoped to the LIVE event counter --
+    # an absolute "until event 40" restored against a resumed campaign that just republished genesis
+    # at event 0 would park the coordinate for a whole new campaign (see CoordCooldown.restore).
+    if claim_state.path is None:
+        log("[glm-contrib %s] WARN: claim state DISABLED -- --data-dir %r is not an absolute path, so "
+            "cooldowns and the walk cursor cannot survive a restart (measured cost of that: run 5 "
+            "trained 7 of 60 coordinates). Pass an absolute --data-dir to enable it."
+            % (miner, getattr(args, "data_dir", None)))
+    _cd_on, _cd_off = claim_state.restore_cooldown(cooldown, event=(_dec0 or {}).get("event"))
+    if _cd_on or _cd_off:
+        log("[glm-contrib %s] claim state %s: restored %d cooldown park(s), dropped %d expired; "
+            "walk resumes on (L%d,E%d)" % (miner, claim_state.path, _cd_on, _cd_off, L, E))
+    if dose_ladder is not None:
+        _ld_on, _ld_off = claim_state.restore_ladder(dose_ladder)
+        if _ld_on or _ld_off:
+            log("[glm-contrib %s] claim state: restored %d backed-off dose rung(s), dropped %d -- a "
+                "layer that rejected the campaign dose before this restart is NOT dosed at it again"
+                % (miner, _ld_on, _ld_off))
     if _root0 and not global_root_comparable(host, _dec0):
         log("[glm-contrib %s] shard claim: skipping the global-root comparison (coordinator has %d "
             "active coordinate(s), we hold %d) -- per-coordinate roots are authoritative here"
@@ -3331,19 +4551,48 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # internally 6h rate-limited via dotfile, so this is one cheap file-stat on all but ~4
         # checks/day. A verified forward release re-execs us here -- never mid-train.
         _maybe_self_update(log)
+        # -- ONE MANIFEST PER TICK (2026-07-27), fetched FIRST and handed to every consumer below.
+        # This tick used to pull THREE full manifests: one inside lane.read_pointer()
+        # (sharddiloco_harness.ContentLane.read_pointer), one inside the corpus re-sync's
+        # _read_data_record (default ON since 2026-07-25), and one for the catch-up scan. MEASURED:
+        # the manifest is 1,648,050 B and the store's uplink is ~145 KB/s, so that was ~4.95 MB =
+        # ~34 s of exclusive link time per tick PER MINER -- the fleet saturated its own store, and
+        # every 207-byte record GET inside a catch-up queued behind it (61 ms idle -> >=178 ms under
+        # the fleet's own load; docs/research/STORE_BOTTLENECK_2026-07-27.md sec 1 + 2c). One fetch,
+        # three consumers: no protocol change, nothing the coordinator has to know about.
+        # It is also strictly SAFER: the pointer's event frontier and the accepted-record names the
+        # catch-up scans now come from ONE snapshot instead of reads seconds apart.
+        try:
+            man = lane.manifest()
+        except Exception:                                        # noqa: BLE001
+            time.sleep(args.poll)
+            continue
         # -- (0) alpha 3.0 periodic corpus re-sync: a SAFE between-rounds boundary (never mid-train).
         # Flag-gated + zero I/O when the record is unchanged. On a VERIFIED new corpus, reload our ids so
         # the next train step uses the fresh data with NO restart; on an unverifiable one, keep the old.
         if _resync_on:
+            # node_ids hands back MEMMAPS, and the install inside the resync is an os.replace onto
+            # exactly these files -- which on Windows fails with PermissionError while a mapping is
+            # open (see _release_ids). Drop the mappings across this call and re-open right after.
+            # Safe HERE and only here: this is the between-rounds boundary the comment above names,
+            # batches are fancy-indexed COPIES, and no slice view outlives a round. The re-open is
+            # unconditional because we just closed them; it maps a header, it does not read the
+            # corpus, so the unchanged-record path stays effectively zero-I/O.
+            _unmapped = _release_ids(train_ids, val_ids)
             _prev_data_record, _refreshed = glm_data_periodic_resync(
-                lane, args.data_dir, _prev_data_record, log=log)
-            if _refreshed:
+                lane, args.data_dir, _prev_data_record, log=log, man=man)
+            if _refreshed or _unmapped:
+                # `_unmapped` alone still forces the re-open: we just closed those mappings, so the
+                # names must be rebound even when nothing was re-fetched. A caller whose ids are NOT
+                # memmaps (mode=tiny, or ids passed in directly) releases nothing, so it keeps the
+                # original refreshed-only behaviour and never reads a file it was not going to read.
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+            if _refreshed:
+                regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
         try:
-            ptr = lane.read_pointer()
+            ptr = lane.read_pointer(man=man)
         except Exception:                                        # noqa: BLE001
             time.sleep(args.poll)
             continue
@@ -3380,12 +4629,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         #    previous run's accepted records at events THIS run has not reached; folding them poisons our
         #    base -> the future-base-event drop storm measured live 2026-07-24). catch_up_accepted verifies
         #    each fold reproduces the coordinator's advertised root and fail-CLOSES otherwise, holding the
-        #    frontier. Non-blocking: nothing visible -> train against the current base rather than wait. ---
-        try:
-            man = lane.manifest()
-        except Exception:                                        # noqa: BLE001
-            time.sleep(args.poll)
-            continue
+        #    frontier. Non-blocking: nothing visible -> train against the current base rather than wait.
+        #    `man` is the ONE manifest this tick fetched at the top of the loop -- see the note there. ---
         _folded = []
         last_applied, applied_any, _abort = catch_up_accepted(
             host, lane, man, last_applied, dec.get("event"), regate_ce, i, miner, log, folded=_folded)
@@ -3407,9 +4652,28 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 continue                                         # F5a: predates our work -> not a verdict
             if accepted_names_me(_rec, miner):
                 reject_streak = 0
+                # DOSE LADDER: an accepted delta means this layer's dose is landing -> back to the
+                # campaign dose. Persisted only when a rung ACTUALLY reset, so an accepting layer
+                # does not rewrite the state file once per record.
+                if dose_ladder is not None and dose_ladder.rung(L):
+                    layer_dose_verdict(dose_trainer, L, accepted=True, log=log, miner=miner)
+                    claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
             else:
                 reject_streak += 1
-        if advance_after and reject_streak >= advance_after:
+        # -- (1c) DOSE BACKOFF BEFORE ABANDONMENT. A plateau used to mean one thing: release the
+        # coordinate. Measured 2026-07-29, that treats the wrong cause -- layers 1 and 5, which each
+        # IMPROVE full-47 held-out CE alone (-0.095165, -0.054498), together returned -0.002736
+        # against a linear prediction of -0.149663 (1.8% retained). Good layers interfere, the
+        # interference is quadratic in the dose while the gain is linear, so the first response to a
+        # rejection is a SMALLER dose on the same layer; release is the last resort. Flag OFF ->
+        # dose_trainer is None -> layer_dose_verdict returns EXHAUSTED -> the advance below runs
+        # exactly as it does today.
+        _plateau = bool(advance_after and reject_streak >= advance_after)
+        if _plateau and layer_dose_verdict(dose_trainer, L, accepted=False, log=log,
+                                           miner=miner) == DOSE_ACTION_SHRINK:
+            reject_streak = 0                    # same coordinate, smaller dose, fresh streak
+            claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
+        elif _plateau:
             # F5b: the freshly claimed coordinate's local weights are the FROZEN BASE. If anyone
             # already trained it, our base_slot_root can never match the coordinator's and EVERY
             # later contribution is dropped `wrong-lineage-slot-root` forever, silently --
@@ -3442,8 +4706,16 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 # val split -- the same mid-loop reload the corpus-resync path already performs.
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+                regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
                 last_pub_base_event = None       # F5a: nothing of OURS is in flight on this coordinate
+            # ONE save per advance, and this is the cheapest correct point: advance_claim is the ONLY
+            # mutator of BOTH the park table and the cursor, so a write here catches every change --
+            # ~1 small file per plateau, not per round. (blocked() also expires entries, but an
+            # expired entry is dropped at load anyway, so it needs no write of its own.)
+            # `ladder=` on EVERY save, not just the ones that change a rung: save() rewrites the
+            # whole file, so a save without it would silently DROP the ladder block and hand the
+            # next process the campaign dose on a layer that just exhausted the backoff.
+            claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
         elif repair_since is not None:
             # Cooldowns expire on wall clock AND events, so retry the walk every iteration: when
             # every coordinate is parked this costs zero lane calls (advance_claim skips them all
@@ -3457,8 +4729,11 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 repair_since = None
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+                regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
                 last_pub_base_event = None
+            # Free while nothing changes: the fingerprint check in save() skips the identical rewrite
+            # this all-blocked retry path would otherwise perform every iteration.
+            claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
         if repair_since is not None:
             # NO TRAINING while every claimable coordinate is blocked -- see 1.5(b) above. Say why,
             # per coordinate, every 30 s: a silent idle miner and a healthy one look identical.
@@ -3496,6 +4771,17 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rounds_done)
                 train_flops, best_val, steps, tokens = 1.0, float("nan"), 0, 0
                 payload = delta                    # adversarial control stays dense: it has no factors
+            elif layer_claim_enabled():
+                # LAYER CLAIM (task #47, NEURAHASH_SD_LAYER_CLAIMS). Flag OFF -> this elif is never
+                # evaluated true, glm_grad_cache is never imported and the else: below runs exactly
+                # as it does today (the owner's no-regression contract). Flag ON -> train ALL experts
+                # of layer L full-rank from the verified true-gradient cache at the campaign's DRIFT
+                # TARGET, and publish the ACHIEVED drift with the delta.
+                c = layer_claim_round(model, cfg, host, lane, args, L, E, i, miner, log,
+                                      round_index=rounds_done, man=man)
+                delta, train_flops, best_val = c["delta"], c["train_flops"], c["best_val_ce"]
+                steps, tokens = int(c.get("steps_trained", 0)), int(c.get("n_tokens", 0))
+                payload = c["payload"]
             else:
                 c = G.train_glm_expert_contribution(
                     model, cfg, L, E, train_ids, val_ids, H=args.inner, r=args.lora_r, lr=args.lr,
@@ -3534,6 +4820,28 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             log("[glm-contrib %s] BASE-CLAMP: last_applied=%d exceeds pointer frontier event=%s -- clamped "
                 "base_event to the frontier (dead-run leftover folded past the live coordinator?)."
                 % (miner, int(last_applied), dec.get("event")))
+        # LAYER CLAIM (task #47) -- publish 64 per-coordinate records, not one 64-block payload. The
+        # nested payload cannot be packed for the wire at all and matches ZERO keys in the merge; see
+        # publish_layer_claim_records for the measurement. Flag OFF -> layer_claim_enabled() is False
+        # and this line is the whole cost; flag ON with a flat payload (--garbage) -> _lc is None and
+        # the single-record path below runs unchanged.
+        _lc = layer_payload_coords(payload) if layer_claim_enabled() else None
+        if _lc:
+            _n, publish_k, _bytes = publish_layer_claim_records(
+                lane, host, payload, _lc, miner, base_event, root, key, wallet, train_flops, steps,
+                tokens, publish_k, log,
+                address=(wallet.address if wallet is not None else None))
+            rounds_done += 1
+            last_pub_base_event = int(base_event)   # F5a: from here on, events >= this can judge us
+            log("[glm-contrib %s] async round %d: LAYER %d published as %d per-coordinate record(s) "
+                "in %.1fs, base_event=%d delta=%dB base_root=%s.. steps=%d (best_val_ce is nan by "
+                "design: the judge scores the result, not the miner)"
+                % (miner, rounds_done, int(L), _n, time.time() - t_tr, base_event, _bytes,
+                   root[:12], steps))
+            if _n == 0:
+                log("[glm-contrib %s] LAYER %d published NOTHING: no claimed coordinate resolved to a "
+                    "local slot. Nothing will merge this round." % (miner, int(L)))
+            continue
         ecid = lane.put_delta(payload)
         sig = _sign_contrib(key, wallet, ecid, base_event, miner)  # HMAC (keyed) or secp256k1 (keyless); r-number == base_event (W2 reads it so)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
@@ -3769,6 +5077,17 @@ def main(argv=None):
                           train_ids, val_ids, seq, _flush, wallet=wallet,
                           claim_ranked=_claim_ranked)
 
+    if model_is_trunk_free(model):
+        # The sync cadence trains with forward passes (train_glm_expert_contribution) and re-gates
+        # with heldout_ce -- both impossible without the trunk. Refuse HERE, before the first
+        # record moves, instead of crashing on a meta tensor mid-round. build_node_model could not
+        # refuse this one: the cadence is the COORDINATOR's choice, visible only from its pointer.
+        _flush("[glm-contrib %s] FATAL: trunk-free base (%s=1) on a v1 SYNC lane. The sync cadence "
+               "forward-passes the model every step, which a trunk-free base cannot do. Point this "
+               "miner at a v2 (async) layer-claim coordinator, or unset %s."
+               % (miner, TRUNK_FREE_FLAG, TRUNK_FREE_FLAG))
+        return RC_TRUNK_FREE_SYNC
+
     done_last = -1
     applied = -1            # last round whose ACCEPTED record has been replayed locally
     rounds_done = 0
@@ -3797,7 +5116,7 @@ def main(argv=None):
         # Cross-domain deltas (OTHER slots) are folded on the coordinator's signed accept -- our
         # single-domain val cannot judge another node's domain, so re-gating them there false-positive
         # rejected legitimate accepts and self-aborted this replica (own_slot=i scopes the check).
-        regate_ce = (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+        regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=_flush)
         for r in range(applied + 1, rnd):
             rec = fetch_accepted(lane, r, timeout=args.round_wait, poll=args.poll)
             if rec is None:

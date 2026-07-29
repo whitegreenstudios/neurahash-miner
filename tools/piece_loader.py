@@ -278,9 +278,14 @@ def _make_dead_experts(num_experts, hidden_dim, intermediate_dim, act_fn):
     return _DeadExperts()
 
 
+# fused expert params created by step 4 below (raw nn.Parameter names -- no ".weight" suffix).
+# Everything else in named_parameters() is TRUNK. Used by the include_trunk=False meta census.
+_FUSED_EXPERT_PARAM_RE = re.compile(r"\.mlp\.experts\.(gate_up_proj|down_proj)$")
+
+
 # ---------------------------------------------------------------------------------------------- the loader
 def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_dir=None, verbose=False,
-                        strip_mtp=False, trunk_quant=None, quant_block=64):
+                        strip_mtp=False, trunk_quant=None, quant_block=64, include_trunk=True):
     """Build a Glm4MoeLiteForCausalLM that holds ONLY the trunk + the experts in `piece_ids` resident.
 
     Args:
@@ -299,6 +304,23 @@ def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_d
                     experts) for a storage/VRAM cut; the fused routed experts and embed/lm_head/norms stay
                     bf16. See docs/research/TRUNK_SIZE_REDUCTION.md; gate on held-out CE before fleet use.
         quant_block: absmax block size for trunk_quant (default 64).
+        include_trunk: OPT-IN escape hatch (default True = today's behaviour, byte-identical, and
+                    the summary dict gains no new key). False SKIPS the trunk piece entirely: every
+                    trunk param stays on the `meta` device (ZERO bytes of storage -- for
+                    GLM-4.7-Flash that is 4.024 GiB / 659 tensors NOT resident) and
+                    pieces/trunk.safetensors need not even exist on disk. The module TREE is intact
+                    (model.model.layers[L].mlp.experts still resolves, fused expert params are real
+                    and trainable), but any forward pass RAISES on the first meta tensor it touches
+                    -- deliberately loud, because a trunk-free model must never silently pretend it
+                    can compute a held-out CE (the own-slot re-gate). Built for the GradCast
+                    layer-claim dose, which consumes ONLY the fused slabs + act_fn
+                    (glm_grad_cache.inner_step): no router, no attention, no embeddings. The model
+                    is stamped `_nh_trunk_free = True` so callers
+                    (sharddiloco_glm_contributor.make_regate_ce / build_node_model) can refuse or
+                    LOUDLY waive every path that needs a forward. Summary gains
+                    include_trunk/n_trunk_meta/n_nontrunk_meta (n_nontrunk_meta must be 0: a fused
+                    expert param on meta means an incomplete piece, exactly what meta_params_left
+                    means on the default path).
 
     Returns (model, summary_dict). The model is a real, forward-capable partial model:
         * trunk fully resident; rotary buffers real (built on `device`);
@@ -324,11 +346,27 @@ def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_d
     device = torch.device(device)
     t0 = time.time()
 
-    manifest = load_manifest(shard_dir, require_pieces=piece_ids)   # tolerate a partial (fleet) fetch
+    if not include_trunk and trunk_quant:
+        raise ValueError("include_trunk=False with trunk_quant=%r is contradictory: there is no "
+                         "resident trunk to quantize. Pick one (docs/research/TRUNK_SIZE_REDUCTION.md "
+                         "is the trunk-KEPT ladder; include_trunk=False is the trunk-GONE path)."
+                         % (trunk_quant,))
+    if include_trunk:
+        manifest = load_manifest(shard_dir, require_pieces=piece_ids)   # tolerate a partial (fleet) fetch
+    else:
+        # TRUNK-FREE: the 4.02 GiB trunk piece is NOT required on disk (that is the point -- an
+        # 8 GB layer-claim node never even fetches it), but the requested EXPERT pieces still are;
+        # load_manifest(require_files=False) checks none, so they are checked below once pdir exists.
+        manifest = load_manifest(shard_dir, require_pieces=piece_ids, require_files=False)
     cfg = _resolve_config(shard_dir, manifest, config_dir)
     n_layers = cfg.num_hidden_layers
     n_experts = cfg.n_routed_experts
     pdir = os.path.join(manifest["shard_dir"], "pieces")
+    if not include_trunk:
+        for pid in piece_ids:
+            fp = os.path.join(pdir, "experts_%d.safetensors" % int(pid))
+            if not os.path.exists(fp):
+                raise FileNotFoundError("piece file missing: %s" % fp)
 
     # 1) empty skeleton on meta (params only -> ~0 bytes). include_buffers=False keeps buffers real, so the
     #    rotary inv_freq and e_score_correction_bias are computed normally (no meta-forward breakage).
@@ -348,23 +386,31 @@ def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_d
         resident_by_layer.setdefault(L, set()).add(E)
 
     # 3) load the TRUNK piece and assign into the skeleton (assign=True: meta -> real, in place).
-    trunk_sd = {}
-    with safe_open(os.path.join(pdir, "trunk.safetensors"), framework="pt", device=str(device)) as sf:
-        for k in sf.keys():
-            if strip_mtp and _is_dead_mtp_key(k, n_layers):
-                continue                       # opt-in: skip dead MTP tensors the model discards anyway
-            trunk_sd[k] = sf.get_tensor(k)
     trunk_quant_summary = None
-    if trunk_quant:                            # opt-in frozen-trunk storage quantization (Linear weights only)
-        n_q = 0
-        for k in list(trunk_sd):
-            if _is_trunk_quant_key(k) and not _is_dead_mtp_key(k, n_layers):
-                trunk_sd[k] = _quant_dequant(trunk_sd[k], trunk_quant, quant_block)
-                n_q += 1
-        trunk_quant_summary = {"mode": trunk_quant, "block": quant_block, "n_linears": n_q}
-    missing, unexpected = model.load_state_dict(trunk_sd, strict=False, assign=True)
-    # `missing` = the fused expert params (handled next). `unexpected` = layer-<n_layers> (MTP) trunk keys.
-    del trunk_sd
+    if include_trunk:
+        trunk_sd = {}
+        with safe_open(os.path.join(pdir, "trunk.safetensors"), framework="pt", device=str(device)) as sf:
+            for k in sf.keys():
+                if strip_mtp and _is_dead_mtp_key(k, n_layers):
+                    continue                   # opt-in: skip dead MTP tensors the model discards anyway
+                trunk_sd[k] = sf.get_tensor(k)
+        if trunk_quant:                        # opt-in frozen-trunk storage quantization (Linear weights only)
+            n_q = 0
+            for k in list(trunk_sd):
+                if _is_trunk_quant_key(k) and not _is_dead_mtp_key(k, n_layers):
+                    trunk_sd[k] = _quant_dequant(trunk_sd[k], trunk_quant, quant_block)
+                    n_q += 1
+            trunk_quant_summary = {"mode": trunk_quant, "block": quant_block, "n_linears": n_q}
+        missing, unexpected = model.load_state_dict(trunk_sd, strict=False, assign=True)
+        # `missing` = the fused expert params (handled next). `unexpected` = layer-<n_layers> (MTP) trunk keys.
+        del trunk_sd
+    else:
+        # TRUNK-FREE (opt-in): every trunk param stays on `meta` -- zero storage anywhere, and any
+        # forward raises on the first meta tensor. Stamp the model so downstream code can tell a
+        # deliberate trunk-free base from an incomplete load (build_node_model checks the stamp AND
+        # n_nontrunk_meta below; sharddiloco_glm_contributor.make_regate_ce refuses to hand out a
+        # working own-slot re-gate for a stamped model).
+        model._nh_trunk_free = True
 
     # 4) per MoE layer: materialize resident fused params + mask, or drop in a dead placeholder.
     resident_layers, partial_layers, dead_layers = [], [], []
@@ -441,6 +487,14 @@ def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_d
         "trunk_quant": trunk_quant_summary,
         "wall_s": round(time.time() - t0, 2),
     }
+    if not include_trunk:
+        # Trunk params on meta are EXPECTED here; a fused expert param on meta is the same
+        # incomplete-piece failure meta_params_left means on the default path. The three keys are
+        # added ONLY in this branch so the default summary stays byte-identical.
+        fused_meta = [n for n in meta_left if _FUSED_EXPERT_PARAM_RE.search(n)]
+        summary["include_trunk"] = False
+        summary["n_trunk_meta"] = len(meta_left) - len(fused_meta)
+        summary["n_nontrunk_meta"] = len(fused_meta)
     if meta_left:
         summary["meta_param_examples"] = meta_left[:5]
     if verbose:
@@ -459,7 +513,12 @@ def _find_piece_with(open_pieces, key):
 
 def _print_summary(s):
     print("piece_loader summary")
-    print("  pieces loaded      : trunk + experts_%s" % s["pieces"])
+    if s.get("include_trunk") is False:
+        print("  pieces loaded      : experts_%s ONLY -- TRUNK NOT LOADED (trunk-free: %d trunk "
+              "params left on meta, 0 bytes resident; forward passes are impossible by "
+              "construction)" % (s["pieces"], s.get("n_trunk_meta", -1)))
+    else:
+        print("  pieces loaded      : trunk + experts_%s" % s["pieces"])
     print("  device / dtype     : %s / %s" % (s["device"], s["dtype"]))
     print("  MoE layers         : %d (expert slots %d)" % (s["n_moe_layers"], s["n_expert_slots"]))
     print("  resident experts   : %d" % s["n_resident_experts"])

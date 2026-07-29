@@ -212,6 +212,11 @@ def verify(secret_key, sig, cid, base_round, name):
     return hmac.compare_digest(sig, sign(secret_key, cid, base_round, name))
 
 
+class NameNotPublished(LookupError):
+    """A lane was asked for a NAME the manifest does not advertise. Distinct from a transport error
+    so a caller can say WHICH name is missing instead of logging a bare 404."""
+
+
 # ============================================================ ContentLane -- all-outbound HTTP client
 class ContentLane:
     """Client for tools/content_store.py (the live VPS anchor lane). Content is fetched/stored BY
@@ -224,6 +229,7 @@ class ContentLane:
         self.timeout = timeout
         self.retries = retries
         self.backoff = backoff
+        self._inflight = None       # the response currently being read; see close_inflight()
 
     def _request(self, req):
         """One urlopen with retry-on-transient-fault -- the resilience a WAN client needs. A 4xx (e.g.
@@ -232,7 +238,12 @@ class ContentLane:
         for i in range(self.retries):
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return r.read()
+                    self._inflight = r          # published so an ABANDONED caller can close the socket
+                    try:
+                        return r.read()
+                    finally:
+                        if self._inflight is r:
+                            self._inflight = None
             except urllib.error.HTTPError as e:
                 if not (500 <= e.code < 600) or i >= self.retries - 1:
                     raise
@@ -253,6 +264,25 @@ class ContentLane:
 
     def manifest(self):
         return json.loads(self._get("/manifest").decode())
+
+    def close_inflight(self):
+        """BEST-EFFORT: close the response this lane is currently reading, from ANOTHER thread.
+
+        WHY (measured 2026-07-27, docs/research/STORE_BOTTLENECK_2026-07-27.md sec 2c): a catch-up
+        call that blows its deadline is ABANDONED by _DeadlineLane, but its worker keeps draining
+        bytes off a ~1.2 Mbps link -- so every abort makes the congestion that caused it worse (160
+        aborts in one run log). Closing the response here makes the abandoned `r.read()` raise
+        instead of trickling, which frees the socket. Returns True if a response was closed.
+        Never raises: the abandoning thread is on an error path already."""
+        r = self._inflight
+        self._inflight = None
+        if r is None:
+            return False
+        try:
+            r.close()
+            return True
+        except Exception:                                        # noqa: BLE001 -- best effort only
+            return False
 
     def get_blob(self, cid):
         body = self._get("/o/" + cid)
@@ -289,12 +319,48 @@ class ContentLane:
     def get_json(self, cid):
         return json.loads(self.get_blob(cid).decode())
 
+    @staticmethod
+    def name_sha(man, name):
+        """The sha256 published under `name` in a manifest, or None. Names are resolvable ONLY via
+        /manifest -- /o/ is keyed by CID, so GET /o/<name> is a guaranteed 404."""
+        ent = (man or {}).get(name)
+        return ent.get("sha256") if isinstance(ent, dict) else None
+
+    def get_json_named(self, name, man=None):
+        """The JSON object published under a NAME (not a CID).
+
+        `get_json` takes a CID; handing it a name issues GET /o/<name> and 404s every single time.
+        That is exactly how run 6's miners spent the night logging `layer cache record
+        sharddiloco/glm/gradcache/1 unreadable (HTTP Error 404: Not Found)` and training nothing,
+        while the record sat in the store intact under its name (13,091 bytes, verified 2026-07-28).
+        Raises NameNotPublished when the lane advertises no such name, so no caller can mistake
+        "the lane has nothing for me" for "I fetched an empty record".
+
+        `man`: a manifest the caller ALREADY fetched, reused instead of pulling another one -- it is
+        1.65 MB / ~24 s on the live store (see read_pointer)."""
+        if man is None:
+            man = self.manifest()
+        sha = self.name_sha(man, name)
+        if not sha:
+            raise NameNotPublished(
+                "the lane advertises no object named %r (%d names in the manifest); /o/ is keyed by "
+                "CID, so this name can never be fetched as one" % (name, len(man or {})))
+        return self.get_json(sha)
+
     # ---- pointer (canonical-state advertisement) ----
     def publish_pointer(self, rnd, state_cid, done=False):
         return self.put_json_named(POINTER_NAME, dict(round=int(rnd), state_cid=state_cid, done=bool(done)))
 
-    def read_pointer(self):
-        man = self.manifest()
+    def read_pointer(self, man=None):
+        """The canonical-state pointer, or None when the lane advertises none.
+
+        `man`: a manifest the caller ALREADY fetched, reused instead of pulling another one. The
+        manifest is 1.65 MB on the live store and ~99% of its cost is wire time on a ~1.2 Mbps link
+        (MEASURED 2026-07-27, docs/research/STORE_BOTTLENECK_2026-07-27.md sec 1), so a poll loop
+        that calls read_pointer() AND manifest() pays for 3.30 MB per tick to learn one 64-hex sha.
+        `man=None` fetches one, exactly as before -- every existing call site is unchanged."""
+        if man is None:
+            man = self.manifest()
         if POINTER_NAME not in man:
             return None
         return self.get_json(man[POINTER_NAME]["sha256"])

@@ -3823,7 +3823,13 @@ class _MiniLane:
             self._dm.sd_pointer_encode(self.event, rounds, root, False))
 
     # -- ContentLane surface -----------------------------------------------------------------
-    def read_pointer(self):
+    def read_pointer(self, man=None):
+        # `man=` mirrors ContentLane.read_pointer (2026-07-27, one-manifest-per-tick): the async
+        # loop hands us the manifest it already fetched. Resolving from it is what the real client
+        # does, so a fake that ignored it would hide a double fetch instead of proving there is none.
+        if man is not None:
+            entry = man.get(N.GLM_POINTER_NAME)
+            return self.get_json(entry["sha256"]) if entry else None
         return self.get_json(self._names[N.GLM_POINTER_NAME])
 
     def manifest(self):
@@ -4261,7 +4267,16 @@ class TestV0CatchUpBounds:
         assert host.writes == len(host.slots), "fail-closed rollback, unchanged"
 
     def test_the_no_fold_stall_aborts_even_inside_the_wall_budget(self, monkeypatch):
-        """Option B: a replay whose records all fail to fold is not progress, however long we wait."""
+        """Option B: a replay that makes no progress is not progress, however long we wait.
+
+        RECALIBRATED 2026-07-27 (V0.2, resume_to_root docstring): the stall clock is now reset once
+        per RECORD instead of once per successful FOLD, because the fold-only clock aborted scans
+        that were advancing steadily at 61-178 ms a record -- which is what made the default
+        configuration unable to finish a catch-up at all. The window therefore measures how long ONE
+        record takes end to end, so it is calibrated here against the per-record gap this scenario
+        really produces (dead_fold burns 10 s) instead of against cumulative no-fold time. The gate
+        itself is untouched: an unproductive replay still trips `stall`, still folds nothing, and
+        still rolls back fail-closed."""
         clk = _FakeClock()
         monkeypatch.setattr(N, "model_root", lambda h: "ours")
         monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
@@ -4274,8 +4289,8 @@ class TestV0CatchUpBounds:
         lane = _CoordFakeLane({e: {"1_0": "mine%d" % e} for e in range(1, 9)})
         out = {}
         applied, reached = N.resume_to_root(host, lane, "unreachable", lambda *_a: None,
-                                            own_coord=(1, 0), budget_s=1e9, stall_s=25.0,
-                                            now=clk, outcome=out)
+                                            own_coord=(1, 0), budget_s=1e9, stall_s=5.0,
+                                            now=clk, outcome=out)   # 5 s < the 10 s per-record gap
         assert (applied, reached) == (0, False)
         assert out["reason"] == "stall" and out["records"] == 0
 
@@ -4729,21 +4744,31 @@ class TestNothingToFoldIsNotAStall:
         """own_coord=None has NO applicability filter -- every record is a candidate for the global
         root -- so its arming signal must stay "a record was scanned", not "a record was applicable"
         (which never becomes true there). Without this, V0.1 would silently delete the stall bound
-        from the global path."""
+        from the global path.
+
+        RECALIBRATED 2026-07-27 (V0.2): stall_s is measured against the PER-RECORD gap
+        (FOLD_S + GET_JSON_S = 1.06 s here), not against cumulative no-fold time -- see
+        test_the_no_fold_stall_aborts_even_inside_the_wall_budget. The property under test, that
+        own_coord=None still arms on "a record was scanned" and still aborts, is unchanged."""
         clk = _FakeClock()
         monkeypatch.setattr(N, "model_root", lambda h: "ours")
         self._dead_fold(clk, monkeypatch)
         lane = _CostLane({e: {"1_%d" % e: "theirs%d" % e} for e in range(1, 61)}, clk)
         out = {}
         applied, reached = N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target",
-                                            lambda *_a: None, budget_s=180.0, stall_s=30.0,
+                                            lambda *_a: None, budget_s=180.0, stall_s=0.5,
                                             now=clk, outcome=out, man=lane.manifest())
         assert out["reason"] == "stall" and out["aborted"] is True, out
         assert (applied, reached) == (0, False)
 
     def test_applicable_records_that_fail_to_fold_STILL_stall_park_and_walk_on(self, monkeypatch):
         """V0's guarantee, un-regressed: when records DO name our coordinate and none of them folds,
-        that is a real stall -- abort, park for 900 s, advance to the next claimable coordinate."""
+        that is a real stall -- abort, park for 900 s, advance to the next claimable coordinate.
+
+        RECALIBRATED 2026-07-27 (V0.2): stall_s is measured against the PER-RECORD gap
+        (FOLD_S + GET_JSON_S = 1.06 s here), not against cumulative no-fold time -- see
+        test_the_no_fold_stall_aborts_even_inside_the_wall_budget. Everything the test asserts
+        (abort, aborted=True, nothing applied, applicable>0, then park-and-walk-on) is unchanged."""
         clk = _FakeClock()
         monkeypatch.setattr(N, "model_root", lambda h: "ours")
         monkeypatch.setattr(N, "slot_root", lambda h, i: "ours")
@@ -4753,7 +4778,7 @@ class TestNothingToFoldIsNotAStall:
         out = {}
         applied, reached = N.resume_to_root(_CoordFakeHost([self.OURS]), lane, "target",
                                             lambda *_a: None, own_coord=self.OURS, budget_s=180.0,
-                                            stall_s=30.0, now=clk, outcome=out, man=lane.manifest())
+                                            stall_s=0.5, now=clk, outcome=out, man=lane.manifest())
         assert out["reason"] == "stall" and out["aborted"] is True, out
         assert (applied, reached) == (0, False) and out["applicable"] > 0
 
@@ -4832,10 +4857,18 @@ class TestNothingToFoldIsNotAStall:
         assert lane.manifests == 2, "man=None must still read one, exactly as before"
 
     def test_the_async_loop_hands_its_manifest_down_to_the_walk(self):
-        """Wiring: the parameter is worthless if the live call sites do not pass it."""
+        """Wiring: the parameter is worthless if the live call sites do not pass it.
+
+        The `man=man)` check is now scoped to the advance_claim CALLS rather than counted over the
+        whole function (2026-07-27): the one-manifest-per-tick fix gave the same tick's manifest to
+        read_pointer and to the corpus re-sync as well, so a global count of the literal measures
+        how many consumers exist, not whether the walk is wired. Same property, no false alarm."""
         import inspect
+        import re
         src = inspect.getsource(N._run_async)
-        assert src.count("advance_claim(host, lane, claim_coords") == 2
-        assert src.count("man=man)") == 2, "both advance_claim call sites must pass the manifest"
+        calls = re.findall(r"advance_claim\(host, lane, claim_coords.*?\)\n", src, re.S)
+        assert len(calls) == 2, calls
+        assert all("man=man)" in c for c in calls), \
+            "both advance_claim call sites must pass the manifest"
         walk = inspect.getsource(N.advance_claim)
         assert "man=man)" in walk, "advance_claim must hand it to resume_to_root"

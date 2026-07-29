@@ -164,10 +164,17 @@ therefore not yet safe, and the pool will not pretend otherwise. We promised to 
 the first candidate fix either way — here it is: **it failed.** Making everyone take smaller steps
 (a shared "drift budget") did not shrink the interference — cutting the dose 3× left it essentially
 unchanged, and a pair of two correctly-dosed *improving* layers was the worst combination measured.
-The tax comes from *combining separately-trained trajectories*, not from step size. The two designs
-now on the table: **sequential** (one layer's work is folded in, fresh caches are cut, then the
-next) and the **fleet-hosted pipeline** (miners chained per layer segment — nothing to combine at
-all). *Status: open — this is the honest reason the next campaign has not launched.*
+The tax comes from *combining separately-trained trajectories*, not from step size. Both remaining
+designs were then put to the test, and we publish the result either way: **sequential failed too.**
+Folding one layer's finished gain and then training the next layer against the *updated* model — a
+clean, pre-registered experiment with every check bit-exact — made the model dramatically worse,
+not better: one layer's fold had effectively *replaced* the next layer's training signal. So
+combining separately-trained layer updates does not work at this step size in any ordering, and the
+pool will not launch a campaign pretending it does. **The road forward is the fleet-hosted
+pipeline** — miners chained per layer segment, one live model, nothing to combine at all — whose
+forward pass is already proven bit-exact across real mixed cards. *Status: open — this is the
+honest reason the next campaign has not launched, and the pipeline's backward pass is now the build
+target.*
 
 **A finding worth knowing as a miner (2026-07-29 evening):** "good layer" and "bad layer" are not
 fixed labels. The layer that *damaged* the model at full dose became the **best contributor

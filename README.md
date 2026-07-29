@@ -118,6 +118,118 @@ stays, its granularity or inputs change. **Historical** = kept as the record, no
 
 ---
 
+## Glossary — every name we use, in plain English (2026-07-29)
+
+Every term this project uses, what it means for **you as a miner**, and its honest status. Nothing
+here is marketing: where something is unproven or measured negative, it says so.
+
+### The method your GPU will run
+
+**GradCast** — the training method for the next campaign, named 2026-07-29. In one line:
+**shardDiLoCo splits the model; GradCast splits the gradient.** The coordinator runs *one* full
+backward pass over the frozen model and harvests it into per-layer "gradient caches". You download
+the cache for the layer you claimed and train that whole layer directly from it — **your card never
+runs a forward pass, never holds the 4 GB trunk, and never sees the other 46 layers.** The expensive
+computation happens once and is shared by every miner who asks. *Status: proven for a single layer
+(the real model measurably improved, with no loss on a capability benchmark); NOT yet proven with
+many layers training at once — see "the interference tax".*
+
+**Multi-tap harvest** — how one backward pass yields caches for many layers at once, bit-identical
+to doing each alone (zero rounding difference). This is what makes the economics work: one
+expensive pass serves many miners instead of one. *Status: proven.*
+
+**Drift dosing** — you are never told "use this learning rate". You are told **how far you may move
+the model** (a drift target), and your miner finds its own setting to land exactly there; naming a
+raw learning rate is refused outright. Why: the safe window is razor-thin and differs per card —
+6.9% too hot means 10× the intended movement, 14.4% means a blow-up. A drift target is
+hardware-independent, so a 4060's work and a 5090's work are genuinely comparable — which is what
+makes the reward fair. *Status: proven.*
+
+**Dose ladder** — what happens when your work is rejected. Your miner retries the **same** layer at
+one-third of the dose, then one-tenth, and only gives the layer up after the smallest dose also
+fails (the layer then cools down locally and your miner claims another). Why not just drop the
+layer? Because we measured that even *good* layers spoil each other in company — smaller steps, not
+different layers, is the fix. *Status: built 2026-07-29, shipping with the next release.*
+
+**Product judge** — the accept gate that decides whether your delta gets paid. It scores your work
+against the **real model** (24 resident layers), not a small stand-in. It exists because the old
+gate was caught **paying for damage**: its stand-in said "better" while the actual model got worse
+on a real benchmark. *Status: proven on the real model; a damaging delta is rejected, a zero delta
+scores exactly 0.*
+
+**The interference tax** — the project's current #1 open problem, measured 2026-07-29: two layers
+that each *individually improve* the model kept only **1.8%** of their combined promise when
+applied together, and three at once actively damaged it. Training many layers in parallel is
+therefore not yet safe, and the pool will not pretend otherwise. The candidate fix (everyone takes
+proportionally smaller steps as more miners join — a shared "drift budget") is being tested now.
+*Status: open — this is the honest reason the next campaign has not launched.*
+
+### The transport and the pool
+
+**shardDiLoCo** — the lane your miner already runs: *DiLoCo* (train locally, sync rarely — the
+network carries almost nothing) fused with *expert sharding* (you hold only your slice of the
+model). All-outbound: no inbound ports, no router setup, works behind any home NAT. *Status: proven
+over real WAN; deltas compressed 67.7× on the wire.*
+
+**shardDiLoCo truly decoupled** — each claimed slot advances on its own clock, so a slow miner
+never stalls a fast one. *Status: proven; matters even more under GradCast, where cache production
+and training are naturally out of step.*
+
+**Shard Claim** — how work is assigned without anyone assigning it: your miner *claims* a
+coordinate, works it, and *advances* to another when progress stalls; recently-failed coordinates
+cool down locally before being retried. Claims are unlimited — the pool never turns a miner away.
+*Status: proven; at the next campaign a claim simply becomes one layer instead of one expert.*
+
+**Trustless coordinator** — the coordinator is a replaceable role, not a trusted party: a staked
+M-of-N validator quorum is the settlement trust root and can veto a bad accept. *Status: proven
+over real WAN, including a 3-machine agreed failover.*
+
+**Fleet-hosted pipeline** — the endgame architecture: one model held by many miners *in a chain*,
+each holding a segment of layers and passing activations to the next. The forward pass is already
+bit-exact across miners. *Status: forward proven; training through the chain is future work. This
+is the one design with no cache to download and no card left waiting.*
+
+### Safety and everyday operation
+
+**VRAM cap guard** — a hard ceiling on how much GPU memory the miner may take, applied before the
+model loads, so mining never starves your desktop. *Status: proven — and structural; every
+measurement we publish runs under it.*
+
+**`NEURAHASH_CAPACITY_AWARE`** — the miner sizes work to your card, and at the next campaign it
+also picks your **role**: big cards (~20 GB) produce gradient caches, small cards (~5 GB) train
+layers from them. That tiering is exactly how an 8 GB card participates as a first-class miner.
+*Status: current, gaining the role job.*
+
+**Zero-config default** — download, run, mine: no environment variables, no flags. *Status:
+current; a few gaps still being closed.*
+
+**Self-update test** — releases are signed against a pinned key and every miner verifies the
+signature before applying. *Known gap, disclosed 2026-07-28: on a hand-modified clone an update
+silently does nothing while the miner still looks healthy. Keep your clone clean until the
+loud-failure fix ships.*
+
+**Auto-resume path** — a recoverable error (like an out-of-memory) no longer kills the miner: it
+self-heals and rejoins, and your claim state (cooldowns, walk position) survives a restart.
+*Status: proven.*
+
+### Data
+
+**Corpus automation / daily corpus extraction + auto-update** — one subsystem, two names: every
+day the training corpus is extracted, published, and every running miner picks it up **without a
+restart**. *Status: proven live, including a mid-run re-publish absorbed at a round boundary; it
+carried the corpus to 2.01 B tokens.*
+
+### Measured negatives — kept on purpose
+
+**DMoE capacity experiment** — tested whether adding dynamic expert capacity buys general
+capability. It wins on recall/storage but never moved the general-capability plateau. *Status:
+retired as a measured negative; recorded so nobody re-spends the GPU hours.*
+
+**G1 real test** — RLVR (reinforcement learning from verifiable rewards) post-training on real
+models. *Status: deferred, not dropped — re-sequenced behind the gate redesign.*
+
+---
+
 ## One lane: GLM shardDiLoCo (deprecation notice, 2026-07-24)
 
 This repo now ships **exactly one way to contribute**: the GLM shardDiLoCo lane — your GPU trains

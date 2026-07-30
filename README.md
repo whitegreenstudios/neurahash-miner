@@ -133,6 +133,81 @@ cannot exist there by construction.
 One honest sentence on ambition: no published project has trained a model this size over
 residential internet connections. There is no recipe to copy — and no incumbent to catch.
 
+### The first LONG two-machine run -- 50 steps, and what it means for your disk (2026-07-30, night)
+
+Gate 1 passed on 3 steps. Later the same day the same setup ran **50 optimizer steps** of the real
+model across the two machines (RTX 4060 = front: embeddings + the dense layer, held under a **6.0 of
+8.0 GiB** VRAM cap; RTX 5090 = the 64-expert MoE layer + the driver). **Training loss fell 15.993 ->
+8.446.** A single-machine reference arm on the identical batches finished at **8.347**.
+
+**The scope, before anything else:** this is **2 layers of 47**, bf16, plain SGD at **learning rate
+1e-2 with no gradient clipping**, **128 tokens per step**, and the number quoted is **training loss
+on that 2-layer slice -- not held-out cross-entropy, and not a capability benchmark.** It is a
+transport-and-optimizer proof, not a "the model got smarter" claim. The double gate at the bottom of
+the ladder above is still the one that decides that.
+
+**The result that matters to you: your card does not have to agree with anyone else's.** We measured
+how far the two machines' weights drift apart from the single-machine reference, step by step:
+
+| step | front stage | MoE stage |
+|---|---|---|
+| 1 | 6.188e-04 | 7.042e-03 |
+| 2 | 6.803e-03 | 7.042e-03 |
+| 3 | 2.724e-02 | 1.961e-02 |
+| 5 | 6.863e-01 | 1.462e-01 |
+| 10 / 20 / 35 / 50 | 0.674 / 0.668 / 0.651 / 0.651 | 0.143 / 0.143 / 0.143 / 0.143 |
+
+Three things follow, all measured:
+1. **A 1-in-1000 agreement bar is already broken after ONE step.** So a coordinator can never check
+   your work by re-running your steps and comparing weights -- which is exactly why this pool pays on
+   **measured outcomes** (the judge) and never on bit-matching. Your card's quirks cannot
+   false-reject you.
+2. **The drift stops growing.** It **saturates** instead of exploding -- bounded, not chaotic -- and
+   the plateau sits at the bf16 rounding floor. The MoE stage's worst absolute difference is
+   **bit-identical (2.891e-01) at steps 10, 20, 35 and 50**.
+3. **Even at ~65% divergence on the worst tensor, both arms are functionally the same model**
+   (**8.446 vs 8.347 -- 1.2% apart**). Mismatched consumer GPUs training one model together is not a
+   compromise we tolerate; it is measured to work.
+
+**About the "30 GB" number, because it would scare the wrong people.** A 21-step run did write
+**30.4 GB** and fill a disk -- that was the **coordinator's** content store on our own box, caused by
+a **measurement-only** setting that ships every stage's full weights each step so we could compute
+the table above. **It was never miner disk.** During the whole run the 4060 acting as a miner had
+about **2.6 GB free** on its system drive and wrote **nothing per step**. **Your disk requirement is
+fixed** -- your segment (**4.02 GiB trunk + 1.125 GiB per resident layer**) plus optimizer state -- and
+does **not grow with how long the run lasts**. Two fixes are filed off the back of it: production
+lanes never ship per-step weights, and pipeline traffic becomes ephemeral in the store with
+disk-full failing **loudly** instead of quietly dropping your connection.
+
+**Also measured, and useful to know:**
+- **The GPU was bored, not busy.** Single-machine throughput went **128 tokens/step -> 55 tokens/s
+  at 2.31 s/step; 512 -> 249 tokens/s at 2.06 s/step; 2048 -> 1054 tokens/s at 1.943 s/step**.
+  Sixteen times the work per step made each step **faster** -- the card was idling at **2-3%
+  utilisation**. The per-step handshake was shipping **1.44 GB/step against ~2 MiB/step of useful
+  traffic (99.85% overhead)**; capping it cut about **30% of per-step wall time (6.0 -> 4.2
+  s/step)**. Expect throughput work, not new science, to be the next visible win.
+- **bf16 alone is now a correctness problem, not just a speed choice.** At the weight sizes seen
+  here (**|w| 1.1 to 3.5**) one bf16 step of precision is **3.9e-03 to 7.8e-03**, while actual
+  per-step updates measured **0.5 to 1** of those -- so most updates are smaller than half a rounding
+  step and **round away to nothing**. Keeping full-precision master weights moves from "nice
+  optimisation" to "required for long runs".
+- **One spike, and what it cost.** At step 4 the loss jumped **11.716 -> 35.495** (a single weight
+  moved **3.303**, about **845** rounding steps), recovered by step 6, and descended cleanly
+  afterwards -- but the drift plateau was set **exactly across that one step** (**2.724e-02 ->
+  6.863e-01**). Per-stage gradient clipping now exists, **default OFF**, and whether it collapses
+  the plateau is under test.
+- **Restart-reproducible.** The two-machine arm was restarted three times that day and reproduced
+  its losses **bit-identically** every time (steps 13/14/15 = **9.285496 / 10.463924 / 9.246750**).
+
+**What it does and does not say about the full model.** All 47 layers need about **57 GiB of weights
+against 29 GiB of usable VRAM** on these two cards -- so the full model needs **layer streaming or
+roughly 10 cards**, which is a provisioning problem, not a physics one. Pipeline parallelism is what
+makes the model **fit** across small cards; **data-parallel replicas with DiLoCo-style averaging**
+are what make training **faster** as more of you join. And to be unambiguous, since older sections
+below are kept as history and some predate this: **adding up separately-trained per-layer updates
+stays refuted at every step size we tested.** Those sections remain the record of what we tried, not
+a description of where the project is going.
+
 ---
 
 ## Which sections below are still current? (status guide, 2026-07-28)

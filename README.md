@@ -116,6 +116,13 @@ cannot exist there by construction.
    single-machine answer to within one floating-point ULP. The tiny residual was traced to the two
    machines' different math libraries — measured proof of why this pool verifies* **outcomes**
    *rather than demanding bit-identical computation from heterogeneous hardware.*
+   ***GATE 1 PASSED later the same day: the real model trained across two real machines.*** *Three
+   optimizer steps of the actual 62 GB-class GLM (a 2-layer span — the honest current scope),
+   split across an RTX 4060 (front) and an RTX 5090 (MoE layer + head), real corpus tokens, loss
+   falling 16.07 → 13.29 → 12.14, and after one step the two-machine answer differed from the
+   single-machine answer by exactly one bf16 bit. Also measured: the drift between different GPUs
+   compounds step over step — which is why the design re-syncs weights periodically and pays on
+   measured outcomes, never on bit-matching. Useful traffic: ~2 MiB per training step.*
 2. Activation compression to the measured requirement (~19–37× on a 1.2 Mbps uplink; published
    systems measure 100×, and our wire is currently uncompressed — the headroom is real).
 3. A chain that survives a miner leaving mid-run.

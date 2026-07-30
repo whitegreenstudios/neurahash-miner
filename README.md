@@ -176,6 +176,12 @@ forward pass is already proven bit-exact across real mixed cards. *Status: open 
 honest reason the next campaign has not launched, and the pipeline's backward pass is now the build
 target.*
 
+*Status update (2026-07-30): the small-dose escape hatch was tested too — pre-registered, every
+check bit-exact — and it failed **harder**: at one tenth the step size, stacking two
+individually-good layer updates did more damage than at full size, while each update alone still
+helps. Combining separately-trained updates is now refuted at every step size we measured, in
+every order. The pipeline's backward pass is the build target, and that build is underway.*
+
 **A finding worth knowing as a miner (2026-07-29 evening):** "good layer" and "bad layer" are not
 fixed labels. The layer that *damaged* the model at full dose became the **best contributor
 measured** at a tenth of the dose, and the best full-dose layer *damaged* at a third. This is

@@ -91,6 +91,36 @@ measured one case where cross-entropy and capability disagreed, **the new traine
 until that benchmark confirms it.** We will publish the number either way, including if it kills
 the approach.
 
+### Where the science stands, and what remains (updated 2026-07-30)
+
+Promised: publish either way. Here is the full ledger.
+
+**Proven, with numbers:** a single miner-style contribution measurably improves the real 62 GB
+model at three different step sizes, with **zero loss on a capability benchmark** — useful work
+exists, is measurable, and is what gets paid. The judge rejects the damage class the old gate
+paid for. The signed release chain is field-proven on real fleet hardware. An 8 GB card trains
+as a first-class participant (measured, not claimed).
+
+**Refuted, pre-registered, published here as promised:** combining *separately-trained* updates —
+at every step size, in every order. A literature survey confirmed no published system anywhere
+composes different parts of one model by summing; the field routes or stacks instead. Our next
+architecture (the fleet-hosted pipeline: one live model chained across miners, everyone
+contributing to the *same* training trajectory) has nothing to combine, so this failure mode
+cannot exist there by construction.
+
+**The remaining proof ladder, in order — each a measurable public gate:**
+1. One real training step of the big model across two real machines (the pipeline's backward pass
+   was built and independently verified bit-exact this week; the live two-box step is next).
+2. Activation compression to the measured requirement (~19–37× on a 1.2 Mbps uplink; published
+   systems measure 100×, and our wire is currently uncompressed — the headroom is real).
+3. A chain that survives a miner leaving mid-run.
+4. **The gate that matters:** a multi-step fleet training run where the full model's held-out
+   score improves *and* the capability benchmark does not drop — the same double gate the
+   single-contribution result already passed, now through the fleet.
+
+One honest sentence on ambition: no published project has trained a model this size over
+residential internet connections. There is no recipe to copy — and no incumbent to catch.
+
 ---
 
 ## Which sections below are still current? (status guide, 2026-07-28)

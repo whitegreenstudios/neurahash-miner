@@ -111,6 +111,11 @@ cannot exist there by construction.
 **The remaining proof ladder, in order — each a measurable public gate:**
 1. One real training step of the big model across two real machines (the pipeline's backward pass
    was built and independently verified bit-exact this week; the live two-box step is next).
+   *First milestone landed 2026-07-30: a training step crossed between two real machines for the
+   first time — small model, one step, total wire payload 2,500 bytes, and the result matched the
+   single-machine answer to within one floating-point ULP. The tiny residual was traced to the two
+   machines' different math libraries — measured proof of why this pool verifies* **outcomes**
+   *rather than demanding bit-identical computation from heterogeneous hardware.*
 2. Activation compression to the measured requirement (~19–37× on a 1.2 Mbps uplink; published
    systems measure 100×, and our wire is currently uncompressed — the headroom is real).
 3. A chain that survives a miner leaving mid-run.

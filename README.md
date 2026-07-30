@@ -528,6 +528,16 @@ What is in the box:
   and cache names now resolve through the store manifest (the defect that made a miner silently
   train nothing).
 
+**Field-proven on real hardware (2026-07-30).** This release's signed update chain was exercised
+end-to-end on a real fleet miner (an RTX 4060 box): the signature verified against the pinned key,
+the update applied, the resulting checkout matched the signed commit exactly, and the release's own
+test suite ran green on that machine (96 passed). We also reproduced the disclosed dirty-clone gap
+live, and learned it is slightly *worse* than documented: the blocker can be an **untracked** local
+file that the new release starts tracking — a case reverting your edits does not fix. Practical
+guidance stands, sharpened: **keep your clone fully clean (no extra files in `tools/`), or delete
+the offending file the updater names.** A louder failure mode and an untruncated error message are
+queued for the next release.
+
 ## Alpha 3.4.0 (2026-07-25) — Shard Claim: pick an expert, finish it, move to the next
 
 Until this release the miner needed `--slot <n>`: a **positional index** into a list of experts the

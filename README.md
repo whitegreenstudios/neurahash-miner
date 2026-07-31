@@ -322,6 +322,33 @@ We are publishing this before we know the answer, including the part where we ma
 something wrong this morning. If the measurement says "cancelling" after all, we will say so and the
 fix becomes a different one.
 
+> **✅ THE MEASUREMENT CAME BACK: everyone IS learning the same thing.** We scored every piece
+> sentence by sentence. Result: **all of the improvement lives in about 10% of the test sentences,
+> and two different miners improve those same sentences by almost exactly the same amounts** —
+> correlation **0.9987**. The bottom half of the test set moves by nothing at all. The merged result
+> sits 6× closer to "the best single piece" than to "both pieces added up". So it is redundancy, not
+> cancelling, and the "pieces interfere" wording earlier on this page is retracted.
+>
+> **We were also wrong about the reason, and that one is on us.** We guessed the cause was our test
+> set being ~78% academic abstracts, funnelling everyone toward the same subject. The data says no:
+> the sentences that improve are **not** concentrated by subject (z = 1.35 against our own
+> significance bar of 2). So the concentration is real, but it is not about topic. The likeliest
+> explanation is plainer — at this point in training there is **one big available improvement**, and
+> every miner's maths finds it.
+>
+> **This is not a NeuraHash defect, and that matters for trusting the number.** Published research
+> measures the same ceiling. The closest study to our setup merged **58–72** independently trained
+> models and beat the best single one by **0.22%** and **0.65%**; a 2026 study across many models
+> found gains "generally less than 1%"; and a fitted curve puts **85% of everything you can gain at
+> just 5 contributors.** Our result is the field's own number. Blunt version: "merging the two best
+> gives what one gives" is a known effect with a known name — the merge is *rejecting* the second
+> contributor because it has nothing new to add.
+>
+> **So what actually helps?** Where merging genuinely works in the research, it works by keeping
+> **several different skills alive at once** — which points at giving different miners different
+> material rather than a cleverer merge formula. That experiment is built and gated, and we will
+> publish it either way.
+
 ### Two machines really did train together over the internet (2026-07-31)
 
 Separately from the above, and good news: an RTX 5090 and an RTX 4060 trained one model **across the

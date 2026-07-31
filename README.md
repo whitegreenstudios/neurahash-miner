@@ -235,6 +235,35 @@ The useful part is *where* it breaks:
 our version of Bitcoin's difficulty: it sets how many miners can be paid for the same layer in the
 same round. It is roughly **8 — not 64, and not 10,000.**
 
+> **⚠️ CORRECTED the same day (2026-07-31): the real number is about 1–2, not 8.** We are leaving the
+> table above in place because we said it publicly and you deserve to see what changed. Here is the
+> mistake. In that first test we picked the 8 pieces by **how much traffic** they get, and it turned
+> out only **one** of those 8 was actually a piece that helps. So "8 pieces keeps 100%" really meant
+> *"one good piece survived being mixed with seven that do nothing"* — not "eight pieces combine
+> well". When we redid it using the 8 pieces that **actually improve the model**, it looks like this:
+>
+> | pieces merged (the good ones) | result |
+> |---|---|
+> | 1 (best piece alone) | −0.133 |
+> | **2** | **−0.134 — the best result we got** |
+> | 4 | −0.112 |
+> | 8 | −0.088 |
+> | 20 | −0.089 |
+>
+> **Merging more good pieces makes the model worse, not better.** Two is the sweet spot, and two is
+> barely better than one. The honest summary: **a layer only absorbs about one good piece's worth of
+> improvement per round, no matter how many miners work on it.**
+>
+> **What this means for you, plainly.** It does *not* reduce who can mine — slots stay unlimited and
+> anyone may join. It means the pool works like Bitcoin more literally than we first described:
+> **most submitted work will not make it into the model**, exactly as most Bitcoin hashes never
+> become a block. You get paid in **shares** for work we can verify you did, and the piece that
+> actually lands each round earns the bonus. We would rather tell you that now than design a reward
+> system on a number we already know is wrong.
+>
+> Still to come: we are re-checking this on the full 47-layer model (the numbers above come from our
+> fast 24-layer judge). We will publish that result whichever way it goes.
+
 **What this means for you.** We are not going to pretend a round can pay unlimited winners when the
 measurement says otherwise. Expect work to be organised as **small coalitions** — a handful of miners
 finishing one layer together and sharing what that layer actually gained — rather than thousands of

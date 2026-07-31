@@ -263,6 +263,27 @@ same round. It is roughly **8 — not 64, and not 10,000.**
 >
 > Still to come: we are re-checking this on the full 47-layer model (the numbers above come from our
 > fast 24-layer judge). We will publish that result whichever way it goes.
+>
+> **✅ CONFIRMED on the full 47-layer model, later the same day.** It went the way the correction
+> said, and it is sharper on the real model than on the fast judge:
+>
+> | on the real model | held-out score | vs untrained |
+> |---|---|---|
+> | the model as-is | 4.816991 | — |
+> | **all 64 pieces of the layer** | 4.721827 | **−0.095165** |
+> | **the single best piece alone** | 4.722758 | **−0.094233** |
+> | the two best pieces merged | 4.722549 | −0.094442 |
+>
+> **One piece delivers 99.0% of what the whole layer delivers.** The other 63 pieces are worth one
+> percentage point between them. So a layer really does contain **about one payable unit per round** —
+> which, to be fair to the original idea, is exactly Bitcoin's shape: one block, one winner, and the
+> rest of the work paid in shares.
+>
+> Two other things worth stating because they make the numbers trustworthy. The untrained baseline
+> reproduced its published value to **0.0000003**, so this is the real product model and not a proxy.
+> And our fast 24-layer judge predicted the merge ratio as 0.509 where the real model gives 0.5047 —
+> agreement to **0.85%** — so the cheap check we use day to day is honest, which means we can keep
+> testing quickly and only spend the slow one on the results that matter.
 
 **What this means for you.** We are not going to pretend a round can pay unlimited winners when the
 measurement says otherwise. Expect work to be organised as **small coalitions** — a handful of miners

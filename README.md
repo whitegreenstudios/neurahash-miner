@@ -208,6 +208,45 @@ below are kept as history and some predate this: **adding up separately-trained 
 stays refuted at every step size we tested.** Those sections remain the record of what we tried, not
 a description of where the project is going.
 
+### How many miners can win at once? We measured it: about 8 per layer (2026-07-31)
+
+A fair question if you are thinking of joining: **Bitcoin hands every miner a lottery ticket — can
+NeuraHash pay 10,000 of us at once?** We tested it properly, and the answer has two halves.
+
+**Half one: yes, your single piece can genuinely improve the model.** We took one layer, split it into
+its 60 expert pieces, and scored each piece **on its own** against a frozen held-out set your miner
+never sees. **20 of the 60 pieces made the model measurably better.** The best single piece improved
+it by **0.133** — and that one piece was worth *more than all 60 pieces combined*. So "one miner, one
+piece, real progress" is not marketing here; it is measured.
+
+**Half two: those improvements do not simply add up.** Merge all 60 and you keep **−0.088** out of a
+possible **−0.636** — about **14%**. The other 86% is lost in the merge, because pieces trained
+separately interfere with one another.
+
+The useful part is *where* it breaks:
+
+| pieces merged | how much of the improvement survives |
+|---|---|
+| 8 | **100%** (all of it) |
+| 16 | 11% |
+| 60 | 14% |
+
+**Up to about 8 pieces, merging is essentially free.** Past that it falls off a cliff. That number is
+our version of Bitcoin's difficulty: it sets how many miners can be paid for the same layer in the
+same round. It is roughly **8 — not 64, and not 10,000.**
+
+**What this means for you.** We are not going to pretend a round can pay unlimited winners when the
+measurement says otherwise. Expect work to be organised as **small coalitions** — a handful of miners
+finishing one layer together and sharing what that layer actually gained — rather than thousands of
+miners merging into the same model and quietly cancelling each other out. To be clear about the thing
+people ask next: **slots stay unlimited and anyone may join.** What this bounds is how many pieces
+merge *per round*, not how many people can mine.
+
+**What we have not proven.** One layer, one step size, scored on our fast 24-layer judge — which we
+checked inside the same run against the full 47-layer model and found pointing the same direction at
+93% of the size. We have **not** yet tried merging *only* the 20 pieces that improved; that could push
+the number up, and it is the next test. We will publish it either way.
+
 ---
 
 ## Which sections below are still current? (status guide, 2026-07-28)

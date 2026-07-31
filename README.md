@@ -285,6 +285,59 @@ same round. It is roughly **8 — not 64, and not 10,000.**
 > agreement to **0.85%** — so the cheap check we use day to day is honest, which means we can keep
 > testing quickly and only spend the slow one on the results that matter.
 
+### Why the pieces don't add up — we may have blamed the wrong thing (2026-07-31, evening)
+
+We told you above that pieces "interfere" — that miners' work cancels out. **Looking harder at the
+same numbers, we think that may be wrong, and the real answer is more hopeful.**
+
+Merging the two best pieces gave **−0.094442**, which is slightly *better* than the best piece alone
+(**−0.094233**), and all 64 together is better still. If the pieces were genuinely fighting each
+other, merging would come out **worse** than the best single piece. It doesn't. It comes out at the
+best single piece **plus 0.2%**.
+
+That points at something different, and simpler: **every miner is learning the same thing.** Not
+cancelling each other — just all finding the same one improvement, over and over.
+
+**Why that would be our fault, not yours.** Right now every miner trains on the same corpus and is
+graded against the same held-out test, which is about **78% arXiv abstracts**. Same reading material,
+same exam. Of course everyone arrives at the same answer.
+
+**Why this is the better problem to have.** "Miners cancel each other" would be a deep architectural
+flaw. "Miners are all given the same homework" is a fixable assignment problem — and we already know
+the fix is available, because we previously measured that **different kinds of text genuinely route
+to different experts** inside the model (0.148 overlap across subject areas vs 0.678 within). The
+machinery to give different miners different work exists; we simply haven't been using it.
+
+**What we're doing about it, right now:**
+1. A measurement that settles it properly — scoring each piece sentence by sentence to see whether
+   two miners improve the *same* sentences (everyone learning the same thing) or *different* ones
+   (genuinely cancelling). We wrote down the rule for deciding before running it.
+2. Building the fix on the assumption it's the first: split the training material into distinct
+   subject areas and give different miners different slices, with each expert assigned by what the
+   model's router actually sends it — not by a hash of your wallet.
+3. Likely also needed: **different exams, not just different homework.** If everyone is still graded
+   on the same arXiv test, they may converge on the same answer no matter what they trained on.
+
+We are publishing this before we know the answer, including the part where we may have told you
+something wrong this morning. If the measurement says "cancelling" after all, we will say so and the
+fix becomes a different one.
+
+### Two machines really did train together over the internet (2026-07-31)
+
+Separately from the above, and good news: an RTX 5090 and an RTX 4060 trained one model **across the
+public internet**, loss **15.638980 → 14.243052**, both halves moving. That is the lane meant to let
+small cards hold a model no single card can fit.
+
+It is slow — about 11 minutes per step — and honestly **we do not yet know why**. Bandwidth accounts
+for ~16 seconds and network round-trips for ~1 second, so **97% of that time is unexplained and is
+not the network.** An earlier explanation we gave ourselves ("too many round trips") was wrong and we
+have retracted it rather than guess again. We are timing each individual exchange to find the truth.
+
+One thing we did find: our two machines currently talk to each other by routing through a server in
+**Singapore** — even though they sit in the same room — because a home connection has no public
+address for a miner to dial. That is a real design flaw for a global network, and fixing it (direct
+peer-to-peer, with the server used only for introductions) is now queued.
+
 **What this means for you.** We are not going to pretend a round can pay unlimited winners when the
 measurement says otherwise. Expect work to be organised as **small coalitions** — a handful of miners
 finishing one layer together and sharing what that layer actually gained — rather than thousands of

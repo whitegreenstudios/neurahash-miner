@@ -349,6 +349,46 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### We audited our own result, and it held (2026-08-01)
+
+Before building anything on the number above, we checked whether it was real or a rounding artifact.
+Model weights are stored in a compact 16-bit format, and small updates can vanish into it — so the
+worry was that miners' contributions were being *silently discarded by the maths* rather than
+genuinely failing to add up.
+
+**They weren't.** Measuring how much of an intended update actually lands, at the dose we really
+use: **95% to 100%**. The result stands. Contributions are being applied faithfully; they just
+overlap with each other.
+
+Two things worth telling you honestly:
+
+**We corrected ourselves again — that's four times now on this page.** We previously wrote that a
+scaled-down update lost "86%" of itself. That was the wrong measurement: 86% of the individual
+*numbers* stopped moving, but roughly *half* the actual step still landed, and only in a
+small-dose test we no longer plan to use. Two separate expert reviews of our own data disagreed
+with each other about this, so we settled it by measuring rather than arguing.
+
+**We tested fp8 — a smaller number format that would let the whole model fit in one graphics card —
+and ruled it out.** Two reasons: every serious training system keeps its master copy of the weights
+in a *larger* format anyway, so fp8 saves nothing on storage; and fp8 is so coarse it would retain
+**0%** of a contribution like ours. There is a format that works (NF4), which would shrink the model
+from 55.8 GB to **14.4 GB** — enough to fit entirely in one card and stop the constant disk reading
+that currently leaves the GPU idle 96% of the time. We already have the code for it, and an earlier
+test measured it within **0.02%** of the full-precision model.
+
+**And a hypothesis of ours died cleanly.** We thought keeping each miner's contribution as a
+separate "adapter" instead of merging it might let contributions stack. It cannot — the algebra is
+identical to adding them, and the one published experiment that tried it with 20 contributions
+scored *worse* than using a single one. Carrying them separately also costs memory that grows with
+every miner, which is incompatible with unlimited slots.
+
+**Pool status.** The coordinator now runs with a proper noise guard on the accept gate for the first
+time, and a fix that stops slow connections being dropped mid-transfer — since applying it, model
+transfers to the miner complete instead of restarting. A corpus mismatch that was silently rejecting
+*every* contribution has been fixed at the source. **If you are joining: do not use `--sync-corpus`
+right now** — our content store is serving a different corpus version than the coordinator expects,
+and syncing to it will get your work rejected. We are fixing the store separately.
+
 ### Two machines really did train together over the internet (2026-07-31)
 
 Separately from the above, and good news: an RTX 5090 and an RTX 4060 trained one model **across the

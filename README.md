@@ -349,6 +349,69 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### Your miner will no longer die on an out-of-memory error (2026-08-01)
+
+This one is for you rather than for the science. Your miner already capped how much VRAM it would
+take and already recognised an out-of-memory error. Three things were still wrong, and all three
+are fixed:
+
+**1. It used to retry the exact same thing.** After an OOM the miner freed memory and tried again
+next round — with the same batch size. If your card genuinely could not fit that batch, it would
+fail identically, forever. Your miner never crashed and never earned anything, which is the worst
+of both worlds: from the outside it looks perfectly healthy. It now **halves the batch size**, then
+the step count, and **refuses to retry a configuration that just failed**. If it runs out of things
+to shrink it says so loudly instead of quietly skipping every round.
+
+**2. The VRAM cap was never checked.** The miner set a hard ceiling on how much of your card it
+would use and printed a confident message — without ever confirming the ceiling worked. We had
+already been bitten by this: an earlier test ran out of memory *twice while supposedly capped*. An
+unenforced cap is worse than none, because instead of failing cleanly it spills into your system
+RAM and can hang the whole machine. The miner now **proves the cap works before using it** — it
+briefly sets a deliberately tiny 64 MB ceiling, asks for 256 MB, and requires that request to fail.
+If it succeeds, the cap is not real on your setup and **the miner refuses to start** rather than
+risk your desktop. Verified on a real RTX 5090.
+
+**3. "Pause instead of spill" was switched off for almost everyone.** The design promised that a
+starved card would wait rather than push into system memory. That behaviour lived behind an opt-in
+flag nobody set, so in practice the miner walked straight back into the allocation that had just
+failed. It now waits for memory to come back by default.
+
+**What this means for you:** on an 8 GB card the miner should now degrade to a smaller batch and
+keep contributing, instead of either crashing or silently idling. 11 new tests cover it; 3730 tests
+pass overall.
+
+### We found the math expert. There is no science expert. (2026-08-01)
+
+Inside the model are thousands of small sub-networks called experts, and a router decides which
+ones see which text. If different miners are going to do genuinely *different* work, we need to
+know who handles what. So we measured it — we fed the router grade-school maths problems, science
+questions, research papers, educational web text, code and literature, and recorded which experts
+lit up.
+
+**Maths has its own experts.** Arithmetic word problems route to experts that **no other kind of
+text touches at all** — zero overlap with the other five categories, at three separate layers.
+
+**Science does not.** Science questions land almost exactly where general educational web text
+lands — 23 to 31 times more overlap than chance. At one layer, research papers and educational web
+text are *identical*, and science is entirely contained in both. The model never learned a
+"science" division. It learned a **maths** division, and files science under "educated prose".
+
+The comparison is fair in a way our earlier one was not: both the maths and science sets are short
+exam-style question-and-answer items, so the *format* is identical and only the *subject* differs.
+Our previous test compared research papers against code against novels — which differ in
+punctuation, vocabulary and topic all at once, so it could not tell whether the router was sorting
+by meaning or just by surface appearance.
+
+**Why it matters for mining:** it tells us the model's real internal divisions are about **four**,
+not one per category — maths, code, general prose, and literary. It also names a mistake we were
+about to make: giving one miner "science" and another "web text" would hand them **the same
+experts**, which is exactly the duplicated work we are trying to avoid.
+
+**What we are NOT claiming.** This shows where text *goes*, not that training there *helps*. This
+project has already paid out ~900 rounds of work that passed every mechanical check while the
+model's real score got worse, so we are treating this as an input to the next experiment, not a
+result. It also covers only 6 of the model's 47 layers.
+
 ### We audited our own result, and it held (2026-08-01)
 
 Before building anything on the number above, we checked whether it was real or a rounding artifact.

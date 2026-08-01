@@ -507,6 +507,225 @@ stays, its granularity or inputs change. **Historical** = kept as the record, no
 
 ---
 
+### The architecture in full — every number, and where mining plugs in
+
+*(Added 2026-08-01. Every figure below is read from the live `config.json` or computed from it and
+cross-checked against a real file on disk — the arithmetic is reproduced at the end so you can
+verify it yourself. This is the reference version of the three-picture tour above.)*
+
+#### 1. The spec sheet
+
+| Field (`config.json`) | Value | What it means |
+|---|---|---|
+| `model_type` | `glm4_moe_lite` | GLM-5.2 family, MoE variant |
+| `num_hidden_layers` | **47** | the 47 floors |
+| `first_k_dense_replace` | **1** | floor 0 is a plain dense layer — so **46** floors are MoE |
+| `hidden_size` | 2048 | width of the signal passed between floors (`H`) |
+| `n_routed_experts` | **64** | specialists per MoE floor (`E`) |
+| `num_experts_per_tok` | **4** | how many wake per token (`top-k`) |
+| `n_shared_experts` | **1** | the always-on generalist |
+| `moe_intermediate_size` | 1536 | each expert's inner width (`I`) |
+| `intermediate_size` | 10240 | the *dense* floor-0 MLP's inner width |
+| `topk_method` | `noaux_tc` | router scoring rule |
+| `routed_scaling_factor` | 1.8 | routed output is scaled by this before it is added back |
+| `norm_topk_prob` | true | the 4 chosen gate weights are renormalised to sum to 1 |
+| `vocab_size` | 154,880 | tokens in the vocabulary |
+| `num_attention_heads` / `num_key_value_heads` | 20 / 20 | attention shape |
+| `q_lora_rank` / `kv_lora_rank` | 768 / 512 | MLA-style compressed attention |
+| `dtype` | bfloat16 | 2 bytes per weight as shipped |
+
+#### 2. The whole tower
+
+```mermaid
+flowchart TD
+    T["token ids"] --> EMB["embedding<br/>154,880 x 2048"]
+    EMB --> L0["floor 0 — DENSE<br/>attention + one 10240-wide MLP<br/>(no experts, nothing to claim)"]
+    L0 --> L1["floor 1 — MoE"]
+    L1 --> L2["floor 2 — MoE"]
+    L2 --> DOTS["... floors 3 … 45 ..."]
+    DOTS --> L46["floor 46 — MoE"]
+    L46 --> NORM["final norm"]
+    NORM --> HEAD["lm_head 2048 x 154,880<br/>(untied)"]
+    HEAD --> P["probability over 154,880 tokens"]
+
+    style L0 fill:#4a5568,color:#fff
+    style L1 fill:#2b6cb0,color:#fff
+    style L2 fill:#2b6cb0,color:#fff
+    style L46 fill:#2b6cb0,color:#fff
+```
+
+**Floor 0 is the one that is not like the others.** `first_k_dense_replace: 1` means the first
+floor keeps a single fat MLP instead of experts. That is why the model has 47 layers but only
+**46 × 64 = 2,944** claimable coordinates — and why a miner can never claim `L0:*`. (This is the
+same 2,944 that appears throughout our logs as the coordinate space, and the reason the piece
+manifest lists 2,944 trainable of 3,008 nominal slots.)
+
+#### 3. Inside one MoE floor — with real tensor shapes
+
+```mermaid
+flowchart TD
+    IN["hidden state<br/>[batch, seq, 2048]"] --> ATT["ATTENTION (MLA)<br/>q_lora 768, kv_lora 512, 20 heads<br/>'every token looks at every other token'"]
+    ATT --> RES1(["+ residual"])
+    RES1 --> RT["ROUTER<br/>2048 -> 64 scores, noaux_tc<br/>keep top-4, renormalise to sum 1"]
+
+    RT -->|"gate weights g1..g4"| EX
+    RES1 --> EX["4 CHOSEN EXPERTS (of 64)<br/>each: gate_up [3072, 2048] + down [2048, 1536]<br/>SiLU(gate) * up -> down"]
+    RES1 --> SH["SHARED EXPERT<br/>always on, same shape"]
+    EX -->|"x 1.8 scaling"| SUM(["weighted sum"])
+    SH --> SUM
+    RT -.->|"not chosen"| SLEEP["the other 60 experts<br/>do no work, cost no FLOPs<br/>(but still occupy memory)"]
+    SUM --> RES2(["+ residual"])
+    RES2 --> OUT["to floor N+1<br/>[batch, seq, 2048]"]
+
+    style EX fill:#2f855a,color:#fff
+    style SLEEP fill:#742a2a,color:#fff
+    style RT fill:#b7791f,color:#fff
+```
+
+The two weight tensors per floor are exactly what our packs hold, and you can see these shapes
+printed in every experiment log:
+
+```
+gate_up_proj : [64, 3072, 2048]      # [E, 2I, H] — gate and up fused, split at row I
+down_proj    : [64, 2048, 1536]      # [E, H, I]
+```
+
+`gate_up` is fused: rows `0..1535` are the **gate**, rows `1536..3071` are the **up**. Our wire
+format splits it back into `{gate, up, down}` per expert, which is why one coordinate's payload
+has three tensors.
+
+> **Sleeping is free in compute, not in memory.** Only 4 of 64 experts run per token, so the model
+> costs a ~2 B-parameter model to *run*. But all 64 must be *resident* for the router to be able to
+> choose any of them. That single sentence is why decentralised training of this model is hard, and
+> it is the reason for everything in section 6.
+
+#### 4. The coordinate grid — what a miner actually claims
+
+```mermaid
+flowchart LR
+    subgraph GRID["the claim space: 46 floors x 64 experts = 2,944 coordinates"]
+        direction TB
+        R1["L1:  e0 e1 e2 ... e63"]
+        R2["L2:  e0 e1 e2 ... e63"]
+        R3["...."]
+        R4["L46: e0 e1 e2 ... e63"]
+    end
+    GRID --> C["a miner claims ONE coordinate, e.g. L1:e31<br/>= 9,437,184 parameters = 18 MiB in bf16"]
+    C --> D["it trains ONLY those weights and publishes<br/>a delta for them"]
+```
+
+- **One expert** = 9,437,184 params = **18.0 MiB** bf16.
+- **One whole floor** (all 64) = 603,979,776 params = **1.125 GiB** bf16 — this is the "1.125 GiB
+  per resident layer" figure that governs how many floors a card can hold.
+- **A full-rank floor delta in fp32** = **2,415,919,104 bytes ≈ 2.42 GB**. That is not a
+  projection: `delta_gutenberg_L1_rho6.0650e-02.pt` on disk is 2,415,921,645 bytes — the extra
+  2,541 bytes are the file header.
+
+#### 5. The parameter budget
+
+| Component | Parameters | Notes |
+|---|---:|---|
+| Routed experts, 46 floors × 64 | **27,783,069,696** | ~27.8 B — the overwhelming majority of the model |
+| Shared experts, 46 × 1 | 434,110,464 | always active |
+| Floor 0 dense MLP | 62,914,560 | not claimable |
+| Embedding + lm_head (untied) | 634,388,480 | 2 × 154,880 × 2048 |
+| Attention, norms, router | remainder | MLA-compressed; small next to the experts |
+| **Active per token** | **~2.17 B** in the MoE path | (4 routed + 1 shared) × 9,437,184 × 46 |
+
+**The ratio that makes this whole project possible: ~27.8 B parameters stored, ~2.17 B used per
+token.** A model that is enormous to *hold* but cheap to *run* is exactly the model you would want
+to train on a fleet of small, cheap cards — if you can solve the holding problem.
+
+#### 6. Sharding — how the model is split across cards
+
+MoE makes the model **splittable**; sharding actually **splits** it. Two different axes:
+
+```mermaid
+flowchart TD
+    subgraph WHOLE["the model: ~29 B params, ~58-62 GB in bf16"]
+        W1["47 floors"]
+    end
+    WHOLE --> Q{"how do you fit this<br/>on consumer cards?"}
+
+    Q --> A["<b>A. EXPERT SHARDING</b><br/>each miner holds the trunk + a few floors<br/>and trains its own coordinate"]
+    Q --> B["<b>B. PIPELINE SPLIT</b><br/>floors 0-23 on card 1, 24-46 on card 2<br/>activations cross the wire each step"]
+    Q --> C["<b>C. GRADCAST</b><br/>miner holds NO model at all —<br/>it gets a cache of (input, grad-out)<br/>pairs for one floor and trains it"]
+
+    A --> AC["cost: trunk 4.02 GiB + 1.125 GiB per resident floor<br/>an 8 GB card holds the trunk + 1-2 floors"]
+    B --> BC["PROVEN: real GLM trained across a 5090 + a 4060,<br/>loss 16.07 -> 12.14 (2026-07-30)"]
+    C --> CC["the current mining method — the card never<br/>needs the other 46 floors in memory"]
+
+    style A fill:#2b6cb0,color:#fff
+    style B fill:#2f855a,color:#fff
+    style C fill:#b7791f,color:#fff
+```
+
+The memory arithmetic every operator needs:
+
+```
+trunk (embeddings + attention + norms + router)   4.02 GiB   measured
+each resident MoE floor                         + 1.125 GiB   = 64 experts, bf16
+-----------------------------------------------------------------
+8 GB card   -> trunk + 1 floor, with ~2.8 GiB headroom
+24 GB card  -> trunk + ~17 floors
+the full 47 -> ~10 cards, composed
+```
+
+Note what this says: **experts inside a floor you already hold are free.** The cost is per
+*floor*, not per *expert*. Claiming 1 expert and claiming all 64 on the same floor cost the same
+memory — which is why the payable unit moved from one expert to one full floor.
+
+#### 7. The mining loop, end to end
+
+```mermaid
+flowchart TD
+    C1["COORDINATOR<br/>runs the full 47-floor model"] -->|"1. produce a gradient cache<br/>for floor L: (input, grad-out) pairs"| CACHE["cache: 600 units, ~3.8 GB<br/>published by CID"]
+    CACHE -->|"2. download"| M["MINER (any card, incl. 8 GB)<br/>holds floor L only"]
+    M -->|"3. train to a fixed drift dose<br/>rho = 6.065e-02, lr found by bisection"| D["delta for floor L<br/>2.42 GB fp32 / 1.21 GB bf16"]
+    D -->|"4. publish"| J["JUDGE (k=24 live floors)<br/>held-out CE on 1,024 sequences<br/>base anchor 6.542763"]
+    J -->|"improves by > margin"| ACC["ACCEPT -> merge -> miner is paid"]
+    J -->|"does not"| REJ["REJECT -> nothing is paid"]
+    ACC --> C1
+
+    style J fill:#b7791f,color:#fff
+    style ACC fill:#2f855a,color:#fff
+    style REJ fill:#742a2a,color:#fff
+```
+
+**Why the judge runs 24 floors and not 1.** In run 5 the judge graded inside a model where 45 of
+the 46 expert floors were zeroed. Deltas that looked good in that empty building were **11.7 ARC
+points worse** in the real one, while every internal check stayed green — the pool paid for
+damage. Grading with **k=24** floors live is the measured fix: at that width the judge's verdict
+matches the full model's, at ~31 s per check.
+
+#### 8. Where the open questions sit on this map
+
+| Question | Status |
+|---|---|
+| Can one card train one floor and improve the real model? | **PROVEN** — held-out CE 10.5 → 8.3 on a live 5090 miner |
+| Can two machines train one model across the internet? | **PROVEN** — 5090 + 4060, loss 16.07 → 12.14 |
+| Do two floors' deltas *add* when merged? | **REFUTED at every dose** — weight-space accumulation across floors does not compose |
+| Do many miners on *the same* floor add up? | **NO — merge saturates at ~1.** One coordinate delivers 99% of what its floor's whole merged set delivers |
+| Does giving miners **different data** make their work add up? | **BEING MEASURED RIGHT NOW** — this is the `R_cross` vs `R_same = 0.5090` experiment |
+| Has the live pool's gate ever paid for a real improvement? | **NO — 0 of 10,752 accepted deltas ever improved held-out.** This is the central unsolved problem |
+
+That last row is the honest headline: the mechanics all work — cards train, deltas ship, machines
+cooperate over WAN — but **making N miners produce N miners' worth of improvement is not yet
+solved**, and we publish the negative results as firmly as the positive ones.
+
+#### 9. Verify the arithmetic yourself
+
+```python
+E, H, I, V, MOE = 64, 2048, 1536, 154880, 46
+per_expert = 2*I*H + H*I              # gate_up [2I,H] + down [H,I]
+assert per_expert == 9_437_184
+assert E * per_expert == 603_979_776               # one floor
+assert E * per_expert * 2 == 1_207_959_552         # 1.125 GiB bf16
+assert E * per_expert * 4 == 2_415_919_104         # 2.42 GB fp32 delta
+assert MOE * E * per_expert == 27_783_069_696      # 27.8 B routed params
+assert MOE * E == 2944                             # the coordinate space
+```
+
 ## Glossary — every name we use, in plain English (2026-07-29)
 
 Every term this project uses, what it means for **you as a miner**, and its honest status. Nothing

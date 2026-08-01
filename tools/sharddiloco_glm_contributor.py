@@ -2182,6 +2182,62 @@ DEFAULT_HEADROOM = 0.90          # of CURRENTLY FREE VRAM, not of the card
 RUNAWAY_SLACK = 1.5              # ... and never more than 1.5x this role's measured need
 
 
+_CAP_PROBE_LIMIT_MIB = 64        # the ceiling the probe temporarily installs
+_CAP_PROBE_ALLOC_MIB = 256       # what it then tries to allocate -- comfortably past that ceiling
+
+
+def _verify_vram_cap_enforced(idx, log=None):
+    """Does set_per_process_memory_fraction ACTUALLY refuse an over-cap allocation on this device?
+
+    Returns True when the cap is enforced (the probe raised OOM, which is the WANTED outcome) and
+    False when the probe ALLOCATED anyway -- meaning the ceiling is advisory here and the process
+    would silently spill to shared system RAM under pressure instead of failing.
+
+    METHOD, and why it is cheap: rather than trying to allocate past the REAL cap (which would mean
+    reserving tens of GiB just to prove a point), install a deliberately tiny 64 MiB ceiling, ask
+    for 256 MiB, and see what happens. Same mechanism, ~0 cost, unambiguous answer. The tiny
+    ceiling is always removed in the `finally` -- leaving it installed would OOM the entire run.
+
+    MUST run before the model is materialised, which is exactly where apply_vram_guard already
+    requires itself to be called.
+
+    KNOWN BENIGN FALSE PASS: if the card genuinely has under 256 MiB free, the probe allocation
+    fails for real-OOM reasons rather than because of the ceiling, and this reports enforced. That
+    errs toward starting rather than blocking, and a card that full will be caught moments later by
+    the `cap_gib < need_gib` preflight.
+    """
+    import torch
+    enforced = False
+    try:
+        torch.cuda.empty_cache()
+        total_b = int(torch.cuda.mem_get_info(idx)[1])
+        probe_frac = min(0.5, (_CAP_PROBE_LIMIT_MIB * 2 ** 20) / float(total_b))
+        torch.cuda.set_per_process_memory_fraction(probe_frac, idx)
+        try:
+            t = torch.empty(_CAP_PROBE_ALLOC_MIB * 2 ** 20, dtype=torch.uint8,
+                            device="cuda:%d" % idx)
+            del t
+            enforced = False          # it allocated past the ceiling -> NOT enforced
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise                 # a different fault is a real error, not a verdict
+            enforced = True
+    finally:
+        # Hand the device back with no probe ceiling no matter what happened above. The caller
+        # applies the real cap immediately after this returns.
+        try:
+            torch.cuda.set_per_process_memory_fraction(1.0, idx)
+            torch.cuda.empty_cache()
+        except Exception:                                            # noqa: BLE001
+            pass
+    if log:
+        log("[vram-guard] cap probe: requested %d MiB under a %d MiB ceiling -> %s"
+            % (_CAP_PROBE_ALLOC_MIB, _CAP_PROBE_LIMIT_MIB,
+               "OOM as expected, cap IS enforced" if enforced
+               else "ALLOCATION SUCCEEDED -- cap is NOT enforced"))
+    return enforced
+
+
 def apply_vram_guard(device, need_gib, log=None):
     """Hard per-process VRAM ceiling + a refuse-to-start preflight. MUST be called before any model
     is materialised on CUDA.
@@ -2231,10 +2287,24 @@ def apply_vram_guard(device, need_gib, log=None):
             "or lower the footprint -- do NOT raise the cap past free memory, that is what spills "
             "to shared system RAM and hangs the box." % (need_gib, cap_gib, how, total_gib, free_gib))
 
+    # PROVE THE MECHANISM BITES BEFORE TRUSTING IT. Applying a fraction and printing a confident
+    # message is not evidence: memory vram-cap-live-verified caveat 0 records "the DiLoCo P0 smoke
+    # OOM'd twice while 'capped'". If set_per_process_memory_fraction is not actually enforcing
+    # (wrong device index, a torch build that ignores it, an allocator already holding blocks), the
+    # process does not fail loudly -- it spills to shared system RAM and thrashes the host, which is
+    # the 2026-07-21 box-crash this guard exists to prevent. So: verify, then cap.
+    if not _verify_vram_cap_enforced(idx, log=log):
+        raise SystemExit(
+            "[vram-guard] REFUSING TO START: the per-process VRAM cap is NOT being enforced on "
+            "device %d -- a deliberate over-cap allocation SUCCEEDED when it should have raised "
+            "OOM. An unenforced cap is worse than none: it spills to shared system RAM and hangs "
+            "the box instead of failing this process. Do not work around this by raising the cap."
+            % idx)
+
     frac = min(1.0, cap_gib / total_gib)
     torch.cuda.set_per_process_memory_fraction(frac, idx)
     msg = ("[vram-guard] capped to %.2f GiB (%.1f%% of the %.2f GiB card; %.2f GiB was free; %s). "
-           "OOMs at the cap, never spills to sysmem. Need ~%.2f GiB."
+           "Cap VERIFIED enforced by probe. OOMs at the cap, never spills to sysmem. Need ~%.2f GiB."
            % (cap_gib, frac * 100, total_gib, free_gib, how, need_gib))
     if log:
         log(msg)
@@ -2306,6 +2376,67 @@ def _maybe_start_vram_manager(args, need_gib, log=None):
     return mgr
 
 
+def _free_vram_gib():
+    """Free VRAM in GiB, or None when it cannot be determined -- WITHOUT importing torch.
+
+    Reads sys.modules instead of importing on purpose. tests/test_glm_vram_pause.py
+    test_torch_not_imported_by_helpers asserts these helpers never pull torch into a fresh
+    interpreter, and that property is worth preserving: it is what lets the OOM path be unit-tested
+    on a machine with no GPU. In a real miner torch is long since imported by the time this runs,
+    so the fallback is live exactly where it matters and inert exactly where it would break a test.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free_b, _total_b = torch.cuda.mem_get_info(torch.cuda.current_device())
+        return float(free_b) / 2 ** 30
+    except Exception:                               # noqa: BLE001 -- a probe must never crash a round
+        return None
+
+
+def _min_free_vram_gib():
+    try:
+        return float(os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB", "1.0") or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits=None):
+    """The elastic pause for miners running WITHOUT the opt-in VramManager -- i.e. the default.
+
+    WHY THIS EXISTS: _vram_pause_if_starved returned 0 immediately whenever no manager was running,
+    and the manager is opt-in behind NEURAHASH_VRAM_MANAGER. So the "it pauses instead of spilling"
+    behaviour the design promised was OFF for every default deployment. This gives the same
+    protection with no manager: after an OOM, if the card is still starved, WAIT for it to recover
+    rather than immediately re-entering training that will OOM again.
+
+    Returns 0 (never blocks) when free VRAM cannot be determined -- an unknown must not become an
+    indefinite hang.
+    """
+    sleep_fn = sleep_fn or time.sleep
+    need = _min_free_vram_gib()
+    free = _free_vram_gib()
+    if free is None or free >= need:
+        return 0
+    log("[glm-contrib %s] VRAM starved: only %.2f GiB free, want >= %.2f GiB -- PAUSED "
+        "(re-checking every %.0fs; set NEURAHASH_VRAM_MIN_FREE_GB to change the bar)"
+        % (miner, free, need, poll_s))
+    waits = 0
+    while True:
+        sleep_fn(poll_s)
+        waits += 1
+        free = _free_vram_gib()
+        if free is None or free >= need:
+            log("[glm-contrib %s] VRAM recovered (%s GiB free) -- resuming after %d wait(s)"
+                % (miner, "?" if free is None else "%.2f" % free, waits))
+            return waits
+        if max_waits is not None and waits >= max_waits:
+            return waits
+
+
 def _vram_units(vm=None):
     """Current sustainable resident-unit capacity, or None when no manager runs (flag off)."""
     m = vm if vm is not None else _VRAM_MGR
@@ -2327,7 +2458,15 @@ def _vram_pause_if_starved(log, miner="", vm=None, poll_s=15.0, sleep_fn=None, m
     sleep_fn = sleep_fn or time.sleep
     waits = 0
     u = _vram_units(vm)
-    if u is None or u > 0:
+    if u is None:
+        # No manager running -- which is the DEFAULT, since the manager is opt-in behind
+        # NEURAHASH_VRAM_MANAGER. Returning 0 here is what made this pause a no-op for every
+        # default deployment, sending the miner straight back into the allocation that just OOM'd.
+        # Fall back to polling free VRAM (torch-free when torch is absent, so the unit tests that
+        # assert no-torch and no-pause both still hold).
+        return _pause_on_low_free_vram(log, miner=miner, poll_s=poll_s, sleep_fn=sleep_fn,
+                                       max_waits=max_waits)
+    if u > 0:
         return 0
     log("[glm-contrib %s] VRAM starved: manager advertises 0 sustainable units -- PAUSED "
         "(re-checking every %.0fs; training resumes when capacity returns)" % (miner, poll_s))
@@ -2348,6 +2487,50 @@ def _is_cuda_oom(exc):
     so a message check covers both it and the classic RuntimeError('CUDA out of memory') --
     and keeps this helper importable torch-free for tests."""
     return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+_OOM_FLOOR_BATCH = 1
+_OOM_FLOOR_INNER = 1
+_OOM_TRIED = set()      # (batch, inner) configurations that have already OOM'd on THIS card
+
+
+def _oom_backoff(args, log, miner=""):
+    """After a CUDA OOM, make the NEXT attempt genuinely different. Returns True if the footprint
+    was reduced, False once there is nothing left to give.
+
+    WHY THIS IS THE WHOLE POINT. Freeing the cache and retrying the SAME batch/inner next round
+    only helps when the OOM was TRANSIENT -- another process spiking, a fragmented allocator. When
+    the config simply does not fit the card, an identical retry OOMs identically, forever: the
+    miner never crashes and never produces a single contribution. That is not resilience, it is a
+    silent hang, and it is what memory v332-oom-death-and-resume-verdict-2026-07-25 records as 18
+    hours of downtime behind a self-heal that healed nothing.
+
+    So: halve the batch first (it scales activation memory almost linearly and costs only
+    throughput), then the inner step count, and refuse to ever re-run a (batch, inner) pair that
+    has already OOM'd on this card. Reductions are GLOBAL on args rather than per-coordinate
+    because the constraint is the CARD, not the expert -- a batch that OOM'd on (L1,E5) will OOM on
+    (L1,E9) too, and re-discovering that per coordinate is how a fleet wastes a night.
+    """
+    b = int(getattr(args, "batch", 0) or 0)
+    h = int(getattr(args, "inner", 0) or 0)
+    _OOM_TRIED.add((b, h))
+    if b > _OOM_FLOOR_BATCH:
+        args.batch = max(_OOM_FLOOR_BATCH, b // 2)
+        log("[glm-contrib %s] OOM BACKOFF: batch %d -> %d (inner %d unchanged). The next attempt "
+            "is a DIFFERENT configuration; an identical retry would OOM identically."
+            % (miner, b, args.batch, h))
+        return True
+    if h > _OOM_FLOOR_INNER:
+        args.inner = max(_OOM_FLOOR_INNER, h // 2)
+        log("[glm-contrib %s] OOM BACKOFF: batch already at the floor (%d), inner %d -> %d."
+            % (miner, b, h, args.inner))
+        return True
+    log("[glm-contrib %s] OOM AT THE FLOOR: batch=%d inner=%d still does not fit this card. "
+        "Nothing left to reduce -- this coordinate is not trainable here. Continuing so a smaller "
+        "coordinate can still be attempted, but THIS IS NOT SILENT PROGRESS: %d configuration(s) "
+        "have now OOM'd. Reduce the claim size, free VRAM, or use a larger card."
+        % (miner, b, h, len(_OOM_TRIED)))
+    return False
 
 
 def build_node_model(args, log=None, need_gib=None):
@@ -4807,6 +4990,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 torch.cuda.empty_cache()
             except Exception:                                        # noqa: BLE001
                 pass
+            _oom_backoff(args, log, miner=miner)   # next attempt MUST differ from the one that failed
             _vram_pause_if_starved(log, miner=miner)
             time.sleep(5.0)
             continue
@@ -5173,6 +5357,7 @@ def main(argv=None):
                 torch.cuda.empty_cache()
             except Exception:                                        # noqa: BLE001
                 pass
+            _oom_backoff(args, log, miner=miner)   # next attempt MUST differ from the one that failed
             _vram_pause_if_starved(log, miner=miner)
             time.sleep(5.0)
             continue

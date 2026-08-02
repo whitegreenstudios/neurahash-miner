@@ -1016,17 +1016,43 @@ def solve_drift_or_refuse(pass_fn, target_rho, tol=RHO_TOL, log=None, **kw):
     return sol
 
 
-def assert_finite_delta(Dgu, Ddn, torch_mod=None, where="delta"):
+def assert_finite_delta(Dgu, Ddn, torch_mod=None, where="delta", K=K_CHUNK):
     """Guard before anything is applied or published. A NaN in a delta is not recoverable and
-    must never reach the wire."""
+    must never reach the wire.
+
+    CHUNKED, and that is not a micro-optimisation -- it sets the minimum card size that can mine.
+    MEASURED 2026-08-01 on an RTX 4060 running a full layer-1 dose (600 units, rho 6.065e-02): the
+    unchunked `isfinite(t).all()` was the LARGEST VRAM transient in the entire run, and full_pass
+    calls it on EVERY bisection pass. Chunking moved peak reserved VRAM 6.328 -> 3.797 GiB and the
+    minimum workable cap 6.25 -> 3.60 GiB, i.e. from "only 8 GB+ cards can produce the payable unit"
+    to "4 GB cards can", which is what the global-miners directive needs.
+
+    The cost is NOT just the bool mask, and that is worth knowing before anyone "simplifies" this
+    back. Measured on a 5090, transient above the resident delta, Dgu = [64, 3072, 2048] fp32:
+        torch.isfinite(Dgu)            2688 MiB      <- 7x the 384 MiB mask it returns
+        Dgu.abs()                      1536 MiB      <- the fp32 temporary inside isfinite
+        chunked, K=8 (this function)    336 MiB
+    isfinite on a float tensor materialises fp32 intermediates before the mask, so the peak is
+    ~1.75x the delta itself; the returned 384 MiB bool is the smallest part of it. Chunking is an 8x
+    reduction (2352 MiB saved), not the 1.5x you would predict from the mask alone.
+
+    Behaviour-preserving by construction: all() over a tensor is the AND of all() over any partition
+    of its rows, and a partition cannot change WHICH rows are non-finite -- only how early the scan
+    stops. The measured delta was bit-identical (max|dw| = 0.0000e+00 vs the unchunked 7.0 GiB run).
+    K is the same expert-row chunk used by inner_step/sq_blocks/apply_delta, and like there it is
+    free: GATE K-EXACT verified K = 1, 2, 4, 8, 16 give byte-identical weights.
+
+    Evidence: scratchpad/campaign3_4060.json (10-point cap sweep; 3.60 GiB passes, 3.50 GiB OOMs),
+    scratchpad/compare_4060floor_vs_5090.json (cosine 1.000000000, max|dw| 5.96e-07 vs the 5090)."""
     if torch_mod is None:
         import torch as torch_mod                                    # noqa: PLW0127
     for name, t in (("gate_up", Dgu), ("down", Ddn)):
-        if not bool(torch_mod.isfinite(t).all()):
-            raise NonFiniteDoseError(
-                "%s: %s contains non-finite values -- the dose diverged; nothing is published "
-                "(the k=24 judge would reject it, but the miner's work is wasted, which is the "
-                "failure this guard prevents)" % (where, name))
+        for c0, c1 in chunk_bounds(t.shape[0], K):
+            if not bool(torch_mod.isfinite(t[c0:c1]).all()):
+                raise NonFiniteDoseError(
+                    "%s: %s contains non-finite values (rows %d:%d) -- the dose diverged; nothing "
+                    "is published (the k=24 judge would reject it, but the miner's work is wasted, "
+                    "which is the failure this guard prevents)" % (where, name, c0, c1))
     return True
 
 
@@ -1035,7 +1061,7 @@ def apply_delta(gu_all, dn_all, Dgu, Ddn, K=K_CHUNK, torch_mod=None):
     0.0 when the cast is bf16-exact (the reference run asserted exactly that on both doses)."""
     if torch_mod is None:
         import torch as torch_mod                                    # noqa: PLW0127
-    assert_finite_delta(Dgu, Ddn, torch_mod=torch_mod, where="apply_delta")
+    assert_finite_delta(Dgu, Ddn, torch_mod=torch_mod, where="apply_delta", K=K)
     exact = 0.0
     with torch_mod.no_grad():
         for c0, c1 in chunk_bounds(gu_all.shape[0], K):
@@ -1075,7 +1101,7 @@ def train_layer_dose(units, gu_all, dn_all, I, act_fn, target_rho, tol=RHO_TOL, 
         Ddn.zero_()
         for u in units:
             inner_step(u, gu_all, dn_all, Dgu, Ddn, act_fn, K, lr, dev, torch_mod=torch_mod)
-        assert_finite_delta(Dgu, Ddn, torch_mod=torch_mod, where="full_pass(lr=%.6e)" % lr)
+        assert_finite_delta(Dgu, Ddn, torch_mod=torch_mod, where="full_pass(lr=%.6e)" % lr, K=K)
         r, _ = rho_of(Dgu, Ddn, I, K, bn, torch_mod=torch_mod)
         return r
 

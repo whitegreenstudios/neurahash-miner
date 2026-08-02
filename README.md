@@ -349,6 +349,81 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-02 (later) — **Release 3.6.1: the mining floor drops to ~4 GB.** And the capability question got its answer: the gate moves, the benchmark does not.
+
+#### Shipped: 3.6.1, and a fielded miner picked it up on its own
+
+The chunked finite-delta guard is now in the miner people actually run, signed and published.
+
+| step | evidence |
+|---|---|
+| fix ported to the public miner | the two copies were byte-identical beforehand, so the diff is the same 3 hunks |
+| `VERSION` → 3.6.1 | written with `printf`, confirmed ASCII by `xxd`: `332e 362e 310a` |
+| signed | `pinned match : YES`, signer `0x5168F6…DC66`, commit recorded as **full 40-hex** |
+| published + fetched from the live URL | version 3.6.1, signer matches the pinned root |
+| **a real miner self-updated** | `verified signed release v3.6.1 (commit 2c3ddfb2e82b) > local v3.6.0; applying` → landed on `VERSION 3.6.1` at the signed commit |
+
+**Card requirement: 8 GB+ → roughly 4 GB+.**
+
+Two near-misses caught during the cut, both of which would have shipped a broken release:
+
+- **The fix was not in the public repo at all.** It had gone to the private repo that morning; only
+  docs went to the miner. A release cut at that moment would have shipped without the one change
+  that justified it. Found by grepping the public copy for the fix instead of assuming propagation.
+- **`echo 3.6.1 > VERSION` in PowerShell writes UTF-16**, which `read_local_version()` cannot parse.
+  That is the exact mechanism behind the 2026-07-25 incident where a manifest declared 3.4.0 while
+  the commit it pointed at said 3.3.2 — and printed `pinned match: YES`, because the *signature* was
+  perfectly valid. The artifact was verified four ways this time, including
+  `git show <commit>:tools/glm_grad_cache.py | grep -c` returning 1.
+
+Also worth recording for anyone scripting the remote agent: `control_client.py --cmd` returns
+**HTTP 500 on backslash paths** and works with forward slashes.
+
+#### The capability answer: CE moves, ARC does not
+
+The goal metric was already measured on 2026-07-28 and we had not been citing it prominently enough.
+Scoring the full 64-expert layer-1 contribution on **ARC-Easy against the full 47-layer model**:
+
+| | base | with the contribution |
+|---|---|---|
+| acc_norm | 81.07% | **81.17%** |
+| acc | 82.87% | 82.52% |
+
+**+0.10 points, McNemar p = 0.888 over 50 discordant items — indistinguishable from noise.** That
+contribution's CE gain was 0.0914, *15× the accept margin*. The pool would have paid well for it.
+The model got no smarter.
+
+The one genuine improvement over run 5: CE and capability now **agree**. Run 5's accepted deltas
+moved CE the right way while costing −11.7 ARC points; the k=24 judge stopped the lying. It did not
+make the work valuable.
+
+#### Dose ladder: bigger contributions scale perfectly — in magnitude
+
+An 8 GB card trained the same layer at 0.5×, 2× and 4× the frozen drift dose. All three converged,
+and delta magnitude tracks the drift target almost exactly:
+
+| dose | achieved rho | delta L2 vs frozen |
+|---|---|---|
+| 0.5× | 0.0304 | **0.504×** |
+| 2× | 0.1211 | **2.003×** |
+| 4× | 0.2434 | **4.024×** |
+
+Every rung peaked at **3.799 GiB** — the new floor doing real work, not a synthetic probe.
+
+Magnitude is not merit, and the ladder's own report says so: *"L2 growth alone is not a gain."*
+Whether a 4× contribution is a *better* contribution is being scored against the full model now. If
+it moves ARC, the payable unit is simply under-dosed and dose is a lever we control. If it is also
+flat, then training this layer does not buy capability at any dose — which would redirect the
+programme toward the pipeline path rather than toward more miners on layer 1.
+
+#### Where that leaves the thesis
+
+The infrastructure is real: consumer cards train a genuine slice of a 29B model, two machines have
+trained one model over the open internet, and the floor is now low enough that most gaming GPUs
+qualify. What is not yet real is the economics — **the thing being paid for has not been shown to
+produce the thing being sold.** We would rather publish that plainly than keep optimising a metric
+that may not cash out.
+
 ### 2026-08-02 — **Different data does NOT make miners add up. Different COORDINATES do.** And an 8 GB card is proven — the real floor is 3.60 GiB.
 
 Two overnight campaigns, roughly 15 GPU-hours across the 5090 (3.6 h of judged arms) and the 4060 (an ~11 h training campaign). One hypothesis died, one

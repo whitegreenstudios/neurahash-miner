@@ -452,15 +452,34 @@ That is **436× tighter** than this project's own cross-architecture precedent (
 
 **Then the floor turned out to be far lower than 8 GB, and what was holding it up was not training
 at all.** The `assert_finite_delta` guard evaluates `torch.isfinite(t).all()` over all 402,653,184
-elements at once — allocating a 384 MiB boolean mask (plus 192 MiB for the second tensor) on *every*
-bisection pass. The chunk-size knob governs a ~300 MiB working set, so shrinking it could never
-help; a first sweep at chunk 4, 2 and 1 hit the identical wall every time.
+elements at once, on *every* bisection pass. The chunk-size knob governs a ~300 MiB working
+set, so shrinking it could never help; a first sweep at chunk 4, 2 and 1 hit the identical wall
+every time.
+
+**The cost is not the boolean mask, which is what we first assumed — it is ~7× worse than that.**
+Measured directly on a 5090 with a real `[64, 3072, 2048]` fp32 delta, transient *above* the
+resident delta:
+
+| | transient |
+|---|---|
+| `torch.isfinite(Dgu)` | **2,688 MiB** |
+| `Dgu.abs()` alone | 1,536 MiB |
+| chunked, K=8 (shipped) | **336 MiB** |
+
+`isfinite` on a float tensor materialises fp32 intermediates *before* producing the mask, so the
+peak is ~1.75× the delta itself and the 384 MiB boolean it returns is the smallest part of it.
+The real saving is **8× — 2,352 MiB**, not the 1.5× the mask alone would predict.
 
 Evaluating that check in chunks — mathematically identical, since `all()` over a tensor is the AND of
 `all()` over any partition of its rows — walks the cap down to **3.60 GiB (peak 3.59)**, versus
 6.25 GiB with the stock guard. All nine cap steps produced the *identical* drift, and the 3.60 GiB
 delta is **bit-identical** to the 7.0 GiB one (max |dw| = 0.0). The small-chunk setting costs nothing
 in throughput (0.10 s/unit).
+
+**Status: applied and tested (2026-08-02).** The chunked guard is in `tools/glm_grad_cache.py`;
+283 tests pass across the four suites that import it, including new coverage that puts a NaN in
+the first, a middle and the last expert row at chunk sizes 1, 4, 8 and 16 — verified by mutation
+(a chunker truncated to its first chunk lets the NaN through, so the tests discriminate).
 
 ~3.4 GiB is a hard floor no knob goes under (1.125 GiB expert slab + 2.25 GiB fp32 delta). **This is
 the difference between "8 GB cards can mine" and "4 GB cards can mine"** — for a fix on the

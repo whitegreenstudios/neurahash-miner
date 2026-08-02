@@ -98,10 +98,39 @@ def fetch(api, rel, dest_root, expect_sha=None, label="", local=None):
     return out
 
 
+def _expand_pieces(spec):
+    """Parse a --pieces spec into a sorted list of ints, accepting BOTH `0,1,2` and ranges `0-11`.
+
+    The README's own step 1 publishes `--pieces 0-11` and explains it as "every expert of one MoE
+    layer", so the range form is the intended contract -- but the parser only ever split on commas,
+    so int("0-11") raised ValueError before the 5.67 GB trunk fetch even began. First command of the
+    two-command quickstart, reported by an external joiner (issue #71, 2026-08-02).
+
+    Accepts any mix: "0-11", "0,1,2", "0-3,8,10-11". Ranges are inclusive, because that is how the
+    README's "0-11" reads to a human expecting 12 pieces.
+    """
+    out = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part.lstrip("-"):
+            a, _, b = part.partition("-")
+            lo, hi = int(a), int(b)
+            if hi < lo:
+                raise SystemExit("--pieces: range %r is backwards (%d > %d)" % (part, lo, hi))
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(part))
+    return sorted(out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dest", required=True, help="shard dir to populate (holds pieces/ + manifests)")
-    ap.add_argument("--pieces", default="0", help="comma-separated expert piece indices to fetch")
+    ap.add_argument("--pieces", default="0",
+                    help="expert piece indices to fetch: comma-separated, inclusive ranges, or a "
+                         "mix -- '0', '0,1,2', '0-11', '0-3,8,10-11'")
     ap.add_argument("--skip-trunk", action="store_true", help="trunk already present and verified")
     # The config CID is a CONTENT HASH, not a secret, and it must have a working default: without one
     # the loader fails only AFTER a multi-GB download, so a stranger burns the whole fetch and ends up
@@ -121,6 +150,10 @@ def main():
     from huggingface_hub import HfApi                      # noqa: E402 (after env + IPv4)
     api = HfApi()
 
+    # `~` is not expanded by the shell on Windows, and the README publishes `--dest ~/glm_base`.
+    # Without this, that command silently creates a LITERAL directory named `~` in the cwd and the
+    # 5.67 GB trunk lands somewhere the miner will never look for it (issue #71, 2026-08-02).
+    args.dest = os.path.expanduser(args.dest)
     os.makedirs(args.dest, exist_ok=True)
     print("dest=%s  repo=%s" % (args.dest, REPO))
 
@@ -139,7 +172,7 @@ def main():
         return v.get("sha256") if isinstance(v, dict) else v
 
     want = ["trunk.safetensors"] if not args.skip_trunk else []
-    want += ["experts_%d.safetensors" % int(p) for p in args.pieces.split(",") if p.strip() != ""]
+    want += ["experts_%d.safetensors" % p for p in _expand_pieces(args.pieces)]
 
     total = 0
     for name in want:

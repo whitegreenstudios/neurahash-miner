@@ -502,7 +502,31 @@ def _default_pip(repo_dir, timeout=1800):
 
 def _default_reexec(argv):
     """Replace the current process with a fresh run of the miner on the NOW-checked-out code.
-    Never returns."""
+    Never returns.
+
+    WINDOWS TAKES A DIFFERENT PATH, and it is not cosmetic. The Windows CRT `exec` family builds the
+    child's command line by joining the argument vector with SPACES and does not quote members that
+    contain them. With the stock python.org all-users install at `C:\\Program Files\\Python311\\
+    python.exe`, the child re-parses its own command line as argv[0]='C:\\Program',
+    argv[1]='Files\\Python311\\python.exe' -- and Python then treats that argv[1] as the script to
+    run, resolving it against the cwd:
+
+        C:\\Program: can't open file 'C:\\Users\\...\\Files\\Python311\\python.exe':
+        [Errno 2] No such file or directory
+
+    Reported from a fresh clone on an RTX 3070 taking v3.6.0 -> v3.6.1 (issue #71, 2026-08-02).
+    Impact: the update genuinely SUCCEEDS -- checkout and VERSION land on the new version -- and then
+    the miner exits. Unattended, a miner silently stops at whichever ~6-hourly check first sees a new
+    release, on any Windows box whose interpreter lives in a spaced path. That is the DEFAULT
+    location for the all-users installer, so it is not an exotic setup. It stops rather than spins
+    (check_and_update writes last_check up front, and the local version is no longer behind), but a
+    miner that quietly stops overnight is indistinguishable from one that was never running.
+
+    subprocess does Windows quoting correctly via list2cmdline; os.execv does not. `_default_pip`
+    above already goes through subprocess.run with a list and was never affected -- this is the only
+    exec path in the file."""
+    if os.name == "nt":
+        raise SystemExit(subprocess.run([sys.executable, *argv]).returncode)
     os.execv(sys.executable, [sys.executable, *argv])
 
 

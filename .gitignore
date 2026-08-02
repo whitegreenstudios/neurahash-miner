@@ -26,3 +26,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+# --- secrets: never commit key material (added 2026-08-02) ---
+*wallet*.json
+*.hex.txt

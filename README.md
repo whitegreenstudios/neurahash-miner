@@ -349,6 +349,134 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-02 — **Different data does NOT make miners add up. Different COORDINATES do.** And an 8 GB card is proven — the real floor is 3.60 GiB.
+
+Two overnight campaigns, roughly 15 GPU-hours across the 5090 (3.6 h of judged arms) and the 4060 (an ~11 h training campaign). One hypothesis died, one
+replaced it, and the hardware floor for joining dropped by half.
+
+#### 1. The hypothesis that died: "give each miner different data"
+
+The idea was that if two miners train the same layer on *different* corpora, their contributions
+should point in different directions and therefore add up. We measured it properly: four corpora
+(`arxiv_abstracts`, `arxiv_papers`, `gutenberg`, and a deliberately mixed `mixed_control`), one
+full-rank layer-1 delta each, **all trained to the same frozen drift dose** (rho 6.065e-02, learning
+rate found by bisection), scored on the k=24 judge against base CE 6.542763. Every pairing was run
+twice: **CROSS** (two different corpora) and **CONTROL** (one corpus, two different expert rows).
+
+**The control is what saved us from publishing a false positive.** The first cross pair came back at
+R = 1.0003 — against a same-corpus baseline of 0.5090 — which looks like a decisive win. Its own
+control scored **1.0060**, i.e. *higher*.
+
+The reason is a flaw in the statistic itself. `R = d_merged / (d_A + d_B)` is a monotone function of
+the **ratio between the two contributions**, not of where the data came from:
+
+| d_a : d_b | R | corpora |
+|---|---|---|
+| 1.00 | 0.5025 | **same** |
+| 1.01 | 0.5013 | different |
+| 4.26 | 1.0081 | different |
+| 4.28 | 1.0003 | different |
+| 7.87 | 1.0060 | **same** |
+
+Sorted by that ratio, cross and control interleave perfectly. When `d_B << d_A` and B does not
+interfere, `d_merged ≈ d_A + d_B` so R → 1. When the two are comparable and redundant,
+`d_merged ≈ d_A` so R → 0.5. **The "R ≥ 0.80 → non-redundant, N miners approach N× gain" verdict
+fires on any lopsided pair, including a same-corpus one where nothing was decorrelated at all.**
+
+We now report the un-gameable number instead: the merged gain as a multiple of the **best single**
+contributor. At the frozen settings that is **1.00× to 1.26×**. Two miners never bought close to two
+miners' worth.
+
+#### 2. What actually decides whether two miners add up
+
+Looking at the six pairings, the structure is unmistakable:
+
+| pairing | d_A | d_B | merged | vs best single |
+|---|---|---|---|---|
+| abstracts + gutenberg | 0.1338 | 0.1324 | **0.1335** | 1.00× |
+| gutenberg + mixed_control | 0.1330 | 0.1293 | **0.1335** | 1.00× |
+| abstracts + mixed_control | 0.1338 | 0.1293 | **0.1354** | 1.01× |
+| abstracts + arxiv_papers | 0.1338 | 0.0313 | **0.1651** | 1.23× |
+| arxiv_papers + gutenberg | 0.0313 | 0.1330 | **0.1656** | 1.24× |
+
+Every **strong + strong** pair merges to ~0.1335 — *less than the better miner achieved alone*. Three
+different corpus combinations, same answer. They are fully redundant because they all converge on
+the **same best coordinate**, and averaging two attempts at the same thing gains nothing.
+
+The pairs that do add are the ones where the two miners were pushed onto **genuinely different
+coordinates**. That is not a property of the data — it is a property of the assignment.
+
+#### 3. The lever that works: give miners more coordinates to try
+
+We re-ran the whole experiment probing 16 candidate rows per corpus instead of 6. **Exactly one
+number changed**: `arxiv_papers`, the weak corpus, found a row worth 0.0772 instead of 0.0313. Every
+other corpus's contribution was byte-identical.
+
+| merged gain | 6 candidates | 16 candidates | change |
+|---|---|---|---|
+| abstracts + arxiv_papers | 0.1651 | **0.2113** | +28% |
+| arxiv_papers + gutenberg | 0.1656 | **0.2115** | +28% |
+| arxiv_papers + mixed_control | 0.1633 | **0.2089** | +28% |
+| *(pairs not involving arxiv_papers)* | 0.1335 | 0.1335 | unchanged |
+
+**A wider search rescued the weak miner, and every merge involving it gained ~28%.** Best single
+contribution: unchanged at 0.1338. So the gain came entirely from the *second* miner finding a
+better coordinate — not from more training, not from better data.
+
+The practical reading: a miner's value is capped by how many coordinates it gets to try, and the
+fleet's value is capped by how well miners are *spread* across coordinates. Both are scheduling
+decisions we control.
+
+One more measured caution: **equal drift is not equal quality.** The four corpora needed learning
+rates spanning 11× to reach the same drift, and the outcomes diverged wildly — gutenberg improved
+6 of 6 probed rows, `arxiv_abstracts` 5 of 6, `arxiv_papers` only **1 of 6**, with a worst row that
+cost +0.639 CE. A corpus can pass the drift gate and still be actively harmful.
+
+#### 4. An 8 GB card produces the payable unit — and the floor is really 3.60 GiB
+
+Until now the only working trainer built the whole 47-layer model, which needs a 24 GiB cap and
+excluded every 8 GB volunteer. It turns out that was never necessary: a gradient-cache unit already
+contains the layer's inputs and grad-outputs, so training a layer needs the layer and its cache and
+nothing else.
+
+The 4060 trained the full-rank layer-1 unit, and the result is numerically indistinguishable from
+the 5090's 24 GiB reference:
+
+| | |
+|---|---|
+| cosine (gate_up / down) | 0.9999999999999971 / 0.9999999999999978 |
+| max abs difference | **5.96e-07** (= 2⁻²⁴, fp32 epsilon) |
+| achieved rho | 0.06038559627 vs reference 0.06038559325 |
+
+That is **436× tighter** than this project's own cross-architecture precedent (2.6e-4).
+
+**Then the floor turned out to be far lower than 8 GB, and what was holding it up was not training
+at all.** The `assert_finite_delta` guard evaluates `torch.isfinite(t).all()` over all 402,653,184
+elements at once — allocating a 384 MiB boolean mask (plus 192 MiB for the second tensor) on *every*
+bisection pass. The chunk-size knob governs a ~300 MiB working set, so shrinking it could never
+help; a first sweep at chunk 4, 2 and 1 hit the identical wall every time.
+
+Evaluating that check in chunks — mathematically identical, since `all()` over a tensor is the AND of
+`all()` over any partition of its rows — walks the cap down to **3.60 GiB (peak 3.59)**, versus
+6.25 GiB with the stock guard. All nine cap steps produced the *identical* drift, and the 3.60 GiB
+delta is **bit-identical** to the 7.0 GiB one (max |dw| = 0.0). The small-chunk setting costs nothing
+in throughput (0.10 s/unit).
+
+~3.4 GiB is a hard floor no knob goes under (1.125 GiB expert slab + 2.25 GiB fp32 delta). **This is
+the difference between "8 GB cards can mine" and "4 GB cards can mine"** — for a fix on the
+validation path that cannot alter any result. Not yet applied to the shipping code; it is queued as
+a reviewed change rather than something that happened unattended.
+
+#### What this changes
+
+- **Do not** build a per-miner web-scraping data pipeline to decorrelate contributions. Measured: it
+  does not decorrelate them.
+- **Do** spread miners across coordinates and let each one probe more candidates before committing.
+  That is where the measured 28% sat.
+- **Do** lower the VRAM floor — it roughly doubles the population of eligible cards.
+- Still unsolved, and stated plainly: merging N miners does not yet buy N miners' worth of
+  improvement, and 0 of 10,752 accepted deltas in the live pool ever improved held-out.
+
 ### Your miner will no longer die on an out-of-memory error (2026-08-01)
 
 This one is for you rather than for the science. Your miner already capped how much VRAM it would

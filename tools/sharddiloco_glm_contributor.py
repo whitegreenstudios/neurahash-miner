@@ -98,7 +98,12 @@ RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither local
 RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)
 RC_NO_CAMPAIGN = 11                 # exit code: the pointer advertises no campaign_id (see campaign_refusal)
 RC_TRUNK_FREE_SYNC = 12             # exit code: trunk-free base on a v1 SYNC lane (sync trains with forwards)
-_ALLOWED_DATA_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)\.npy\Z")
+# The optional `.pNNN` CORPUS PART suffix sits AFTER the (train|val) alternation deliberately. This
+# guard exists to make the coordinator's SECRET probe/heldout splits unnameable by a forged data
+# record, and anchoring the suffix last preserves that by construction: `ids_daily_probe.p000.npy`
+# matches neither alternative and is still refused. Parts exist because a joiner should not have to
+# download 14.97 GiB to read 0.25% of it -- see docs/CORPUS_ON_DEMAND_DESIGN.md.
+_ALLOWED_DATA_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)(?:\.p[0-9]{3,4})?\.npy\Z")
 
 
 def use_glm_lane_names():
@@ -2104,6 +2109,16 @@ def add_common_args(ap):
     ap.add_argument("--domains", default=os.environ.get("NEURAHASH_GLM_DOMAINS", "daily"),
                     help="one corpus domain per slot (mode=glm); ids_<domain>_<split>.npy "
                          "(default: daily -- the split the public lane publishes)")
+    # CORPUS PARTS: a miner reads ~41 MB of the 14.97 GiB corpus in a 10,000-step run (0.25%), so it
+    # fetches ONE 256 MiB part instead and rotates. `auto` picks by identity hash; `off` forces the
+    # monolithic file. Ignored entirely when no part files are present. docs/CORPUS_ON_DEMAND_DESIGN.md
+    ap.add_argument("--corpus-part", default=os.environ.get("NEURAHASH_GLM_CORPUS_PART", "auto"),
+                    help="corpus part to train from: 'auto' (by identity), an integer, or 'off' "
+                         "to use the whole-corpus file (default: %(default)s)")
+    ap.add_argument("--corpus-rotate-rounds", type=int,
+                    default=int(os.environ.get("NEURAHASH_GLM_CORPUS_ROTATE", "0")),
+                    help="rotate to the next corpus part every N rounds, deleting the old one "
+                         "(0 = never rotate). Keeps a long run's data fresh at bounded disk.")
     ap.add_argument("--warm-steps", type=int, default=int(os.environ.get("NEURAHASH_GLM_WARM", "400")),
                     help="mode=tiny only: deterministic warm-start steps standing in for a PRETRAINED "
                          "GLM base. MUST be identical on every node (it defines the shared base)")
@@ -2701,13 +2716,188 @@ def build_node_model(args, log=None, need_gib=None):
     return model, model.config, seq
 
 
+def evict_corpus_parts(root, dom, keep, split="train", log=print):
+    """Delete every train PART except the indices in `keep`. Returns (deleted, freed_bytes).
+
+    This is the half of corpus-on-demand that actually bounds disk: fetching one part is pointless if
+    yesterday's parts accumulate. Callers MUST have released any memmap over a doomed part first --
+    on Windows an open mapping makes the unlink fail with PermissionError [WinError 5], the same
+    mechanism that forced _release_ids to exist for the atomic corpus install.
+
+    Best-effort per file: a part that cannot be deleted (still mapped, held by another process, a
+    concurrent session) costs disk, never correctness, so it is logged and skipped rather than
+    raising into a training loop that is otherwise healthy."""
+    keep = {int(k) for k in (keep or ())}
+    deleted, freed = [], 0
+    for idx in corpus_parts_present(root, dom, split):
+        if idx in keep:
+            continue
+        p = os.path.join(root, part_filename(dom, split, idx))
+        try:
+            n = os.path.getsize(p)
+            os.remove(p)
+        except OSError as e:                                     # noqa: BLE001
+            log("[glm-contrib] corpus part %d not evicted (%s)" % (idx, e))
+            continue
+        deleted.append(idx)
+        freed += n
+    if deleted:
+        log("[glm-contrib] evicted corpus part(s) %s, freed %.0f MiB"
+            % (deleted, freed / float(1 << 20)))
+    return deleted, freed
+
+
+def next_corpus_part(cur, nparts, step=1):
+    """The next part index in the rotation, wrapping. Kept separate so it can be tested without a
+    filesystem, a lane, or a GPU."""
+    if not nparts:
+        return None
+    return (int(cur) + int(step)) % int(nparts)
+
+
+def part_filename(dom, split, idx):
+    """ids_daily_train.p007.npy -- the on-disk name of one corpus part."""
+    return "ids_%s_%s.p%03d.npy" % (dom, split, int(idx))
+
+
+def coord_domain(args, slot):
+    """The corpus domain a slot reads. ONE definition, so _ids_path and the rotation caller cannot
+    drift apart and start reading/evicting different domains."""
+    doms = domains_list(args)
+    return doms[int(slot) % len(doms)]
+
+
+def corpus_parts_present(root, dom, split="train"):
+    """Sorted indices of the corpus PARTS on disk for this split. Empty list = monolith mode.
+
+    Presence on disk is the whole switch: a box that fetched the single 14.97 GiB file keeps using
+    it, and one that fetched parts uses those, with no flag to get wrong and no protocol version to
+    negotiate. See docs/CORPUS_ON_DEMAND_DESIGN.md for why parts exist at all."""
+    pref, suf = "ids_%s_%s.p" % (dom, split), ".npy"
+    out = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return out
+    for nm in names:
+        if nm.startswith(pref) and nm.endswith(suf):
+            body = nm[len(pref):-len(suf)]
+            if body.isdigit():
+                out.append(int(body))
+    return sorted(out)
+
+
+def corpus_parts_declared(files, dom, split="train"):
+    """Part indices the coordinator's DATA RECORD declares, sorted.
+
+    This -- not the local disk -- is the denominator for part assignment. A fresh joiner has ZERO
+    parts on disk, so counting local files would hand every new miner part 0 and leave the rest of
+    the corpus permanently untrained: the exact opposite of what sharding is for."""
+    pref, suf = "ids_%s_%s.p" % (dom, split), ".npy"
+    out = []
+    for nm in (files or ()):
+        if nm.startswith(pref) and nm.endswith(suf):
+            body = nm[len(pref):-len(suf)]
+            if body.isdigit():
+                out.append(int(body))
+    return sorted(out)
+
+
+def rotate_corpus_part(args, lane, dom, log=print, autosync=None):
+    """Advance to the next corpus part, then delete the one we just finished with.
+
+    ORDER IS THE SAFETY PROPERTY: fetch and VERIFY the replacement before evicting the incumbent. A
+    rotation that evicted first would turn any transient network failure into a miner holding no
+    corpus at all -- and glm_data_autosync fail-closes on unverifiable data, so such a miner would
+    EXIT rather than degrade. Here a failed fetch is a non-event: keep the part we have, say so, and
+    try again at the next boundary. A miner that never rotates still trains correctly; a miner that
+    rotates into nothing does not.
+
+    Returns the part index now in use (unchanged if the rotation did not happen)."""
+    cur = getattr(args, "corpus_part_idx", None)
+    total = int(getattr(args, "corpus_parts_total", 0) or 0)
+    if cur is None or total < 2:
+        return cur
+    nxt = next_corpus_part(cur, total)
+    if nxt == cur:
+        return cur
+    want = {part_filename(dom, "train", nxt), DATA_MANIFEST_NAME, "ids_%s_val.npy" % dom}
+    try:
+        (autosync or glm_data_autosync)(lane, args.data_dir, log=log, want=want)
+    except SystemExit as e:                                      # fail-closed autosync, not fatal here
+        log("[glm-contrib] corpus rotation to part %d could not be verified (%s) -- staying on "
+            "part %d and retrying at the next boundary" % (nxt, e, cur))
+        return cur
+    except Exception as e:                                       # noqa: BLE001
+        log("[glm-contrib] corpus rotation to part %d failed (%s) -- staying on part %d"
+            % (nxt, e, cur))
+        return cur
+    if not os.path.isfile(os.path.join(args.data_dir, part_filename(dom, "train", nxt))):
+        log("[glm-contrib] corpus part %d absent after sync -- staying on part %d" % (nxt, cur))
+        return cur
+    args.corpus_part_idx = nxt
+    evict_corpus_parts(args.data_dir, dom, keep=[nxt], log=log)
+    log("[glm-contrib] corpus rotated to part %d of %d" % (nxt, total))
+    return nxt
+
+
+def resolve_corpus_part(args, identity, nparts=None, log=print):
+    """Decide WHICH corpus part this miner trains from, and record it on args.
+
+    --corpus-part accepts `auto` (default), an integer, or `off`. `auto` starts at
+    sha256(identity) % nparts: deterministic, needs no coordination, and spreads miners evenly over
+    the corpus so the pool still covers all of it. It is deliberately NOT a function of the
+    coordinate (L,E) -- tying data to coordinate was tested and refuted (memory
+    xcorpus-diverse-data-refuted: cross-corpus assignment never beat its own same-corpus control),
+    so there is no reason to couple the two and a good reason not to.
+
+    Returns the chosen index, or None for monolith mode."""
+    spec = str(getattr(args, "corpus_part", "auto") or "auto").strip().lower()
+    if spec in ("off", "none", "-1"):
+        args.corpus_part_idx = None
+        return None
+    if nparts is None:
+        # Fallback only. The caller should pass the count the RECORD declares (see
+        # corpus_parts_declared); local disk is right only for an offline box that already holds
+        # parts, and wrong for a fresh joiner, who holds none.
+        doms = domains_list(args)
+        nparts = len(corpus_parts_present(args.data_dir, doms[0], "train"))
+    if not nparts:
+        args.corpus_part_idx = None
+        args.corpus_parts_total = 0
+        return None
+    args.corpus_parts_total = int(nparts)
+    if spec == "auto":
+        h = hashlib.sha256(str(identity or "").encode("utf-8")).digest()
+        idx = int.from_bytes(h[:8], "big") % int(nparts)
+    else:
+        try:
+            idx = int(spec) % int(nparts)
+        except ValueError:
+            raise SystemExit("--corpus-part must be 'auto', 'off', or an integer (got %r)" % spec)
+    args.corpus_part_idx = idx
+    log("[glm-contrib] corpus part %d of %d (--corpus-part=%s)" % (idx, nparts, spec))
+    return idx
+
+
 def _ids_path(args, slot, split, base=None):
     """Path to a split's id file. `base` overrides args.data_dir -- the coordinator passes its
     coordinator-only dir (args.coord_data_dir) for the secret probe/heldout splits (F1), so those
-    files are read from a dir that is never present on a miner box."""
+    files are read from a dir that is never present on a miner box.
+
+    TRAIN may resolve to a PART (ids_<dom>_train.pNNN.npy) when one is present and a part index has
+    been chosen. Falls back to the monolithic file whenever the part is absent, so a half-migrated
+    box degrades to the old behaviour instead of failing. `base is not None` never takes the part
+    path: that argument is only ever the COORDINATOR's secret-split dir, which is never sharded."""
     doms = domains_list(args)                 # ONE parse for the whole module (see domains_digest)
     dom = doms[int(slot) % len(doms)]
     root = base if base is not None else args.data_dir
+    if split == "train" and base is None:
+        idx = getattr(args, "corpus_part_idx", None)
+        if idx is not None:
+            cand = os.path.join(root, part_filename(dom, split, idx))
+            if os.path.isfile(cand):
+                return cand
     return os.path.join(root, "ids_%s_%s.npy" % (dom, split))
 
 
@@ -3204,7 +3394,34 @@ def _read_data_record(lane, man=None):
         return None
 
 
-def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get):
+def wanted_data_names(files, dom, part_idx, split="train"):
+    """Which of the record's declared files this miner must actually DOWNLOAD.
+
+    The record lists every corpus part so that its manifest hash commits to all of them, but a miner
+    needs exactly one. Without this filter, sharding the corpus into 60 parts would make a joiner
+    download 14.97 GiB again -- strictly worse than the monolith it replaced, since it would also pay
+    60 round trips for it. So: keep everything that is NOT a train part, plus the ONE train part we
+    were assigned. Note this is a bandwidth filter, never a security one -- every name in the record
+    is still validated by _is_allowed_data_name BEFORE this runs, and the entire record is refused if
+    any name fails. Narrowing what we fetch cannot widen what we accept.
+
+    Falls back to "want everything" when no part was chosen (monolith mode) or when the assigned part
+    is not in the record, because fetching too much is merely wasteful while fetching too little is a
+    training failure."""
+    names = set(files or ())
+    if part_idx is None:
+        return names
+    mine = part_filename(dom, split, part_idx)
+    parts = {n for n in names if _PART_RE.match(n)}
+    if mine not in parts:
+        return names
+    return (names - parts) | {mine}
+
+
+_PART_RE = re.compile(r"ids_[A-Za-z0-9-]+_(?:train|val)\.p[0-9]{3,4}\.npy\Z")
+
+
+def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get, want=None):
     """W6 corpus-over-WAN DOWNLOAD half: before training, make a bare stranger clone fetch and VERIFY
     its ids files, and FAIL CLOSED on anything it cannot verify. Today the loaders bare-np.load
     whatever sits in --data-dir with ZERO verification (node_ids); this closes exactly that gap.
@@ -3253,7 +3470,13 @@ def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get):
                 "and fetching nothing." % name)
             return
 
-    for name in sorted(files):
+    # BANDWIDTH filter, applied only AFTER every name above passed the F1/F2 hard-guard: the record
+    # commits to all corpus parts so its manifest hash covers them, but this miner downloads one.
+    fetch_names = sorted(files) if want is None else sorted(n for n in files if n in want)
+    if want is not None and len(fetch_names) != len(files):
+        log("[glm-contrib] data record lists %d file(s); fetching the %d this node needs (%s)"
+            % (len(files), len(fetch_names), ", ".join(fetch_names)))
+    for name in fetch_names:
         info = files[name]
         sha = str(info.get("sha256", "")) if isinstance(info, dict) else ""
         size = info.get("size") if isinstance(info, dict) else None   # F2: untrusted declared size -> ceiling
@@ -3291,7 +3514,7 @@ def glm_data_autosync(lane, data_dir, log=print, http_get=data_http_get):
                 % (name, sha, len(tried), tried, RC_DATA_UNVERIFIED))
             raise SystemExit(RC_DATA_UNVERIFIED)
     log("[glm-contrib] data autosync OK: %d file(s) verified against record %r"
-        % (len(files), DATA_RECORD_NAME))
+        % (len(fetch_names), DATA_RECORD_NAME))
 
 
 # ==================================================================== alpha 3.0 periodic corpus resync
@@ -4799,6 +5022,12 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             "attempting resume replay" % (miner, model_root(host)[:12], str(_root0)[:12]))
         resume_to_root(host, lane, _root0, log, own_coord=(L, E))
 
+    # Corpus-part rotation cadence. 0 (default) = never rotate, i.e. exactly today's behaviour for
+    # every existing miner. _last_rotate_round makes the modulo test edge-triggered: rounds_done can
+    # be re-observed many times inside one round's polling, and rotating on each observation would
+    # re-download a part per poll.
+    _rotate_every = int(getattr(args, "corpus_rotate_rounds", 0) or 0)
+    _last_rotate_round = -1
     _resync_on = _data_resync_enabled(os.environ)
     _prev_data_record = _read_data_record(lane) if _resync_on else None
     if _resync_on:
@@ -4848,6 +5077,27 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
             if _refreshed:
                 regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
+        # -- (0b) CORPUS PART ROTATION: bounded disk across an UNBOUNDED run. Default OFF.
+        # A miner holds one 256 MiB part instead of the whole 14.97 GiB corpus; rotating means it
+        # still sees all of the corpus over time, just never all at once. This rides the same
+        # between-rounds boundary and the same release/re-open dance as the resync above, and for
+        # exactly the same reason: rotation replaces the file _ids_path resolves to, and on Windows
+        # an open mapping blocks the delete (see _release_ids). rotate_corpus_part fetches and
+        # VERIFIES the replacement before evicting the incumbent, so a failed rotation is a no-op
+        # that leaves this miner training on the part it already has.
+        if _rotate_every and rounds_done and rounds_done != _last_rotate_round \
+                and rounds_done % _rotate_every == 0 \
+                and getattr(args, "corpus_part_idx", None) is not None:
+            _last_rotate_round = rounds_done
+            _rot_unmapped = _release_ids(train_ids, val_ids)
+            _before = getattr(args, "corpus_part_idx", None)
+            _after = rotate_corpus_part(args, lane, coord_domain(args, coord_data_slot(L, E)),
+                                        log=log)
+            if _after != _before or _rot_unmapped:
+                train_ids = node_ids(args, coord_data_slot(L, E), "train")
+                val_ids = node_ids(args, coord_data_slot(L, E), "val")
+                if _after != _before:
+                    regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
         try:
             ptr = lane.read_pointer(man=man)
@@ -5237,7 +5487,29 @@ def main(argv=None):
         # W6 corpus-over-WAN: fetch+verify this miner's ids files BEFORE anything reads them.
         # build_node_model() below infers seq length from ids_<dom>_val.npy (_infer_seq), so this MUST
         # run first; a single call here covers BOTH the sync and async cadences that branch below.
-        glm_data_autosync(lane, args.data_dir, log=_flush)
+        # CORPUS PARTS: pick this node's part from what the RECORD declares (never from local disk
+        # -- a fresh joiner holds nothing, so counting local files would put every new miner on
+        # part 0), then fetch only that part. `want=None` when the lane still publishes a single
+        # monolithic corpus, which keeps every existing deployment byte-for-byte unchanged.
+        _dom0 = coord_domain(args, coord_data_slot(L, E))
+        _drec = _read_data_record(lane) or {}
+        _declared = corpus_parts_declared(_drec.get("files") or {}, _dom0)
+        # Same identity expression the ClaimState cursor uses (:5564) -- `wallet` may be None, and a
+        # part assignment that disagreed with the claim identity would move on restart.
+        _ident0 = wallet.address if wallet is not None else (args.miner or "miner0")
+        _part = resolve_corpus_part(args, _ident0, nparts=len(_declared), log=_flush)
+        _want = (wanted_data_names(_drec.get("files") or {}, _dom0, _part)
+                 if _part is not None else None)
+        glm_data_autosync(lane, args.data_dir, log=_flush, want=_want)
+
+    G = _G()
+    model, cfg, seq = build_node_model(args, log=_flush)
+    host = G.GlmExpertLaneHost(model, cfg, slots)
+    _flush("[glm-contrib %s] base ready: model_root=%s.. base_digest=%s.. seq=%d"
+           % (miner, model_root(host)[:12], base_digest(model)[:12], seq))
+
+    train_ids = node_ids(args, coord_data_slot(L, E), "train")
+    val_ids = node_ids(args, coord_data_slot(L, E), "val")
 
     G = _G()
     model, cfg, seq = build_node_model(args, log=_flush)

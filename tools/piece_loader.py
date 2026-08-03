@@ -334,11 +334,31 @@ def build_partial_model(shard_dir, piece_ids, device="cpu", dtype=None, config_d
     import torch.nn as nn
     from accelerate import init_empty_weights
     from safetensors import safe_open
-    from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
-        Glm4MoeLiteForCausalLM,
-        Glm4MoeLiteMoE,
-        Glm4MoeLiteRotaryEmbedding,
-    )
+    # transformers must be new enough to ship glm4_moe_lite. A stranger who follows the published
+    # install gets whatever `transformers` (unpinned) resolves to -- MEASURED on a fresh 8 GB-card
+    # join, 2026-08-03: transformers 4.57.1, no glm4_moe_lite, and the bare ModuleNotFoundError gives
+    # no hint that the fix is an UPGRADE. That is the whole install, dead at the last step, after a
+    # 6.33 GB base download. Say what is wrong and what to type.
+    try:
+        from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+            Glm4MoeLiteForCausalLM,
+            Glm4MoeLiteMoE,
+            Glm4MoeLiteRotaryEmbedding,
+        )
+    except ModuleNotFoundError as e:
+        if "glm4_moe_lite" not in str(e):
+            raise
+        try:
+            import transformers as _tf
+            have = getattr(_tf, "__version__", "unknown")
+        except Exception:                                    # noqa: BLE001
+            have = "not installed"
+        raise SystemExit(
+            "This miner trains GLM (glm4_moe_lite), which needs transformers >= 5.8.1.\n"
+            "  installed: transformers %s\n"
+            "  fix      : pip install -U 'transformers>=5.8.1'\n"
+            "Your downloaded base and corpus are fine -- rerun after upgrading and nothing "
+            "re-downloads." % have)
 
     if dtype is None:
         dtype = torch.bfloat16

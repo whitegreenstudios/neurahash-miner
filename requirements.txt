@@ -10,9 +10,13 @@ eth-account==0.13.7          # secp256k1 signing + EIP-55 addresses (pulls eth-u
 cryptography>=42             # keystore encryption (AES) + TLS cert handling
 
 # --- all-outbound miner (tools/run_miner.py) — fetches a dense HF base, then trains it ---
-transformers                 # REQUIRED for tools/run_miner.py: make_base_from_hf.py (outbound HF base
-#                              fetch) + the NEURAHASH_CORPUS=qwen tokenizer path. (The old
-#                              run_miner_client.py toy/real-corpus path does NOT need it — see below.)
+transformers>=5.8.1          # REQUIRED. >=5.8.1 is not cosmetic: the GLM lane loads the model class
+#                              transformers.models.glm4_moe_lite, which does NOT exist before 5.8.
+#                              MEASURED on a fresh 8 GB-card join 2026-08-03: an unpinned install
+#                              resolved to 4.57.1, and the whole quickstart died at the LAST step
+#                              ("No module named transformers.models.glm4_moe_lite") after a 6.33 GB
+#                              base download. Also used by make_base_from_hf.py and the
+#                              NEURAHASH_CORPUS=qwen tokenizer path.
 
 # --- opt-in / convenience ---
 web3==7.16.0                 # optional: on-chain balance/settlement helpers (mining does not need it)

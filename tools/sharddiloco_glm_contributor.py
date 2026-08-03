@@ -92,7 +92,15 @@ ACCEPTED_CAMPAIGN_NAME_FMT = "sharddiloco/glm/accepted/%s/r%d"   # campaign-scop
 # a contributor fetches ONLY the miner-facing splits it matches -- ids_<domain>_train/val.npy or the
 # data manifest. The SECRET probe/heldout splits (sharddiloco_glm_coordinator.py:573) must never
 # match, so even a forged record cannot make miner code pull them (F1 defense-in-depth).
-DATA_RECORD_NAME = "sharddiloco/glm/data"
+# Overridable so a parts record can be STAGED without flipping the production name. A parts-only
+# record published as `sharddiloco/glm/data` would tell every miner still on the old client to look
+# for ids_daily_train.npy, which such a record no longer lists -- so the rollout needs a way to point
+# ONE node at the new record first. MEASURED why this matters, 2026-08-03: a real miner started
+# against the production record on an 8 GB box began pulling the 16,078,168,192 B monolith and took
+# free disk from 8.08 GB to 2.38 GB before it was stopped. Same trust surface either way: every name
+# in whatever record is read still passes the F1/F2 hard-guard below.
+DATA_RECORD_NAME = os.environ.get("NEURAHASH_GLM_DATA_RECORD", "sharddiloco/glm/data")
+
 DATA_MANIFEST_NAME = "data_manifest.json"
 RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither locally-valid nor fetched+verified
 RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)

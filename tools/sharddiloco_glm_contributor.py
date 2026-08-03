@@ -2584,6 +2584,53 @@ _OOM_FLOOR_INNER = 1
 _OOM_TRIED = set()      # (batch, inner) configurations that have already OOM'd on THIS card
 
 
+# (card total GiB floor, starting batch). Only the SMALL-card rows change anything: a >=24 GiB card
+# still starts at 16, exactly as before.
+_AUTO_BATCH_TABLE = ((24.0, 16), (16.0, 8), (0.0, 4))
+
+
+def resolve_start_batch(args, log=print):
+    """Choose the STARTING batch from the card, so a small GPU does not have to discover its limit by
+    OOMing twice first.
+
+    _oom_backoff below already rescues this correctly -- MEASURED on an 8 GB card 2026-08-03 at the
+    README's own full layer-1 residency (--pieces 0-11): batch 16 OOMs, backoff halves to 8, that
+    OOMs too, 4 trains at 6.36 GiB peak. So the miner was never permanently stuck. But each of those
+    OOMs costs a whole SKIPPED ROUND, so an 8 GB joiner burns two rounds and prints two CUDA
+    tracebacks before its first contribution, which reads like a broken client.
+
+    `auto` (the default) picks from the table above; an explicit --batch/NEURAHASH_GLM_BATCH integer
+    always wins and is never second-guessed. Starting low costs only throughput, and _oom_backoff
+    remains the safety net for any card this table guesses wrong -- including one sharing its GPU
+    with another process, which no static table can predict."""
+    raw = getattr(args, "batch", "auto")
+    if isinstance(raw, int):
+        return raw                                            # already resolved (or passed in as int)
+    s = str(raw).strip().lower()
+    if s and s != "auto":
+        args.batch = int(s)
+        return args.batch
+    total = _CARD_TOTAL_GIB
+    if total is None:
+        try:
+            import torch
+            total = (torch.cuda.get_device_properties(0).total_memory / float(1 << 30)
+                     if torch.cuda.is_available() else None)
+        except Exception:                                     # noqa: BLE001
+            total = None
+    if total is None:
+        args.batch = 16                                       # CPU / unknown: unchanged from before
+        log("[glm-contrib] batch=auto -> 16 (no CUDA card detected; behaviour unchanged)")
+        return args.batch
+    for floor, b in _AUTO_BATCH_TABLE:
+        if total >= floor:
+            args.batch = b
+            break
+    log("[glm-contrib] batch=auto -> %d for a %.1f GiB card (explicit --batch overrides; "
+        "OOM backoff still applies)" % (args.batch, total))
+    return args.batch
+
+
 def _oom_backoff(args, log, miner=""):
     """After a CUDA OOM, make the NEXT attempt genuinely different. Returns True if the footprint
     was reduced, False once there is nothing left to give.
@@ -5410,8 +5457,10 @@ def main(argv=None):
                          "predicts the gate. MUST match the coordinator's --outer (shared "
                          "NEURAHASH_SD_OUTER default 0.7).")
     ap.add_argument("--lr", type=float, default=float(os.environ.get("NEURAHASH_GLM_LR", "3e-3")))
-    ap.add_argument("--batch", type=int, default=int(os.environ.get("NEURAHASH_GLM_BATCH", "16")),
-                    help="B=4 on the 4060 (plan sec 1: vocab 154880 log_softmax is ~1.2 GiB at B=48)")
+    ap.add_argument("--batch", default=os.environ.get("NEURAHASH_GLM_BATCH", "auto"),
+                    help="'auto' (default) sizes the STARTING batch from the card -- >=24 GiB: 16, "
+                         ">=16 GiB: 8, smaller: 4 -- because 16 OOMs an 8 GB card at full-layer "
+                         "residency. An explicit integer always wins. OOM backoff still applies.")
     ap.add_argument("--wire", default=os.environ.get("NEURAHASH_GLM_WIRE", "lora"),
                     choices=("lora", "dense"),
                     help="lora (default) ships the LoRA factors -- 67.7x smaller than the dense "
@@ -5504,15 +5553,9 @@ def main(argv=None):
 
     G = _G()
     model, cfg, seq = build_node_model(args, log=_flush)
-    host = G.GlmExpertLaneHost(model, cfg, slots)
-    _flush("[glm-contrib %s] base ready: model_root=%s.. base_digest=%s.. seq=%d"
-           % (miner, model_root(host)[:12], base_digest(model)[:12], seq))
-
-    train_ids = node_ids(args, coord_data_slot(L, E), "train")
-    val_ids = node_ids(args, coord_data_slot(L, E), "val")
-
-    G = _G()
-    model, cfg, seq = build_node_model(args, log=_flush)
+    # AFTER the build, because the VRAM guard has now measured the card (_CARD_TOTAL_GIB) and both
+    # round loops read args.batch as an int from here on.
+    resolve_start_batch(args, log=_flush)
     host = G.GlmExpertLaneHost(model, cfg, slots)
     _flush("[glm-contrib %s] base ready: model_root=%s.. base_digest=%s.. seq=%d"
            % (miner, model_root(host)[:12], base_digest(model)[:12], seq))

@@ -14,6 +14,7 @@ catastrophic if they regressed:
 And one guards the point of the exercise: eviction must actually free disk, or "fetch one part"
 just means "accumulate every part".
 """
+import io
 import os
 import sys
 
@@ -346,6 +347,104 @@ def test_rotation_wraps_around_the_whole_corpus(tmp_path):
     assert seen == [0, 1, 2, 3, 4, 0, 1, 2]
     assert set(seen) == {0, 1, 2, 3, 4}                       # full coverage over time
     assert N.corpus_parts_present(root, "daily") == [2]       # exactly ONE resident throughout
+
+
+# ---------------------------------------------------------------------------------------------
+# starting batch: a small card should not have to OOM twice to find its limit
+# ---------------------------------------------------------------------------------------------
+
+class _B(object):
+    def __init__(self, batch):
+        self.batch = batch
+
+
+@pytest.mark.parametrize("total_gib,want", [
+    (31.8, 16),   # 5090 -- unchanged from the old hardcoded default
+    (24.0, 16),
+    (23.9, 8),
+    (16.0, 8),
+    (15.9, 4),
+    (8.0, 4),     # MEASURED: 16 and 8 both OOM here, 4 trains at 6.36 GiB peak
+    (6.0, 4),
+])
+def test_auto_batch_picks_from_card_size(total_gib, want, monkeypatch):
+    monkeypatch.setattr(N, "_CARD_TOTAL_GIB", total_gib)
+    a = _B("auto")
+    assert N.resolve_start_batch(a, log=_silent) == want
+    assert a.batch == want
+
+
+def test_explicit_batch_is_never_second_guessed(monkeypatch):
+    """An operator who typed a number means it -- including a big one on a small card, where the
+    OOM backoff is the thing that rescues them."""
+    monkeypatch.setattr(N, "_CARD_TOTAL_GIB", 8.0)
+    for given, want in (("16", 16), ("48", 48), ("1", 1), (12, 12)):
+        a = _B(given)
+        assert N.resolve_start_batch(a, log=_silent) == want
+
+
+def test_auto_batch_is_idempotent(monkeypatch):
+    """main() resolves once, but the loops re-read args.batch every round and _oom_backoff mutates
+    it. Re-resolving must never undo a backoff."""
+    monkeypatch.setattr(N, "_CARD_TOTAL_GIB", 8.0)
+    a = _B("auto")
+    assert N.resolve_start_batch(a, log=_silent) == 4
+    a.batch = 2                                       # as if _oom_backoff had halved it
+    assert N.resolve_start_batch(a, log=_silent) == 2
+    assert a.batch == 2
+
+
+def test_auto_batch_without_a_card_keeps_the_old_default(monkeypatch):
+    """CPU or an un-probed card must behave exactly as before this change (16). Note the dev box has
+    a 5090, so this MUST force is_available False -- otherwise it would pass by reading the real
+    card and prove nothing."""
+    import torch
+    monkeypatch.setattr(N, "_CARD_TOTAL_GIB", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    a = _B("auto")
+    assert N.resolve_start_batch(a, log=_silent) == 16
+
+
+# ---------------------------------------------------------------------------------------------
+# port-damage guards. These exist because a transplant into the PUBLIC miner on 2026-08-03 sliced
+# one block too far and DUPLICATED the model build -- shipped and pushed before it was noticed.
+# Two models resident at once would OOM exactly the 8 GB cards this work is meant to serve, and no
+# test looked, because every test called build_node_model directly instead of main().
+# ---------------------------------------------------------------------------------------------
+
+def _contributor_source():
+    return io.open(N.__file__, encoding="utf-8").read()
+
+
+def test_the_model_is_built_exactly_once():
+    src = _contributor_source()
+    n = src.count("model, cfg, seq = build_node_model(args, log=_flush)")
+    assert n == 1, ("build_node_model appears %d times in main(); a duplicated build holds two "
+                    "models resident and OOMs a small card" % n)
+
+
+def test_no_block_is_duplicated_back_to_back():
+    """Catch the whole class, not just the one instance: a bad transplant repeats a run of lines."""
+    lines = _contributor_source().splitlines()
+    dupes = []
+    for i in range(len(lines) - 12):
+        win = lines[i:i + 6]
+        if sum(1 for x in win if x.strip()) < 4:
+            continue
+        if win == lines[i + 6:i + 12]:
+            dupes.append((i + 1, win[0].strip()[:60]))
+    assert not dupes, "duplicated 6-line block(s): %r" % dupes[:3]
+
+
+def test_every_ported_symbol_appears_exactly_once():
+    src = _contributor_source()
+    for marker in ("_ALLOWED_DATA_RE = re.compile", "def evict_corpus_parts",
+                   "def wanted_data_names", "def resolve_corpus_part", "def rotate_corpus_part",
+                   "def corpus_parts_declared", "def resolve_start_batch", "def _ids_path",
+                   "def node_ids", "fetch_names = sorted(files)",
+                   "resolve_start_batch(args, log=_flush)",
+                   "glm_data_autosync(lane, args.data_dir"):
+        assert src.count(marker) == 1, "%r appears %d times (want 1)" % (marker, src.count(marker))
 
 
 def test_part_names_round_trip_through_the_allowlist():

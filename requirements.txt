@@ -28,3 +28,8 @@ segno==1.6.6                 # optional: QR helper for the onboarding/join flow
 # bitsandbytes                #   fused vs unfused MoE experts); bitsandbytes only needed for --load-4bit
 # accelerate                  #   also required for --load-4bit (transformers device_map 4-bit load); Colab
 #                             #   ships it preinstalled, so this only bites native installs
+
+# The published quickstart tells a newcomer to run `python -m pytest tests/ -q`, so the test
+# runner is a dependency of the documented install path -- it was missing, and a stranger hit
+# "No module named pytest" on step 3 (issue #71, fresh-clone walkthrough 2026-08-03).
+pytest

@@ -2087,9 +2087,23 @@ def add_common_args(ap):
     # MINER-FACING data dir: train + val ONLY. The coordinator's SECRET probe/heldout live in a
     # separate coordinator-only dir (tools/glm_wan_prep_data.py writes <out>/miner vs <out>/coord),
     # so this default resolves to a dir a miner can hold and even ship without leaking the gate (F1).
-    ap.add_argument("--data-dir", default=os.environ.get("NEURAHASH_GLM_DATA_DIR", "D:/glm_wan/miner"))
-    ap.add_argument("--domains", default=os.environ.get("NEURAHASH_GLM_DOMAINS", "code,gutenberg"),
-                    help="one corpus domain per slot (mode=glm); ids_<domain>_<split>.npy")
+    # DEFAULTS MUST WORK ON A STRANGER'S MACHINE. Both of these were dev-box values that made the
+    # published "two commands, no placeholders" quickstart impossible to follow (issue #71,
+    # measured on a fresh clone 2026-08-03):
+    #   --data-dir defaulted to "D:/glm_wan/miner" -- our own dev path. Any machine without a D:
+    #     drive died with an unhandled FileNotFoundError: 'D:/' AFTER minting a wallet and claiming
+    #     a coordinate, so the failure looked like a network problem rather than a bad default.
+    #   --domains defaulted to "code,gutenberg", but the lane publishes only the `daily` split, so
+    #     _ids_path looked for ids_code_val.npy and reported "cannot infer seq length". The README
+    #     called --domains daily OPTIONAL; it was in fact mandatory.
+    # Now: data lands under the user's home by default, and the domain default matches what the
+    # lane actually serves. Env overrides are unchanged.
+    ap.add_argument("--data-dir",
+                    default=os.environ.get("NEURAHASH_GLM_DATA_DIR",
+                                           os.path.join(os.path.expanduser("~"), ".neurahash", "glm_data")))
+    ap.add_argument("--domains", default=os.environ.get("NEURAHASH_GLM_DOMAINS", "daily"),
+                    help="one corpus domain per slot (mode=glm); ids_<domain>_<split>.npy "
+                         "(default: daily -- the split the public lane publishes)")
     ap.add_argument("--warm-steps", type=int, default=int(os.environ.get("NEURAHASH_GLM_WARM", "400")),
                     help="mode=tiny only: deterministic warm-start steps standing in for a PRETRAINED "
                          "GLM base. MUST be identical on every node (it defines the shared base)")
@@ -2180,6 +2194,10 @@ GLM_NEED_GIB = GLM_CONTRIB_NEED_GIB   # default = the larger, so a new caller ca
 TINY_NEED_GIB = 0.5
 DEFAULT_HEADROOM = 0.90          # of CURRENTLY FREE VRAM, not of the card
 RUNAWAY_SLACK = 1.5              # ... and never more than 1.5x this role's measured need
+
+# The margin we insist on keeping BELOW free, so a cap is never set flush against free memory --
+# that is the spill-to-shared-system-RAM hazard the refusal message warns about.
+FIT_MARGIN_GIB = 0.25
 
 
 _CAP_PROBE_LIMIT_MIB = 64        # the ceiling the probe temporarily installs
@@ -2280,6 +2298,28 @@ def apply_vram_guard(device, need_gib, log=None):
         cap_gib = min(free_gib * DEFAULT_HEADROOM, need_gib * RUNAWAY_SLACK)
         how = "min(%.0f%% of free, %.1fx need)" % (DEFAULT_HEADROOM * 100, RUNAWAY_SLACK)
 
+        # THE FREE-FRACTION MUST NOT REFUSE A CARD THAT ACTUALLY FITS.
+        # Reported from an external RTX 3070 (issue #71, 2026-08-03): need 6.40, free 6.95 -- it
+        # fits -- and the guard refused, because cap = free x 0.90 = 6.25 < need. Solve it and the
+        # rule says a role can only start when free >= need / 0.90 = 7.111 GiB, i.e. on an 8.00 GiB
+        # card the OS and desktop compositor must hold under 0.89 GiB. A stock Windows desktop holds
+        # ~1.05 GiB. So the free-fraction invalidated the exact margin GLM_CONTRIB_NEED_GIB was sized
+        # to provide -- and on the very card class its own comment names ("4060: ~6.9 GiB usable",
+        # also below 7.111). The two constants contradicted each other.
+        #
+        # The free-fraction exists to stop CONCURRENT launches oversubscribing a shared card. It is
+        # not the defence against one runaway process -- RUNAWAY_SLACK is, and it still applies. So
+        # when the role genuinely fits inside currently-free memory WITH a real margin, cap at need
+        # rather than refusing. We never cap flush against free: FIT_MARGIN_GIB is held back, so the
+        # anti-spill property the refusal message is protecting is preserved.
+        # Confirmed by the reporter: an explicit 6.60 GiB cap on that same card built all 60 resident
+        # coordinates of layer 1 cleanly in ~5 s, with the cap probe verifying enforcement.
+        if cap_gib < need_gib <= free_gib - FIT_MARGIN_GIB:
+            cap_gib = need_gib
+            how = ("need (%.2f GiB fits in %.2f GiB free with %.2f GiB held back; the free-fraction "
+                   "ceiling %.2f GiB would have refused a card that fits)"
+                   % (need_gib, free_gib, FIT_MARGIN_GIB, free_gib * DEFAULT_HEADROOM))
+
     if cap_gib < need_gib:
         raise SystemExit(
             "[vram-guard] REFUSING TO START: this role needs ~%.2f GiB but the cap is %.2f GiB "
@@ -2303,6 +2343,11 @@ def apply_vram_guard(device, need_gib, log=None):
 
     frac = min(1.0, cap_gib / total_gib)
     torch.cuda.set_per_process_memory_fraction(frac, idx)
+    # Remember what we reserved and how big the card is. _min_free_vram_gib needs both: the
+    # "is the card starved?" bar has to be judged against the memory we are NOT holding, or a
+    # legitimately-capped miner waits forever for memory it is itself holding (see there).
+    global _APPLIED_CAP_GIB, _CARD_TOTAL_GIB
+    _APPLIED_CAP_GIB, _CARD_TOTAL_GIB = float(cap_gib), float(total_gib)
     msg = ("[vram-guard] capped to %.2f GiB (%.1f%% of the %.2f GiB card; %.2f GiB was free; %s). "
            "Cap VERIFIED enforced by probe. OOMs at the cap, never spills to sysmem. Need ~%.2f GiB."
            % (cap_gib, frac * 100, total_gib, free_gib, how, need_gib))
@@ -2397,11 +2442,41 @@ def _free_vram_gib():
         return None
 
 
+_APPLIED_CAP_GIB = None          # set by apply_vram_guard once the cap is actually enforced
+_CARD_TOTAL_GIB = None
+
+
 def _min_free_vram_gib():
+    """The "card is starved, pause" bar -- CLAMPED so it can never exceed what we are not holding.
+
+    MEASURED 2026-08-03 on a stock 8 GB card (issue #71): a fresh miner joined, claimed all 60
+    coordinates, OOM'd once, correctly backed its batch 16 -> 8, and then PAUSED FOREVER:
+
+        VRAM starved: only 0.52 GiB free, want >= 1.00 GiB -- PAUSED (re-checking every 15s)
+        nvidia-smi during the pause: 6955 MiB used, 1003 MiB free
+
+    The bar was a flat 1.0 GiB. But the miner itself is capped at 6.40 GiB of an 8.00 GiB card, so
+    ~1.0 GiB free is not starvation -- it is the CORRECT steady state, and the remaining free memory
+    is bounded above by (total - our cap). The miner was waiting for memory it was itself holding:
+    an unsatisfiable condition, so zero contributions, forever, with no error. The self-heal worked;
+    the bar was wrong.
+
+    A flat absolute bar cannot be right for both an 8 GiB and a 32 GiB card. What the pause actually
+    wants to know is "is something ELSE crowding me out?", and the memory something else can occupy
+    is (total - cap). Clamping the bar to half of that keeps the original 1.0 GiB behaviour on big
+    cards (32 GiB card, 24 GiB cap -> min(1.0, 3.9) = 1.0, unchanged) while making it satisfiable on
+    small ones (8.00 GiB card, 6.40 GiB cap -> min(1.0, 0.80) = 0.80, and the measured 1.00 GiB free
+    now correctly reads as healthy). An explicit NEURAHASH_VRAM_MIN_FREE_GB is still clamped the
+    same way -- an operator cannot accidentally configure a livelock either.
+    """
     try:
-        return float(os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB", "1.0") or 1.0)
+        bar = float(os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB", "1.0") or 1.0)
     except (TypeError, ValueError):
-        return 1.0
+        bar = 1.0
+    if _APPLIED_CAP_GIB is not None and _CARD_TOTAL_GIB is not None:
+        headroom = max(0.0, _CARD_TOTAL_GIB - _APPLIED_CAP_GIB)
+        bar = min(bar, headroom * 0.5)
+    return bar
 
 
 def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits=None):

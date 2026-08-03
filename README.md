@@ -349,6 +349,104 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-03 — **The capability question is answered, and the answer is no: a bigger contribution does not make the model smarter.** Plus the corpus is finally published, and the first outside miner found three real bugs.
+
+#### 1. Three doses, three flat results — layer-1 training does not buy capability
+
+The frozen dose was already known to leave ARC-Easy unmoved. The open question was whether the
+contribution was simply too *small*. So we trained the same layer at 0.5x, 2x and 4x the frozen
+drift dose on an 8 GB card — all three converged, with delta magnitude tracking the target almost
+exactly (0.504x / 2.003x / 4.024x) — and scored the extremes against the **full 47-layer model**:
+
+| contribution | ARC-Easy acc_norm | change | McNemar p |
+|---|---|---|---|
+| base | 81.07% | — | — |
+| frozen dose (2026-07-28) | 81.17% | +0.10 pp | 0.888 |
+| frozen dose, larger corpus | 80.52%* | −0.05 pp | 1.00 |
+| **4× dose** | **80.52%** | **−0.55 pp** | 0.207 |
+
+\* different arm, same base.
+
+**Every one is indistinguishable from noise, and the point estimate trends *downward* as the dose
+grows.** Meanwhile the same class of contribution beats the accept margin on the gate metric by 15×.
+
+That is as clean as a negative result gets: **the size of a miner's contribution is not the lever.**
+Combined with the earlier finding that different training data does not decorrelate miners either,
+two of the three obvious levers are now measured and dead. What remains untested is the *target* —
+every one of these measurements trains layer 1, and nothing yet says layer 1 is representative.
+
+A methodological note we are keeping honest about: ARC-Easy at N=1997 produced 43–63 discordant
+items per comparison. A benchmark that discordant is not powerful enough to resolve small real
+effects, so "flat" here means *"this benchmark at this sample size cannot see it"* rather than
+*"there is provably no effect"*. The right response is a larger or harder benchmark, not a louder
+claim about this one.
+
+#### 2. The corpus is published — every new joiner was hard-blocked before this
+
+An outside miner hit this and died before its first training step:
+
+```
+[glm-contrib] data seed unusable .../glm_data/o/41663428e560c1e5… (HTTP Error 404: Not Found)
+[glm-contrib] FATAL: cannot verify data file ids_daily_train.npy … Refusing to train on
+              unverified data (rc9)
+```
+
+The advertised record was correct and the miner's fail-closed behaviour was correct. **The object
+had simply never been uploaded** — 16,078,168,192 bytes sitting on one local disk while every
+joiner was told to fetch it from a URL that did not exist.
+
+Now published and verified at the exact failing URL: `HTTP 206, bytes 0-0/16078168192`. The tiny
+validation object was uploaded and round-tripped *first*, to prove repo, path shape, token and
+permissions before committing hours to 16 GB. Nothing in the repo was modified to do it, and the
+source directory was never touched — reality was moved to match the record, not the other way round.
+
+Honest limitation: a joiner still downloads 16 GB once. The client memmaps a single `.npy`, so
+there is no multi-part reader to fetch only the slice a miner trains on. Per-slice corpus sharding
+is real work with a correctness surface (the integrity gate hashes the whole file today) and is not
+something to bolt on quickly.
+
+#### 3. The first outside GPU found three bugs in one evening
+
+An RTX 3070 — the first machine outside this project — joined and immediately surfaced three
+defects, all on the published quickstart, none reachable from our own two boxes:
+
+- **`--pieces 0-11` raised `ValueError`.** Our own step 1. The README publishes the range form and
+  explains it as "every expert of one MoE layer"; the parser only ever split on commas. Also
+  `--dest ~/glm_base` silently created a literal `~` directory on Windows.
+- **The signed self-update applied, then the miner died** on any Python installed to a spaced path.
+  The Windows CRT `exec` family joins the argument vector without quoting, so the default
+  all-users install at `C:\Program Files\Python311\python.exe` makes the child re-parse itself as
+  `argv[0]='C:\Program'`. The update *succeeds* and then the process exits — unattended, a miner
+  silently stops at whichever update check first sees a new release. **Our own 3.6.1 release is what
+  triggered it.**
+- **The data-seed 404** above.
+
+The first two are fixed and shipped. The reporter diagnosed the second to the line and supplied the
+fix; we verified the mechanism independently (`list2cmdline` quotes the spaced path, the CRT join
+does not) rather than taking it on trust.
+
+Neither of our machines could have found any of them: both had warm clones, and neither has Python
+under `Program Files`. **One outside card was worth more than a week of our own two-box testing** —
+which is the strongest argument yet for opening this up.
+
+#### 4. Release 3.6.1: the mining floor drops to ~4 GB
+
+Published, signed against the pinned root, and verified end to end — a fielded miner self-updated
+onto the signed commit on its own. The card requirement drops from 8 GB+ to roughly 4 GB+, because
+the finite-delta guard no longer materialises a full-tensor mask (and its fp32 temporaries) on every
+bisection pass: 2,688 MiB of transient becomes 336 MiB, an 8× reduction.
+
+#### Where this leaves the project
+
+The engineering keeps working: consumer cards train a real slice of a 29B-parameter model, an 8 GB
+card matches a 24 GB card to fp32 epsilon, two machines train one model over the open internet, and
+the floor is now low enough for most gaming GPUs.
+
+The economics still do not close. **Nothing we have measured shows that a miner's accepted work makes
+the model measurably smarter** — not at any dose, not with diverse data, and not in the live pool,
+where 0 of 10,752 accepted contributions ever improved held-out. We would rather publish that
+plainly and keep looking than keep optimising a metric that has not been shown to cash out.
+
 ### 2026-08-02 (later) — **Release 3.6.1: the mining floor drops to ~4 GB.** And the capability question got its answer: the gate moves, the benchmark does not.
 
 #### Shipped: 3.6.1, and a fielded miner picked it up on its own

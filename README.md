@@ -173,9 +173,18 @@ Three things follow, all measured:
 **30.4 GB** and fill a disk -- that was the **coordinator's** content store on our own box, caused by
 a **measurement-only** setting that ships every stage's full weights each step so we could compute
 the table above. **It was never miner disk.** During the whole run the 4060 acting as a miner had
-about **2.6 GB free** on its system drive and wrote **nothing per step**. **Your disk requirement is
-fixed** -- your segment (**4.02 GiB trunk + 1.125 GiB per resident layer**) plus optimizer state -- and
-does **not grow with how long the run lasts**. Two fixes are filed off the back of it: production
+about **2.6 GB free** on its system drive and wrote **nothing per step**. **Your disk requirement does not grow with
+how long the run lasts** -- but be aware of the real total before you start.
+
+| what | size |
+|---|---|
+| base on disk (trunk + 12 expert pieces) | **6.34 GiB** |
+| training corpus `ids_daily_train.npy` | **14.97 GiB** |
+| **steady total** | **~21.3 GiB** |
+
+An earlier version of this page said the requirement was *"4.02 GiB trunk + 1.125 GiB per resident layer"*. That was wrong -- it omitted the corpus entirely, and on Windows the HuggingFace cache cannot symlink, so the base was briefly stored **twice** (a ~27.6 GiB peak). A volunteer with 20.7 GiB free could not complete the install. The duplicate is now deleted automatically once the verified copy lands, and the numbers above are measured, not estimated.
+
+**The corpus is the part that should not be this big, and we know it.** A miner running 10,000 steps at batch 16 touches 160,000 sequences -- **0.25% of the corpus, about 41 MB**. Every joiner currently downloads ~400x more data than they will read, because the client memory-maps one file and there is no per-slice fetch yet. Fixing that is open work, not a settled design. Two fixes are filed off the back of it: production
 lanes never ship per-step weights, and pipeline traffic becomes ephemeral in the store with
 disk-full failing **loudly** instead of quietly dropping your connection.
 

@@ -84,6 +84,20 @@ def fetch(api, rel, dest_root, expect_sha=None, label="", local=None):
     tmp = api.hf_hub_download(repo_id=REPO, repo_type="dataset", filename=rel)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     shutil.copyfile(tmp, out)
+    # DOUBLE-DISK: on Windows the hub cache cannot symlink, so hf_hub_download materialises a full
+    # SECOND copy of every file. MEASURED on a fresh 8 GB-card install (issue #71, 2026-08-03):
+    # 6.335 GiB in `dest` PLUS 6.335 GiB still sitting in the hub cache = 12.67 GiB of disk for a
+    # 6.33 GiB artifact. That doubling is most of the reason a volunteer with ~20 GiB free could not
+    # complete the install at all.
+    # The copy in `dest` is the one the loader reads and it is sha-verified below, so the cache copy
+    # is pure redundancy from here on. Best-effort delete: failing to remove it costs disk, never
+    # correctness, so it must not abort a fetch that already succeeded. Set NEURAHASH_KEEP_HF_CACHE=1
+    # to keep it (useful if you are refetching repeatedly and would rather spend disk than bandwidth).
+    if os.environ.get("NEURAHASH_KEEP_HF_CACHE", "") not in ("1", "true", "TRUE"):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     dt = max(time.time() - t0, 1e-6)
     mb = os.path.getsize(out) / 1e6
     if expect_sha:

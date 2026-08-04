@@ -179,12 +179,16 @@ how long the run lasts** -- but be aware of the real total before you start.
 | what | size |
 |---|---|
 | base on disk (trunk + 12 expert pieces) | **6.34 GiB** |
-| training corpus `ids_daily_train.npy` | **14.97 GiB** |
-| **steady total** | **~21.3 GiB** |
+| training corpus — **one part**, fetched on demand | **~0.25 GiB** |
+| **steady total** | **~6.6 GiB** |
+
+> **Updated 2026-08-04 — this table used to read 14.97 GiB / ~21.3 GiB total.** The corpus is now
+> published as 60 shuffled parts and a joiner fetches **one**, so the requirement dropped **59.9x**.
+> This is the production default: no flag, no environment variable. See the 2026-08-04 entry below.
 
 An earlier version of this page said the requirement was *"4.02 GiB trunk + 1.125 GiB per resident layer"*. That was wrong -- it omitted the corpus entirely, and on Windows the HuggingFace cache cannot symlink, so the base was briefly stored **twice** (a ~27.6 GiB peak). A volunteer with 20.7 GiB free could not complete the install. The duplicate is now deleted automatically once the verified copy lands, and the numbers above are measured, not estimated.
 
-**The corpus is the part that should not be this big, and we know it.** A miner running 10,000 steps at batch 16 touches 160,000 sequences -- **0.25% of the corpus, about 41 MB**. Every joiner currently downloads ~400x more data than they will read, because the client memory-maps one file and there is no per-slice fetch yet. Fixing that is open work, not a settled design. Two fixes are filed off the back of it: production
+**The corpus is the part that should not be this big, and we know it.** ~~A miner running 10,000 steps at batch 16 touches 160,000 sequences -- **0.25% of the corpus, about 41 MB**. Every joiner currently downloads ~400x more data than they will read, because the client memory-maps one file and there is no per-slice fetch yet. Fixing that is open work, not a settled design.~~ **FIXED 2026-08-04 — this is no longer open work.** The corpus ships as 60 shuffled parts and you fetch one (~268 MB). The measurement that motivated it stands: you really do read only a fraction, which is why the fix was worth building. Two fixes are filed off the back of it: production
 lanes never ship per-step weights, and pipeline traffic becomes ephemeral in the store with
 disk-full failing **loudly** instead of quietly dropping your connection.
 
@@ -358,6 +362,56 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-04 — **Joining now costs 0.25 GiB of corpus instead of 14.97, by default.** And a coordinator crash no longer wipes everyone's progress.
+
+**The 16 GB download is gone.** Yesterday's page told you a joiner "still downloads 16 GB once" and
+called per-slice sharding open work. It shipped. The corpus is published as **60 shuffled parts of
+~268 MB**, and your miner fetches **one**:
+
+| | before | now |
+|---|---|---|
+| corpus you download | 14.97 GiB | **~0.25 GiB** |
+| steady total install | ~21.3 GiB | **~6.6 GiB** |
+
+This is the **production default** — no flag, no environment variable, nothing to configure. If you
+were told earlier to set `NEURAHASH_GLM_DATA_RECORD=sharddiloco/glm/data-parts-test`, **remove it**;
+the production record now advertises the parts and that staging name is no longer needed.
+
+Two things that did *not* work, recorded so nobody repeats them. **HTTP range requests are useless
+here**: the training batch draw is a uniform scatter over the file, so at 1 MiB granularity a run
+touches **99.99%** of it — you would "stream" almost the whole corpus anyway. And **a contiguous
+slice is not the same corpus**: it is a measurably different data distribution (total-variation
+distance **1.274** against the shuffled floor). The shuffle happens once at publish time, which is
+what makes one part statistically stand in for the whole. The split was verified lossless at full
+scale — **62,805,344 rows / 2,009,771,008 tokens**, checked by row count and full token histogram,
+because a checksum comparison is meaningless when shuffling changes it by design.
+
+*Honest limit: a 16-run sweep (3 replicates) found the smaller row space costs nothing measurable —
+p256 mean CE **7.871606** vs full-corpus **7.887114**, every arm inside seed noise. That is "no
+penalty detected at this scale", not "no penalty exists".*
+
+**Your accumulated work now survives a coordinator restart.** Previously, if the coordinator
+crashed and came back, it replayed the accepted records, failed to reproduce its own state, and
+published a fresh genesis pointer at event 0 — resetting the campaign. Every miner's contributions
+to that point stopped counting. Fixed, and proven by crashing a live coordinator on purpose: it
+now resumes at the exact event and model root it left, or refuses and starts clean, never silently
+half-way.
+
+**A reject that was not your fault no longer counts against you.** If the coordinator merged your
+coordinate at an event but processed *another* miner's delta — you lost the race — the client used
+to score that as a rejection. Consecutive rejections shrink your dose and eventually release your
+layer, so someone else's event could walk your good layer into a damaging dose (the dose response
+is non-monotone: layer 1 improves at rho and *damages* at rho/3). The client now distinguishes
+"rejected" from "no verdict on me". Pull the latest to get it.
+
+**Still not proven, and we would rather say so.** None of the above is evidence the model is
+getting smarter — it makes joining cheaper and restarts survivable, which is not the same thing.
+The full 47-layer held-out CE and ARC-Easy measurement against our frozen baselines (**4.816991**
+and **0.810716**) is queued and blocked on GPU memory, and when it lands it will speak for **3
+expert coordinates of one layer**, not for the model as a whole. Separately, the 8 GB reference
+miner still dies of a Windows access violation roughly once an hour and is kept alive by a restart
+supervisor; if your miner stops silently, that is the known cause and it is being worked.
+
 ### 2026-08-03 — **The capability question is answered, and the answer is no: a bigger contribution does not make the model smarter.** Plus the corpus is finally published, and the first outside miner found three real bugs.
 
 #### 1. Three doses, three flat results — layer-1 training does not buy capability
@@ -409,10 +463,14 @@ validation object was uploaded and round-tripped *first*, to prove repo, path sh
 permissions before committing hours to 16 GB. Nothing in the repo was modified to do it, and the
 source directory was never touched — reality was moved to match the record, not the other way round.
 
-Honest limitation: a joiner still downloads 16 GB once. The client memmaps a single `.npy`, so
-there is no multi-part reader to fetch only the slice a miner trains on. Per-slice corpus sharding
-is real work with a correctness surface (the integrity gate hashes the whole file today) and is not
-something to bolt on quickly.
+Honest limitation *(as written on 2026-08-03 — **SUPERSEDED 2026-08-04**, see that entry above)*: a
+joiner still downloads 16 GB once. The client memmaps a single `.npy`, so there is no multi-part
+reader to fetch only the slice a miner trains on. Per-slice corpus sharding is real work with a
+correctness surface (the integrity gate hashes the whole file today) and is not something to bolt on
+quickly.
+
+> That limitation lasted one day. The multi-part reader was built, the correctness surface was the
+> hard part exactly as predicted, and a joiner now fetches **0.25 GiB instead of 14.97**.
 
 #### 3. The first outside GPU found three bugs in one evening
 

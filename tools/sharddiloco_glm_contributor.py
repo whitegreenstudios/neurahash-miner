@@ -100,7 +100,6 @@ ACCEPTED_CAMPAIGN_NAME_FMT = "sharddiloco/glm/accepted/%s/r%d"   # campaign-scop
 # free disk from 8.08 GB to 2.38 GB before it was stopped. Same trust surface either way: every name
 # in whatever record is read still passes the F1/F2 hard-guard below.
 DATA_RECORD_NAME = os.environ.get("NEURAHASH_GLM_DATA_RECORD", "sharddiloco/glm/data")
-
 DATA_MANIFEST_NAME = "data_manifest.json"
 RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither locally-valid nor fetched+verified
 RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)
@@ -1162,11 +1161,18 @@ def _layer_cache_dir(args, environ=None):
 # each individually IMPROVE the model -- returned -0.002736 against a linear prediction of
 # -0.149663: 1.8% of their predicted joint gain. Good layers interfere with each other.
 #
-# The mechanism sets the policy. Interference is CROSS-CURVATURE, which is quadratic in the dose,
-# while the gain is linear in it -- so halving the dose costs half the gain and a QUARTER of the
-# interference, and shrinking the dose is the lever that recovers value. Releasing the layer is not:
-# a drop-first miner spends GPU hours re-discovering, one layer at a time, that every layer is "bad
-# in company", and arrives back where it started with a colder cache.
+# The policy is SHRINK-BEFORE-RELEASE, and the reason is measured, not mechanistic. The original
+# argument here was that interference is cross-curvature, hence QUADRATIC in the dose while the gain
+# is linear -- so a smaller dose would always retain more value. The 2026-07-29 dose sweep REFUTED
+# that as a general law: the interaction term was unchanged under a 3x dose cut, and the response is
+# NOT monotone. What survives is narrower and still decisive:
+#   * shrinking RECOVERS OVER-DOSED layers -- L2 went +0.217781 (damage) at rho to -0.148 at rho/10;
+#   * shrinking can also DESTROY a working one -- L1 improves at rho and DAMAGES at rho/3.
+# So a smaller rung is a HYPOTHESIS to be tested, never an improvement to be assumed, and the k=24
+# product judge gates every rung. Shrinking still beats releasing as the first response, because a
+# drop-first miner spends GPU hours re-discovering, one layer at a time, that every layer is "bad in
+# company", and arrives back where it started with a colder cache -- while a rung costs one cycle
+# against a cache it already holds.
 #
 # Hence: a rejected delta shrinks the dose on the SAME layer (rho -> rho/3 -> rho/10) and only a
 # rejection at the SMALLEST rung gives the layer up (park + advance, both existing machinery).
@@ -1484,8 +1490,10 @@ class LayerClaimTrainer:
         rho = self.dose_rho(L)                  # per-layer override x dose-backoff rung, never a bare scalar
         if self.ladder.rung(L):
             self._log("[glm-contrib] layer %d is dosed at %s of its %.6e target -> rho=%.6e: this "
-                      "layer's last delta was rejected, and cross-curvature interference is "
-                      "QUADRATIC in the dose while the gain is linear, so shrink before releasing."
+                      "layer's last delta was rejected. MEASURED 2026-07-29: shrinking recovers "
+                      "OVER-DOSED layers (L2 +0.218 at rho -> -0.148 at rho/10) but the response is "
+                      "NOT monotone -- L1 improves at rho and DAMAGES at rho/3 -- so a smaller rung "
+                      "is a hypothesis, not an improvement, and the k=24 judge gates every one."
                       % (int(L), self.ladder.describe(L), self.base_rho(L), rho))
         rep = GC.train_layer_dose(units, gu_all, dn_all, I, act_fn, rho, tol=self.tol,
                                   K=self.k_chunk, dev=dev, log=self._log, torch_mod=torch_mod)
@@ -3149,6 +3157,106 @@ def accepted_names_me(record, miner):
     so the signal existed -- nothing read it. The plateau rule (K consecutive rejects -> release the
     coordinate and claim the next) is built on this."""
     return any(str(it.get("miner")) == str(miner) for it in (record.get("accepted") or []))
+
+
+# ======================================================== #58: the HONEST per-coordinate reject signal
+# accepted_names_me answers "was I accepted?" by ABSENCE, and absence has two causes that call for
+# OPPOSITE responses: the judge rejected MY delta (shrink the dose on this layer), or ANOTHER MINER won
+# this coordinate at this event (change nothing -- my delta was never judged). Conflating them is not
+# merely imprecise. MEASURED 2026-07-29: the dose response is NON-MONOTONE -- layer 1 improves at rho
+# and DAMAGES at rho/3 -- so a lost race misread as a rejection walks a GOOD layer down the ladder into
+# a damaging dose. The k=24 judge still gates the result, so nothing bad ships (fail-safe); the cost is
+# that the miner burns full dose->judge cycles manufacturing rejectable damage.
+#
+# The wire form is deliberately ADDITIVE: the coordinator stamps a `verdicts` map onto the accepted
+# record it already publishes, so a miner pays no extra fetch and a coordinator that does not publish
+# one (pre-#58, or the judge flag off) leaves the map ABSENT -- which every reader below treats as
+# "no verdict information", i.e. exactly today's absence-based behaviour.
+VERDICT_ACCEPTED = "accepted"              # my delta was accepted (and paid)
+VERDICT_JUDGE_REJECTED = "judge_rejected"  # the PRODUCT judge rejected the fold my delta was in
+VERDICT_GATE_REJECTED = "gate_rejected"    # my delta was processed but lost an earlier gate
+VERDICT_LOST_RACE = "lost_race"            # DERIVED: this event judged my coordinate WITHOUT my delta
+VERDICTS_KEY = "verdicts"                  # the additive key on the accepted record
+
+
+def verdict_name(coord, campaign=None):
+    """"sharddiloco/glm/verdict/[<campaign_id>/]<L>_<E>" -- the standalone per-coordinate verdict
+    record, campaign-scoped for the same reason accepted_prefix is (memory
+    cross-campaign-record-replay: a flat namespace lets a dead run's records merge into a live one).
+
+    It carries the SAME body as the `verdicts` map embedded in the accepted record, and exists for the
+    one outcome that commits NO event -- the judge's fail-closed budget exhaustion -- plus operators."""
+    L, E = coord
+    cid = normalize_campaign_id(campaign)
+    stem = "sharddiloco/glm/verdict/" if cid is None else "sharddiloco/glm/verdict/%s/" % cid
+    return stem + "%d_%d" % (int(L), int(E))
+
+
+def coord_verdict_for_me(record, miner):
+    """THIS miner's honest verdict in `record`, or None when the record carries NO verdict map.
+
+    None is the interop contract, not an error: a pre-#58 coordinator (or one with the product judge
+    off) publishes accepted records without the map, and the caller must then keep its legacy
+    absence-based behaviour byte-for-byte. Present-but-absent-from-the-map is the NEW information: the
+    coordinator processed this coordinate at this event and OUR delta was not among what it processed
+    -- we lost the race, which is not a verdict on our dose."""
+    v = record.get(VERDICTS_KEY) if isinstance(record, dict) else None
+    if not isinstance(v, dict):
+        return None
+    got = v.get(str(miner))
+    return VERDICT_LOST_RACE if got is None else str(got)
+
+
+STREAK_ACCEPT = "accept"           # our delta was accepted -> reset the streak AND the dose rung
+STREAK_REJECT = "reject"           # our delta was judged and lost -> grow the streak (may shrink)
+STREAK_NO_VERDICT = "no_verdict"   # this event was not about OUR delta -> change NOTHING
+
+
+def streak_action(record, miner):
+    """The THREE things one accepted record can mean for OUR dose ladder. Pure, and the ONLY place
+    the accept/reject/lost-race distinction is decided -- the loop calls it through
+    fold_streak_update, so a mutation here is a mutation of the shipped behaviour.
+
+    Legacy interop is the `else`: a record with no verdict map (pre-#58 coordinator, or the product
+    judge off) can only ever return ACCEPT or REJECT, which is byte-for-byte today's rule."""
+    if accepted_names_me(record, miner):
+        return STREAK_ACCEPT
+    if coord_verdict_for_me(record, miner) == VERDICT_LOST_RACE:
+        return STREAK_NO_VERDICT
+    return STREAK_REJECT
+
+
+def fold_streak_update(records, coord, miner, last_pub_base_event, reject_streak,
+                       on_accept=None, on_lost_race=None):
+    """Fold one tick's newly-applied accepted records into the consecutive-reject streak, and return
+    the new streak. The two callbacks are the caller's side effects (dose reset + state save; the
+    lost-race log) -- kept OUT of here so this stays pure and testable.
+
+    Two pre-filters are unchanged from the loop this was extracted from: a record that did not move
+    OUR coordinate is some other expert's event, and a record that predates our published work is not
+    a verdict on us (F5a). Only what survives both is a statement about our delta."""
+    streak = int(reject_streak)
+    for rec in (records or ()):
+        if not record_touched_coord(rec, coord):
+            continue                                         # some other expert's event
+        if not event_judged_us(rec, last_pub_base_event):
+            continue                                         # F5a: predates our work -> not a verdict
+        act = streak_action(rec, miner)
+        if act == STREAK_ACCEPT:
+            streak = 0
+            if on_accept is not None:
+                on_accept(rec)
+        elif act == STREAK_NO_VERDICT:
+            # #58: NOT a rejection. The coordinator merged this coordinate at this event and OUR delta
+            # was not among the ones it processed -- another miner won the race. Growing the streak
+            # here would shrink the dose (and eventually release the layer) on the strength of someone
+            # else's event, and the dose response is NON-MONOTONE (measured 2026-07-29: layer 1
+            # improves at rho and DAMAGES at rho/3), so that walks a GOOD layer into a damaging dose.
+            if on_lost_race is not None:
+                on_lost_race(rec, streak)
+        else:
+            streak += 1
+    return streak
 
 
 class RegateUnavailable:
@@ -5223,27 +5331,29 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # losses = this expert has stopped yielding for us, so release it and claim the next one. This is
         # the owner's "finish one, store it, start the next": storing is a no-op because an accepted
         # delta is already merged into the model, so the model IS the store.
-        for _rec in _folded:
-            if not record_touched_coord(_rec, (L, E)):
-                continue                                         # some other expert's event
-            if not event_judged_us(_rec, last_pub_base_event):
-                continue                                         # F5a: predates our work -> not a verdict
-            if accepted_names_me(_rec, miner):
-                reject_streak = 0
-                # DOSE LADDER: an accepted delta means this layer's dose is landing -> back to the
-                # campaign dose. Persisted only when a rung ACTUALLY reset, so an accepting layer
-                # does not rewrite the state file once per record.
-                if dose_ladder is not None and dose_ladder.rung(L):
-                    layer_dose_verdict(dose_trainer, L, accepted=True, log=log, miner=miner)
-                    claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
-            else:
-                reject_streak += 1
+        def _on_accept(_rec):
+            # DOSE LADDER: an accepted delta means this layer's dose is landing -> back to the
+            # campaign dose. Persisted only when a rung ACTUALLY reset, so an accepting layer
+            # does not rewrite the state file once per record.
+            if dose_ladder is not None and dose_ladder.rung(L):
+                layer_dose_verdict(dose_trainer, L, accepted=True, log=log, miner=miner)
+                claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
+
+        def _on_lost_race(_rec, _streak):
+            log("[glm-contrib %s] event %s moved (L%d,E%d) WITHOUT our delta -- we lost the race, "
+                "not a gate. Dose and reject streak (%d) unchanged; only a verdict ON OUR OWN "
+                "delta moves the ladder." % (miner, _rec.get("event"), L, E, _streak))
+
+        reject_streak = fold_streak_update(_folded, (L, E), miner, last_pub_base_event,
+                                           reject_streak, on_accept=_on_accept,
+                                           on_lost_race=_on_lost_race)
         # -- (1c) DOSE BACKOFF BEFORE ABANDONMENT. A plateau used to mean one thing: release the
         # coordinate. Measured 2026-07-29, that treats the wrong cause -- layers 1 and 5, which each
         # IMPROVE full-47 held-out CE alone (-0.095165, -0.054498), together returned -0.002736
-        # against a linear prediction of -0.149663 (1.8% retained). Good layers interfere, the
-        # interference is quadratic in the dose while the gain is linear, so the first response to a
-        # rejection is a SMALLER dose on the same layer; release is the last resort. Flag OFF ->
+        # against a linear prediction of -0.149663 (1.8% retained). Good layers interfere, and
+        # shrinking RECOVERS an over-dosed layer (L2: +0.218 at rho -> -0.148 at rho/10), so the
+        # first response to a rejection is a SMALLER dose on the same layer -- a hypothesis the k=24
+        # judge then gates, since the response is not monotone; release is the last resort. Flag OFF ->
         # dose_trainer is None -> layer_dose_verdict returns EXHAUSTED -> the advance below runs
         # exactly as it does today.
         _plateau = bool(advance_after and reject_streak >= advance_after)

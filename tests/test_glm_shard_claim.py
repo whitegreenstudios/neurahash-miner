@@ -1996,11 +1996,21 @@ class TestF5aStreakOnlyCountsVerdictsOnOurOwnWork:
             assert N.event_judged_us(bad, 0) is False, repr(bad)
 
     def test_the_sweep_is_actually_gated_on_it(self):
-        """Wiring: the helper is worthless if the loop still counts every touching event."""
+        """Wiring: the helper is worthless if the loop still counts every touching event. The sweep
+        moved into N.fold_streak_update (#58, 2026-07-29) so the accept/reject/lost-race decision has
+        one testable home; the gate itself is unchanged and is asserted BEHAVIOURALLY here, not just
+        by source string -- 10 historical rejects must still move the streak by zero."""
         import inspect
-        src = inspect.getsource(N._run_async)
-        assert "event_judged_us(_rec, last_pub_base_event)" in src
-        assert "last_pub_base_event = int(base_event)" in src, "the publish must record its base_event"
+        assert "event_judged_us(rec, last_pub_base_event)" in \
+            inspect.getsource(N.fold_streak_update)
+        assert "fold_streak_update(_folded" in inspect.getsource(N._run_async), \
+            "the loop must route its sweep through the helper"
+        assert "last_pub_base_event = int(base_event)" in inspect.getsource(N._run_async), \
+            "the publish must record its base_event"
+        assert N.fold_streak_update(self._HIST, (1, 3), "me", None, 0) == 0, \
+            "history that predates our first publish must not move the streak"
+        assert N.fold_streak_update(self._HIST, (1, 3), "me", 8, 0) == 3, \
+            "only events 8,9,10 are at/after our publish"
 
 
 class TestF5bAdvanceLandsOnTheCoordinatorsBase:

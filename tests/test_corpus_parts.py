@@ -447,6 +447,64 @@ def test_every_ported_symbol_appears_exactly_once():
         assert src.count(marker) == 1, "%r appears %d times (want 1)" % (marker, src.count(marker))
 
 
+# ---------------------------------------------------------------------------------------------
+# the RESYNC path must carry the same bandwidth filter as startup. It calls autosync through a
+# different door, and it did not have the filter -- so growing the published record from 4 parts to
+# 60 would have made a running 8 GB miner fetch 16.08 GB onto a disk with 8 GB free.
+# ---------------------------------------------------------------------------------------------
+
+def _record(nparts, dom="daily"):
+    f = {"ids_%s_val.npy" % dom: {"sha256": "a" * 64, "size": 131200}}
+    f.update({N.part_filename(dom, "train", i): {"sha256": "b" * 64, "size": 268435584}
+              for i in range(nparts)})
+    return {"manifest_sha256": "sha-%d" % nparts, "seeds": ["http://x"], "files": f}
+
+
+def test_resync_fetches_only_our_part_when_the_record_grows(monkeypatch):
+    """4 parts -> 60 parts must still fetch ONE part, not sixty."""
+    seen = {}
+
+    def fake_autosync(lane, data_dir, log=None, http_get=None, want=None):
+        seen["want"] = want
+
+    monkeypatch.setattr(N, "glm_data_autosync", fake_autosync)
+    monkeypatch.setattr(N, "_data_resync_enabled", lambda env=None: True)
+    monkeypatch.setattr(N, "_read_data_record", lambda lane, man=None: _record(60))
+
+    rec, refreshed = N.glm_data_periodic_resync(
+        None, "/tmp/x", _record(4), log=_silent, dom="daily", part_idx=2)
+
+    assert refreshed is True
+    assert seen["want"] == {"ids_daily_val.npy", "ids_daily_train.p002.npy"}, seen["want"]
+    assert len(seen["want"]) == 2, "must not balloon to the 61 files the record names"
+
+
+def test_resync_keeps_the_part_we_hold_rather_than_reassigning(monkeypatch):
+    """Our index came from hash(identity) % nparts; a record growing 4 -> 60 must NOT silently move
+    us to a different part and force a pointless 268 MB download."""
+    seen = {}
+    monkeypatch.setattr(N, "glm_data_autosync",
+                        lambda lane, data_dir, log=None, http_get=None, want=None:
+                        seen.__setitem__("want", want))
+    monkeypatch.setattr(N, "_data_resync_enabled", lambda env=None: True)
+    monkeypatch.setattr(N, "_read_data_record", lambda lane, man=None: _record(60))
+    N.glm_data_periodic_resync(None, "/tmp/x", _record(4), log=_silent, dom="daily", part_idx=3)
+    assert "ids_daily_train.p003.npy" in seen["want"]
+
+
+def test_resync_without_a_part_is_unfiltered_as_before(monkeypatch):
+    """Monolith mode (no part chosen) must behave exactly as it did before parts existed."""
+    seen = {}
+    monkeypatch.setattr(N, "glm_data_autosync",
+                        lambda lane, data_dir, log=None, http_get=None, want=None:
+                        seen.__setitem__("want", want))
+    monkeypatch.setattr(N, "_data_resync_enabled", lambda env=None: True)
+    monkeypatch.setattr(N, "_read_data_record", lambda lane, man=None: _record(0))
+    N.glm_data_periodic_resync(None, "/tmp/x", {"manifest_sha256": "old", "files": {}},
+                               log=_silent, dom="daily", part_idx=None)
+    assert seen["want"] is None
+
+
 def test_part_names_round_trip_through_the_allowlist():
     """The splitter's names and the miner's guard must agree -- they are edited in different files
     and a mismatch would only surface as a stranger's fetch being refused."""

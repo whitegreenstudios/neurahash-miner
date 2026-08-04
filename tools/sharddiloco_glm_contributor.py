@@ -3627,7 +3627,7 @@ def plan_data_resync(prev_record, new_record):
 
 
 def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=data_http_get, env=None,
-                             man=None):
+                             man=None, dom=None, part_idx=None):
     """Alpha-3.0 periodic corpus re-sync STEP (Objective 2), safe to call at every async round
     boundary. Returns (record_now, refreshed):
       * flag OFF -> (prev_record, False), ZERO I/O. (_run_async's guard already skips it; the internal
@@ -3649,8 +3649,21 @@ def glm_data_periodic_resync(lane, data_dir, prev_record, log=print, http_get=da
     changed, old_sha, new_sha, changed_files = plan_data_resync(prev_record, new_record)
     if not changed:
         return prev_record, False
+    # THE SAME BANDWIDTH FILTER THE STARTUP PATH USES. Without it this call re-fetches EVERY file the
+    # new record names -- and the whole point of parts is that a record names 60 of them. MEASURED
+    # danger, 2026-08-04: republishing the staged record from 4 parts to 60 would have made a running
+    # 8 GB miner pull 16.08 GB onto a disk with 8 GB free, the same disk-filling failure a monolith
+    # record caused on that box the day before. Startup got the filter; this path did not, because it
+    # calls autosync through a different door.
+    # KEEP THE PART WE HOLD rather than re-resolving against the new nparts: our index came from
+    # hash(identity) % nparts, so a record growing 4 -> 60 would silently reassign us and force a
+    # download for no training benefit. wanted_data_names falls back to "fetch everything" only when
+    # our part is absent from the new record, which is the case where we genuinely must re-sync.
+    _want = None
+    if part_idx is not None and dom:
+        _want = wanted_data_names((new_record or {}).get("files") or {}, dom, part_idx)
     try:
-        glm_data_autosync(lane, data_dir, log=log, http_get=http_get)
+        glm_data_autosync(lane, data_dir, log=log, http_get=http_get, want=_want)
     except SystemExit as e:
         log("[glm-contrib] corpus resync REFUSED: new manifest %s..->%s.. failed fail-closed verify "
             "(rc%s) -- keeping the current verified corpus, will retry next round"
@@ -5122,7 +5135,9 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             # corpus, so the unchanged-record path stays effectively zero-I/O.
             _unmapped = _release_ids(train_ids, val_ids)
             _prev_data_record, _refreshed = glm_data_periodic_resync(
-                lane, args.data_dir, _prev_data_record, log=log, man=man)
+                lane, args.data_dir, _prev_data_record, log=log, man=man,
+                dom=coord_domain(args, coord_data_slot(L, E)),
+                part_idx=getattr(args, "corpus_part_idx", None))
             if _refreshed or _unmapped:
                 # `_unmapped` alone still forces the re-open: we just closed those mappings, so the
                 # names must be rebound even when nothing was re-fetched. A caller whose ids are NOT

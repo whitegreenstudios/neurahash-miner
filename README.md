@@ -37,6 +37,11 @@ else runs (or that you run from the full node package).
 - **No fragile determinism requirement.** The GLM lane gates on measured held-out improvement, not
   bit-exact recompute across different GPU architectures — your card's ~1-ULP numeric quirks cannot
   false-reject honest work.
+- **The gate cannot currently resolve one contribution (measured 2026-08-05).** One contribution moves
+  about **1.6e-3 nats**; the gate's own margin measured **4.764e-03 → 5.927e-03** — roughly **3.7×
+  coarser** than the thing it is being asked to judge. Accepted work has still not been shown to make
+  the model measurably smarter. Run this because you want to help test a distributed-training network,
+  not because you expect meaningful earnings. Numbers in the **2026-08-05 (later)** entry below.
 
 ---
 
@@ -361,6 +366,63 @@ fix becomes a different one.
 > **several different skills alive at once** — which points at giving different miners different
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
+
+### 2026-08-05 (later) — **The 8 GB fix is holding: 14 hours crash-free.** Your paid work now has a second copy. And the straight answer about what mining currently buys you: the gate cannot yet tell your contribution apart from its own noise.
+
+**Two pieces of good news and one piece of bad news, and you should have all three.**
+
+#### 1. The stability fix is holding — 14 hours, not one
+
+Earlier today we shipped two fixes for 8 GB cards (see the entry below). Here is the follow-up
+measurement, because a few hours of uptime was not enough to call it.
+
+The reference 8 GB miner has now run **14 hours crash-free, at round 412**. Before the fix, the same
+card died **25 times at an average of 55.8 minutes** — so this is **15× the old average** and **4.9×
+the longest run it had ever managed**. The fix is in the current public build; if you are on it, you
+have it.
+
+If you are still seeing hourly deaths with Windows exit code `3221225477`, you are on an older
+build — update.
+
+#### 2. Your paid work now has a second copy
+
+The record of what you have been paid used to live in exactly one place. It is now **mirrored
+durably**, and we rehearsed the restore rather than assuming it: with the primary store
+**unreachable**, a restore returned records **byte-identical, 0 failures**. The mirror pass itself
+covered **1,985 records with 0 corrupt and 0 unfetchable**.
+
+Nothing changes for you operationally. It means a single machine going down no longer takes the
+payment record with it.
+
+#### 3. The honest part: what mining currently buys you
+
+We audited our own pay path today, and it did not hold up. This is the same list we have been
+publishing since run 5, updated with today's numbers.
+
+- **Accepted contributions still have not been shown to make the model measurably smarter.** That
+  has been on this page since 2026-07-28 and today's audit did not change it.
+- **The gate cannot currently resolve a single contribution against its own noise.** Measured: the
+  gate's own margin was **4.764e-03** and then **5.927e-03** nats, while **one contribution moves
+  about 1.6e-3 nats** — roughly **3.7× below the resolution the gate itself states**. Our own
+  coordinator log says it in as many words: gains below that margin are indistinguishable from probe
+  noise.
+- **Some accepted work was folded in while held-out got worse.** **13 of 74** accepts landed while
+  the held-out score moved the wrong way. All 13 paid **zero**, which is the gate working as
+  designed — but the damage stayed folded in, because the "keep the best version" revert **does not
+  exist yet** in either lane.
+- **The accept rate is falling as the campaign runs on:** **19.6% → 7.9% → 7.4% → 4.2%**. The last
+  quarter of the campaign minted **0.6%** of the campaign total, and the **top 3 of 61 accepts hold
+  48.3%** of everything ever minted. If you joined late, that is what you are joining.
+
+**What this means in practice, said plainly:** right now the honest reason to run this miner is that
+you want to help test a real distributed-training network and prove a consumer card can join one. It
+is not a reason to expect meaningful earnings. We would rather you decide that with the numbers than
+find out later.
+
+**What we are doing about it.** The size of the payable unit is the problem, not the gate's honesty —
+so we are testing whether the unit itself can ever work. That measurement is queued with its
+prediction **registered in advance** (we expect the benchmark not to move), and we will publish the
+result either way, exactly as we did with the run-5 finding and the merge-saturation finding above.
 
 ### 2026-08-05 — **If you have an 8 GB card, your miner was probably doing nothing.** Two bugs fixed: one parked it forever, the other crashed it every hour — and the second one was quietly corrupting the accept decision.
 

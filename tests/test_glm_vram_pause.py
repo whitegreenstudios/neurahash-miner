@@ -77,6 +77,34 @@ def test_starved_max_waits_cap():
     assert waits == 3                      # bounded for tests / callers that need a cap
 
 
+def test_pause_releases_our_own_cache_before_every_measurement(monkeypatch):
+    """The pause must exonerate ITSELF before blaming the card.
+
+    REGRESSION GUARD for the 2026-08-04 livelock: the loop measured free VRAM without first
+    returning its own reclaimable allocator cache, so the 4060 reference miner parked at 0.24 GiB
+    against a 0.30 GiB bar and waited ~90 minutes for memory it was holding. Order matters as much
+    as the call -- a release AFTER the measurement fixes nothing -- so this asserts interleaving,
+    not just call count.
+    """
+    events = []
+    frees = iter([0.10, 0.10, 5.00])       # starved, still starved, then genuinely free
+
+    monkeypatch.setattr(C, "_release_own_vram_cache",
+                        lambda: events.append("release") or True)
+    monkeypatch.setattr(C, "_free_vram_gib",
+                        lambda: events.append("measure") or next(frees))
+    monkeypatch.setattr(C, "_min_free_vram_gib", lambda: 0.30)
+
+    logs = []
+    waits = C._pause_on_low_free_vram(logs.append, miner="m", poll_s=15.0,
+                                      sleep_fn=lambda s: None)
+
+    assert waits == 2
+    # every measurement is immediately preceded by a release, including the pre-pause one
+    assert events == ["release", "measure"] * 3, events
+    assert any("recovered" in m for m in logs)
+
+
 def test_is_cuda_oom_detection():
     assert C._is_cuda_oom(RuntimeError("CUDA out of memory. Tried to allocate 1.12 GiB"))
     assert C._is_cuda_oom(RuntimeError("HIP Out Of Memory"))

@@ -2473,6 +2473,39 @@ def _free_vram_gib():
         return None
 
 
+def _release_own_vram_cache():
+    """Hand back THIS process's unused cached VRAM -- WITHOUT importing torch.
+
+    WHY: PyTorch's caching allocator keeps freed blocks reserved against our own process, so after a
+    round the miner still holds its training high-water mark even though nothing is live. Nothing on
+    the healthy path released it -- empty_cache appeared only on the OOM-exception path and in the
+    opt-in VramManager's resize seam -- so an idle miner sat on ~1 GiB of reclaimable cache between
+    rounds.
+
+    That turned _pause_on_low_free_vram into a LIVELOCK on small cards: the pause polls free VRAM and
+    waits for someone else to give memory back, while the largest reclaimable block on the card
+    belongs to the waiter. MEASURED 2026-08-04 on the 4060 reference miner: parked at 0.24 GiB free
+    against a 0.30 GiB bar and stayed parked ~90 minutes at round 1, re-checking every 15 s, with a
+    supervisor that reported it healthy the whole time.
+
+    Uses the sys.modules pattern for the same reason _free_vram_gib does -- see its docstring;
+    tests/test_glm_vram_pause.py::test_torch_not_imported_by_helpers asserts these helpers never pull
+    torch into a fresh interpreter, which is what keeps the OOM path unit-testable with no GPU.
+
+    Returns True if a release was actually attempted, False when torch/CUDA is not available.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.empty_cache()
+        return True
+    except Exception:                               # noqa: BLE001 -- a probe must never crash a round
+        return False
+
+
 _APPLIED_CAP_GIB = None          # set by apply_vram_guard once the cap is actually enforced
 _CARD_TOTAL_GIB = None
 
@@ -2524,6 +2557,11 @@ def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits
     """
     sleep_fn = sleep_fn or time.sleep
     need = _min_free_vram_gib()
+    # EXONERATE OURSELVES BEFORE ACCUSING ANYONE ELSE. The bar's whole question is "is
+    # something ELSE crowding me out?" (see _min_free_vram_gib), and our own reclaimable
+    # allocator cache is not something else. Measuring before releasing let the miner wait
+    # indefinitely on memory it was holding -- a livelock, not starvation.
+    _release_own_vram_cache()
     free = _free_vram_gib()
     if free is None or free >= need:
         return 0
@@ -2534,6 +2572,7 @@ def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits
     while True:
         sleep_fn(poll_s)
         waits += 1
+        _release_own_vram_cache()   # re-check must release too, or a late-arriving cache re-locks
         free = _free_vram_gib()
         if free is None or free >= need:
             log("[glm-contrib %s] VRAM recovered (%s GiB free) -- resuming after %d wait(s)"
@@ -5253,8 +5292,22 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 # original refreshed-only behaviour and never reads a file it was not going to read.
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-            if _refreshed:
-                regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
+                # ... and the RE-GATE is rebound on this SAME condition, never only on
+                # _refreshed. regate_ce is a closure over the val_ids ARRAY OBJECT
+                # (make_regate_ce), and the _release_ids above just close()d the mapping UNDER
+                # that object -- a closed memmap is NOT protected by refcounts, so the old
+                # closure points at unmapped pages from here on. The pre-2026-08-05 code
+                # rebuilt it only on _refreshed (i.e. ~never, while the release runs EVERY
+                # tick), so the next own-slot fold walked apply_accepted -> ce_fn ->
+                # heldout_ce's torch.as_tensor(ids[i:i+n]).to(dev) straight into the dead
+                # mapping: exit 0xC0000005 with NO Python traceback, because an access
+                # violation never unwinds. MEASURED on the reference 4060 (2026-08-03..05,
+                # ~1 crash/h once its own-slot deltas started being accepted): 9 of 13 fatal
+                # stack beats at sharddiloco_glm_expert.py:393 via exactly this lambda.
+                # log only when _refreshed: the unchanged-tick rebind re-wraps the same bytes
+                # and has nothing new to say.
+                regate_ce = make_regate_ce(G, model, val_ids, miner=miner,
+                                           log=(log if _refreshed else None))
         # -- (0b) CORPUS PART ROTATION: bounded disk across an UNBOUNDED run. Default OFF.
         # A miner holds one 256 MiB part instead of the whole 14.97 GiB corpus; rotating means it
         # still sees all of the corpus over time, just never all at once. This rides the same
@@ -5274,8 +5327,13 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             if _after != _before or _rot_unmapped:
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                if _after != _before:
-                    regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
+                # Same dangling-closure hazard as the resync block above: a FAILED rotation is
+                # a no-op for the FILES (_after == _before) but its _release_ids already closed
+                # the mappings the current regate_ce captured, so the re-gate is rebound
+                # whenever the ids were re-opened -- it must never be left holding a closed
+                # memmap (the 0xC0000005-in-heldout_ce shape). log only on a real part change.
+                regate_ce = make_regate_ce(G, model, val_ids, miner=miner,
+                                           log=(log if _after != _before else None))
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
         try:
             ptr = lane.read_pointer(man=man)

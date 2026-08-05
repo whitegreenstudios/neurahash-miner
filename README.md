@@ -362,6 +362,57 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-05 — **If you have an 8 GB card, your miner was probably doing nothing.** Two bugs fixed: one parked it forever, the other crashed it every hour — and the second one was quietly corrupting the accept decision.
+
+**Update if you are mining. Both bugs hit 8 GB cards hardest, and neither announced itself.**
+
+#### 1. Your miner may have been "running" while doing zero work
+
+If your GPU also drives your desktop — Chrome, a video, anything — you may have seen this and had no
+way to know it was a bug:
+
+    VRAM starved: only 0.24 GiB free, want >= 0.30 GiB -- PAUSED (re-checking every 15s)
+
+The miner then waits for VRAM to free up. Except it was waiting for **itself**. PyTorch keeps freed
+GPU memory reserved to the process, and nothing gave it back between rounds — so the pause polled
+free VRAM while the biggest reclaimable block on the card was its own. On our reference 8 GB card it
+sat there **~90 minutes after a single round**, and every health check said it was fine.
+
+Fixed by returning our own cached VRAM before each measurement. **We did not lower the safety bar** —
+that bar is what stops the out-of-memory crashes, and lowering it would trade a stall for a crash.
+(For the curious: the bar is `(card_total − vram_cap) × 0.5`, so *lowering* your cap actually *raises*
+it. Neither knob was the problem.)
+
+Measured after the fix: **0 starvation events in ~11 hours**, held-out CE **6.86 → 6.51**.
+
+#### 2. It crashed hourly with no error — and the crash was the *good* outcome
+
+Miners were dying about once an hour with Windows exit code `3221225477` (`0xC0000005`, access
+violation) and **no traceback at all** — that class of fault kills the process below Python, so
+roughly 20 crashes produced nothing but a number.
+
+We found it by recording every thread's stack every 5 seconds and flushing to disk, so the last line
+survives a process that dies without unwinding. Overnight that captured 15 crashes; **9 of the 13
+usable captures were the same stack.**
+
+The cause: the code that re-scores your work against held-out data captured the corpus as a
+memory-mapped array. A periodic resync closes that mapping and re-opens it — but the scorer was only
+rebuilt when the corpus *content* changed, which is almost never. So it kept pointing at a mapping
+that had been closed underneath it, and the next accepted contribution read freed memory.
+
+**Why this matters beyond the crash:** if that freed memory gets reused by something else, there is
+no crash — the scorer just reads **garbage** and returns a held-out score computed from it, into the
+accept/reject decision on your work. So this was a correctness bug wearing a stability bug's
+clothes, and some fraction of past accept/reject calls on 8 GB miners are suspect.
+
+Fixed by rebinding the scorer whenever the mapping is re-opened. The held-out score is proven
+**bit-identical** before and after (`==`, not a tolerance) — the fix changes when the scorer is
+rebuilt, never what it computes. The regression test fails on the old code; on the first such run the
+bug reproduced *inside pytest itself*.
+
+*Still open and unrelated, despite sharing the exit code: an access violation in our internal cache
+producer. Same Windows error, different cause — it does not affect miners.*
+
 ### 2026-08-04 — **Joining now costs 0.25 GiB of corpus instead of 14.97, by default.** And a coordinator crash no longer wipes everyone's progress.
 
 **The 16 GB download is gone.** Yesterday's page told you a joiner "still downloads 16 GB once" and

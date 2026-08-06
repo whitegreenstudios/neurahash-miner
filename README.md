@@ -42,6 +42,10 @@ else runs (or that you run from the full node package).
   coarser** than the thing it is being asked to judge. Accepted work has still not been shown to make
   the model measurably smarter. Run this because you want to help test a distributed-training network,
   not because you expect meaningful earnings. Numbers in the **2026-08-05 (later)** entry below.
+- **The accepted work, at the dose actually applied, made the model WORSE (measured 2026-08-06).**
+  Full-47 held-out CE **4.816991 -> 5.251066** and ARC-Easy **0.8237 -> 0.3375**. The same deltas at
+  **1/8 dose BEAT the base** (CE 4.784680), so the work was **mis-scaled, not wasted** — but read the
+  **2026-08-06** entry below before you draw any conclusion about earnings.
 
 ---
 
@@ -366,6 +370,128 @@ fix becomes a different one.
 > **several different skills alive at once** — which points at giving different miners different
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
+
+### 2026-08-06 — **The accepted work made the model worse — and the exact same work makes it BETTER at 1/8 the dose.** Your mining was not wasted. The number we multiplied it by was wrong, by about 8×.
+
+**If you mined the last campaign, read this whole entry.** We finally scored the accepted work against
+the real, full 47-layer model. The result is bad, and the follow-up measurement is genuinely hopeful.
+Both are below, worst first.
+
+#### 1. The bad news first: as applied, the accepted work damaged the model
+
+Campaign `31627ec8f184cfd6` — **84 accepted deltas**, folded into the real full-47 model and scored
+against frozen held-out data and a real benchmark. MEASURED today:
+
+    held-out CE        4.816991  ->  5.251066     (+0.434 nats, WORSE)
+    ARC-Easy accuracy  0.8237    ->  0.3375       (chance on 4 choices is ~25%)
+
+This is not "a bit noisier". The two models agree with each other on only **40.2%** of answers — the
+folded model is a **different function**, not a degraded version of the same one. At 0.3375 on
+ARC-Easy it is close to guessing.
+
+#### 2. The good news, from the exact same deltas: at 1/8 dose they help
+
+We then swept the dose — same 84 deltas, same fold, the only thing that changes is the scalar they
+are multiplied by. MEASURED:
+
+    alpha 0.000   CE 4.816991    0.000000   control; bit-exact against the published base
+    alpha 0.125   CE 4.784680   -0.032311   <-- BETTER than base
+    alpha 0.250   CE 4.994049   +0.177058
+    alpha 0.500   CE 5.219627   +0.402636
+    alpha 0.750   CE 5.160449   +0.343458
+    alpha 1.000   CE 5.251066   +0.434075   control; the dose actually used
+
+**The signal in your work is real. We applied it roughly 8× too strongly.** That is the whole story of
+this entry: mis-scaled, not wasted.
+
+Two things we are not going to dress up. The gain at the best dose is **small** — 0.032 nats, **0.67%**
+of base — while full dose costs **9.01%**. And the curve is **not a smooth bowl**: alpha 0.750 scores
+*better* than 0.500, so we do not yet understand its shape.
+
+#### 3. Why nobody caught it: the gate was grading a model that is 1/46 alive
+
+Training and the accept gate both ran on a network where **45 of 46 MoE layers output exactly zero**.
+
+Every mechanical check we had was HONEST, and every one of them passed: the held-out yardstick was
+sha256-verified and frozen, the fold reproduced the coordinator's own advertised root, and the alpha
+0.000 arm reproduced the published baseline to six decimals. Nothing was broken. **The gate was
+measuring the wrong thing** — a model missing 45 of its 46 expert layers.
+
+INFERRED — plausible and consistent with the numbers, but NOT measured: on that crippled network an
+expert gets rewarded for partly reconstructing what the 45 missing layers would have contributed. Put
+those layers back and the same contribution is counted twice. That is what an ~8× overshoot looks
+like.
+
+#### 4. The three questions you are actually asking
+
+**"Was my work wasted?"** No. At alpha 0.125 the same deltas beat the base. The work carried real
+signal; the scalar applied to it was wrong.
+
+**"Will I still get paid?"** Nothing already minted changes. And nobody was overpaid for the damage:
+on the events that worsened held-out, **`attribute_minted` paid 0.000000** — the gate refused to pay
+for them. What went wrong is that the **model** kept the damage anyway, because the rollback did not
+fire. That is fixed in the working tree (§6), not yet deployed.
+
+**"What do I have to do differently?"** Right now: **`git pull`** — and nothing else. That picks up
+the quickstart fix in §5. Moving the mint gate onto the full model is planned but **NOT deployed**;
+when it happens it gets its own entry here before it ships.
+
+#### 5. Already live: `git pull` if your install died at "No module named 'accelerate'"
+
+`accelerate` was missing from `requirements.txt` even though `piece_loader.build_partial_model`
+imports it unconditionally. MEASURED on a rented RTX A4000: clean image, followed the two published
+commands, **49 packages installed**, then the run died at
+
+    ModuleNotFoundError: No module named 'accelerate'
+
+**after a 5.67 GB download.** Every new miner hit this, at the last step. Fixed and pushed today —
+commit `c2e31a9`.
+
+This is the **third** time an undeclared import has killed the quickstart at its final step, after
+`transformers>=5.8.1` and `pytest`. The recurrence is on us.
+
+#### 6. Fixed today, NOT yet deployed (the running coordinator still has the old code)
+
+Restarting the live coordinator is an operator decision, so these are in the working tree only:
+
+- **The held-out rollback tolerance was ~590× too loose.** It was borrowing the **probe's** noise
+  floor — but the probe is 128 rows drawn with replacement, while held-out is a fixed set that
+  re-reads bit-identically and needs no such slack. MEASURED cost: **16 live events worsened held-out
+  and all 16 escaped rollback**, leaving **+0.032629 nats** of damage folded into the model.
+- **Damage could ratchet.** The gate compared each event only to the previous one, so every event
+  could give back a little and it compounded. It now gates against the **best held-out ever seen**.
+- **The accept bar moved +24.4% across a single coordinator restart** — so what you earned depended
+  on which restart you happened to join. Calibration trials go **30 -> 300**.
+- **The frozen probe/held-out files carried no content hash**, so an absent file was silently re-cut
+  — the yardstick could move without anyone noticing. They are now sha256-fingerprinted and verified
+  at coordinator boot.
+
+#### 7. What an 8 GB card can and cannot do (MEASURED on a real RTX 4060)
+
+This decides what small cards can ever be asked to do, so it belongs here:
+
+- An 8 GB card holds the stripped trunk plus **5 MoE layers** (marginal cost **1.1838 GiB/layer**);
+  **k=6 OOMs**. A full-47 pipeline therefore needs **10-12 cards**.
+- At 5 layers, checkpointed forward+backward runs at **4,521 tok/s**.
+- **Keeping the model on disk and streaming layers in per step is not viable.** On that box: **0.96 s**
+  of compute against **1222-1561 s** of weight IO per step — about **1300×**. Even on NVMe it is
+  still roughly **50×**. Layers have to be resident.
+- A pipeline stage must push **8 KB per token** upstream, which is **296 Mbit/s** to stay
+  compute-bound. ASSUMED, not measured — we have never measured real volunteer uplinks: on a
+  20 Mbit/s home upload that works out to **6.8%** of the card's own compute. For comparison, the
+  shardDiLoCo lane running today costs **36.3 B/token** upstream.
+
+#### 8. What we have NOT measured
+
+- **ARC at the good dose (alpha 0.125) is still running.** We have CE there; we do not yet have the
+  benchmark.
+- **The true optimum may be below 0.125.** That was simply the lowest non-zero point we tested.
+- **This is ONE campaign**, one fold, one held-out set. It is evidence, not a law.
+
+Yesterday's entry registered a prediction in advance for exactly this measurement: *"ARC within ±1 and
+no full-CE gain."* Half of it held. There was no full-CE gain — it was **0.434 nats worse**. ARC did
+not stay within ±1: it fell **48.6 points**. We are leaving that prediction on the page where we wrote
+it.
 
 ### 2026-08-05 (later) — **The 8 GB fix is holding: 14 hours crash-free.** Your paid work now has a second copy. And the straight answer about what mining currently buys you: the gate cannot yet tell your contribution apart from its own noise.
 

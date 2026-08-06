@@ -389,6 +389,15 @@ This is not "a bit noisier". The two models agree with each other on only **40.2
 folded model is a **different function**, not a degraded version of the same one. At 0.3375 on
 ARC-Easy it is close to guessing.
 
+**Which ARC number, and why it differs from older entries.** ARC-Easy has two standard scores and we
+report both, because picking one after seeing the results is how you fool yourself. `acc`
+**0.8237 → 0.3375** (−48.6 points); `acc_norm` **0.8119 → 0.3354** (−47.6 points). The collapse is
+the same on either — this result does not depend on which score you prefer. If you compare against
+the **2026-07-27** entry above, note it quotes **0.8107**, which is the length-normalised `acc_norm`
+on a different subset size; today's headline **0.8237** is plain `acc` over n=2376. Both entries are
+correct; they are simply not the same statistic, and we have left the older one untouched rather
+than rewrite history.
+
 #### 2. The good news, from the exact same deltas: at 1/8 dose they help
 
 We then swept the dose — same 84 deltas, same fold, the only thing that changes is the scalar they

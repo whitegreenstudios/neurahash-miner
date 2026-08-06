@@ -17,6 +17,20 @@ transformers>=5.8.1          # REQUIRED. >=5.8.1 is not cosmetic: the GLM lane l
 #                              ("No module named transformers.models.glm4_moe_lite") after a 6.33 GB
 #                              base download. Also used by make_base_from_hf.py and the
 #                              NEURAHASH_CORPUS=qwen tokenizer path.
+accelerate>=0.30             # REQUIRED, and NOT optional despite what the fleet section below used
+#                              to imply. tools/piece_loader.py build_partial_model() does
+#                              `from accelerate import init_empty_weights` UNCONDITIONALLY -- it is
+#                              the mainline GLM path every miner runs, not a --load-4bit extra. It is
+#                              also NOT pulled in transitively: accelerate is an OPTIONAL transformers
+#                              extra, so `pip install -r requirements.txt` did not bring it.
+#                              MEASURED on a rented RTX A4000 stranger pod 2026-08-06: clean image,
+#                              followed the published two commands, 49 packages installed, then died
+#                              at "ModuleNotFoundError: No module named 'accelerate'" AFTER the 5.67 GB
+#                              trunk download. Invisible until then because every machine that had
+#                              ever mined here already had it -- the pod bootstrap pip-installs it by
+#                              hand, and long-lived dev boxes picked it up from elsewhere.
+#                              Same shape as the transformers note above and the pytest note below:
+#                              third time an undeclared import killed the quickstart at the last step.
 
 # --- opt-in / convenience ---
 web3==7.16.0                 # optional: on-chain balance/settlement helpers (mining does not need it)

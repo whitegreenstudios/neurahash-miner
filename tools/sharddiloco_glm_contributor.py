@@ -58,6 +58,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import sys
@@ -2476,21 +2477,21 @@ def _free_vram_gib():
 def _release_own_vram_cache():
     """Hand back THIS process's unused cached VRAM -- WITHOUT importing torch.
 
-    WHY: PyTorch's caching allocator keeps freed blocks reserved against our own process, so after a
-    round the miner still holds its training high-water mark even though nothing is live. Nothing on
-    the healthy path released it -- empty_cache appeared only on the OOM-exception path and in the
-    opt-in VramManager's resize seam -- so an idle miner sat on ~1 GiB of reclaimable cache between
-    rounds.
+    WHY: PyTorch's caching allocator keeps freed blocks reserved against our own process, so after
+    a round the miner still holds its training high-water mark even though nothing is live. Nothing
+    on the healthy path ever released it -- empty_cache appeared only on the OOM-exception path and
+    in the opt-in VramManager's resize seam -- so an idle miner sat on ~1 GiB of reclaimable cache
+    between rounds.
 
-    That turned _pause_on_low_free_vram into a LIVELOCK on small cards: the pause polls free VRAM and
-    waits for someone else to give memory back, while the largest reclaimable block on the card
+    That turned _pause_on_low_free_vram into a LIVELOCK on small cards: the pause polls free VRAM
+    and waits for someone else to give memory back, while the largest reclaimable block on the card
     belongs to the waiter. MEASURED 2026-08-04 on the 4060 reference miner: parked at 0.24 GiB free
     against a 0.30 GiB bar and stayed parked ~90 minutes at round 1, re-checking every 15 s, with a
     supervisor that reported it healthy the whole time.
 
     Uses the sys.modules pattern for the same reason _free_vram_gib does -- see its docstring;
-    tests/test_glm_vram_pause.py::test_torch_not_imported_by_helpers asserts these helpers never pull
-    torch into a fresh interpreter, which is what keeps the OOM path unit-testable with no GPU.
+    tests/test_glm_vram_pause.py::test_torch_not_imported_by_helpers asserts these helpers never
+    pull torch into a fresh interpreter, which is what keeps the OOM path unit-testable with no GPU.
 
     Returns True if a release was actually attempted, False when torch/CUDA is not available.
     """
@@ -2508,9 +2509,10 @@ def _release_own_vram_cache():
 
 _APPLIED_CAP_GIB = None          # set by apply_vram_guard once the cap is actually enforced
 _CARD_TOTAL_GIB = None
+_BAR_CLAMP_WARNED = False        # latch: the clamp warning below runs on every 15 s poll
 
 
-def _min_free_vram_gib():
+def _min_free_vram_gib(log=None, miner=""):
     """The "card is starved, pause" bar -- CLAMPED so it can never exceed what we are not holding.
 
     MEASURED 2026-08-03 on a stock 8 GB card (issue #71): a fresh miner joined, claimed all 60
@@ -2533,13 +2535,38 @@ def _min_free_vram_gib():
     now correctly reads as healthy). An explicit NEURAHASH_VRAM_MIN_FREE_GB is still clamped the
     same way -- an operator cannot accidentally configure a livelock either.
     """
+    raw = os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB")
+    explicit = raw not in (None, "")
     try:
-        bar = float(os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB", "1.0") or 1.0)
+        bar = float(raw or 1.0)
     except (TypeError, ValueError):
-        bar = 1.0
+        bar, explicit = 1.0, False
+    asked = bar
     if _APPLIED_CAP_GIB is not None and _CARD_TOTAL_GIB is not None:
         headroom = max(0.0, _CARD_TOTAL_GIB - _APPLIED_CAP_GIB)
         bar = min(bar, headroom * 0.5)
+        # SAY SO WHEN THE CLAMP BITES. The clamp is what keeps the bar satisfiable (see above), but
+        # it is arithmetic no operator can see from outside: a cap set to the WHOLE card leaves
+        # headroom 0, which drives the bar to 0.00 and disables the elastic pause outright --
+        # including an explicit NEURAHASH_VRAM_MIN_FREE_GB, which is then ignored without a word.
+        # Losing an OOM guard should not be something you discover from the crash it was meant to
+        # prevent. Warn ONCE: this runs on every 15 s poll, so the latch is what keeps it to a line.
+        global _BAR_CLAMP_WARNED
+        if log is not None and not _BAR_CLAMP_WARNED:
+            if bar <= 0.0:
+                _BAR_CLAMP_WARNED = True
+                log("[glm-contrib %s] WARNING: the elastic VRAM pause is DISABLED -- the applied "
+                    "cap %.2f GiB leaves no headroom on a %.2f GiB card, so the bar clamps to 0.00 "
+                    "GiB and this miner will never pause for external memory pressure%s. Lower "
+                    "NEURAHASH_VRAM_CAP_GB if you want the guard back."
+                    % (miner, _APPLIED_CAP_GIB, _CARD_TOTAL_GIB,
+                       " (NEURAHASH_VRAM_MIN_FREE_GB=%s is ignored)" % raw if explicit else ""))
+            elif explicit and bar < asked:
+                _BAR_CLAMP_WARNED = True
+                log("[glm-contrib %s] NOTE: NEURAHASH_VRAM_MIN_FREE_GB=%.2f GiB is NOT in force -- "
+                    "clamped to %.2f GiB, half the %.2f GiB an outside process could occupy (card "
+                    "%.2f - cap %.2f). A bar above that is unsatisfiable and would livelock."
+                    % (miner, asked, bar, headroom, _CARD_TOTAL_GIB, _APPLIED_CAP_GIB))
     return bar
 
 
@@ -2556,11 +2583,12 @@ def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits
     indefinite hang.
     """
     sleep_fn = sleep_fn or time.sleep
-    need = _min_free_vram_gib()
-    # EXONERATE OURSELVES BEFORE ACCUSING ANYONE ELSE. The bar's whole question is "is
-    # something ELSE crowding me out?" (see _min_free_vram_gib), and our own reclaimable
-    # allocator cache is not something else. Measuring before releasing let the miner wait
-    # indefinitely on memory it was holding -- a livelock, not starvation.
+    need = _min_free_vram_gib(log=log, miner=miner)
+    # EXONERATE OURSELVES BEFORE ACCUSING ANYONE ELSE. The bar's whole question is "is something
+    # ELSE crowding me out?" (see _min_free_vram_gib), and our own reclaimable allocator cache is
+    # not something else. Measuring before releasing let the miner wait indefinitely on memory it
+    # was holding -- a livelock, not starvation. Release first, then measure; if it still reads
+    # starved, the pressure is genuinely external and pausing is the correct response.
     _release_own_vram_cache()
     free = _free_vram_gib()
     if free is None or free >= need:
@@ -2815,6 +2843,23 @@ def build_node_model(args, log=None, need_gib=None):
     if log:
         log("[glm-node] GLM pieces_here=%s resident: %s" % (fmt_piece_selection(args), summ))
     seq = _infer_seq(args)                      # from a split THIS role holds (never the secret one)
+    # NO TOY MODELS (owner directive 2026-07-09). build_node_model is the SINGLE choke point for the
+    # whole GLM lane's model: the coordinator calls it for the host whose held-out CE IS the accept
+    # gain that pays (sharddiloco_glm_coordinator.py:3109 -> GlmExpertLaneHost -> heldout_ce), and
+    # the contributor calls it for the model it trains and publishes deltas from. `--mode tiny` is a
+    # DECLARED wire shakedown and stays legal (it announces itself at build_tiny_glm). This branch
+    # is the one that PROMISES a real GLM, so it must prove the promise: a mis-pointed --shard-dir
+    # or --config-dir (e.g. at tests/fixtures/glm_moe_dsa_config.tiny.json, vocab_size=100) would
+    # otherwise hand a toy to the gate with no error anywhere.
+    import no_toy_models as _NTM
+    _NTM.assert_real_model(
+        (model, model.config), where="tools/sharddiloco_glm_contributor.py:build_node_model",
+        decision="supplies the model the coordinator's held-out-CE ACCEPT GATE scores (it decides "
+                 "which deltas are merged and paid) and the model the contributor trains and "
+                 "publishes deltas from",
+        remedy="point --shard-dir/--config-dir at the real GLM manifest+config; to run the "
+               "deliberate wire shakedown instead, pass --mode tiny (it is announced in the log "
+               "and its numbers are toy numbers)")
     return model, model.config, seq
 
 
@@ -3326,8 +3371,9 @@ def make_regate_ce(G, model, val_ids, miner="", log=None):
     """The ONE constructor for the F2 own-slot re-gate closure -- every bind site (the async init,
     the corpus-resync rebind, the two claim-advance rebinds, the sync loop) routes here.
 
-    Trunk-bearing model: byte-identical to the expression this replaced,
-    `(lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None`.
+    Trunk-bearing model: returns exactly what the expression this replaced returned,
+    `(lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None` -- the empty-val branch
+    still yields None, it just no longer does so in silence (see below).
     Trunk-free model (model_is_trunk_free): returns REGATE_UNAVAILABLE and logs the exact property
     being given up. NEVER returns None for that case: None already means "replay bit-exact, no
     gate" and a trunk-free node must never look like a node that legitimately chose that."""
@@ -3339,7 +3385,21 @@ def make_regate_ce(G, model, val_ids, miner="", log=None):
                 "is FORFEITED on this node until it runs with the trunk resident."
                 % (miner, TRUNK_FREE_FLAG))
         return REGATE_UNAVAILABLE
-    return (lambda h: G.heldout_ce(h.model, val_ids)) if len(val_ids) else None
+    if not len(val_ids):
+        # An EMPTY val split is a "cannot", not a choice, and it forfeits exactly the same F2
+        # defense the trunk-free branch above announces in full -- but silently. The RETURN VALUE
+        # stays None (that is the recorded meaning of "replay bit-exact, no gate", and
+        # apply_accepted already handles it); what changes is that it stops happening quietly. A
+        # node in this state folds every accepted record for its OWN coordinate unchecked, which
+        # is the one case the local re-gate exists to cover.
+        if log:
+            log("[glm-contrib %s] SECURITY: own-slot re-gate DISABLED -- the local val split is "
+                "EMPTY, so there is no held-out CE to re-gate against. Accepted records for this "
+                "node's own coordinate will be folded WITHOUT the local check. A miner that is "
+                "training normally should never have 0 val tokens: check the corpus resync and "
+                "--domains." % miner)
+        return None
+    return lambda h: G.heldout_ce(h.model, val_ids)
 
 
 def apply_accepted(host, lane, record, log=None, ce_fn=None, tol=None, rejected=None, own_slot=None,
@@ -5088,6 +5148,120 @@ def async_publish_name(base_event, miner, k, campaign=None):
     return "%s.%d" % (contrib_name(base_event, miner, campaign), int(k))
 
 
+# ======================================================================== miner identity card (v3.7.1)
+# Why this exists: until now a miner told the pool NOTHING about the machine it runs on. The operator
+# could see that `glm-c47c9334` published a record, but not whether that was a 4060 or an H100, how
+# much VRAM it had, or what client version it ran -- so "who joined the pool?" was unanswerable for
+# any box the operator did not personally own and poll. The live dashboard could only report cards it
+# scraped locally (its own nvidia-smi) or over the LAN control agent, which by construction excludes
+# every real stranger. This publishes one small JSON object per miner to the content store, where the
+# public snapshot can read it, and costs one PUT per process start.
+#
+# Deliberately NOT a protocol change: the coordinator neither reads nor validates this object, so an
+# old coordinator and a new miner interoperate unchanged, and a miner that never publishes a card is
+# simply reported as "GPU not reported" rather than being rejected. The card is SELF-REPORTED and must
+# be treated as such by anything that renders it -- it is an operator convenience, not an attestation,
+# and nothing may gate payment on it.
+def miner_card_name(miner):
+    """Content-store object name holding one miner's identity card. Pure."""
+    return "miners/%s/card.json" % (miner,)
+
+
+def _local_client_version():
+    """The client's VERSION file, or None. BOM-tolerant on purpose: a past release was cut with
+    PowerShell `echo x > VERSION`, which writes UTF-16 and made a naive reader see garbage."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "VERSION"), "rb") as fh:
+            raw = fh.read(64)
+        for enc in ("utf-8-sig", "utf-16", "utf-8"):
+            try:
+                txt = raw.decode(enc).strip()
+            except Exception:                                 # noqa: BLE001
+                continue
+            # A version line is short and ASCII-ish; anything else means we guessed the codec wrong.
+            if txt and len(txt) < 32 and all(31 < ord(c) < 127 for c in txt):
+                return txt
+    except Exception:                                         # noqa: BLE001
+        pass
+    return None
+
+
+def build_miner_card(miner, address=None, coord=None, mode=None, extra=None):
+    """Collect what this box is, for the operator dashboard. NEVER raises: every probe is optional and
+    a miner with no CUDA (the Colab CPU miner is a real, supported case) reports gpu_name None rather
+    than failing. Returns a plain dict of JSON-safe scalars."""
+    card = {
+        "schema": 1,
+        "miner_id": miner,
+        "address": address,
+        "gpu_name": None,
+        "gpu_count": 0,
+        "vram_total_gb": None,
+        "vram_free_gb": None,
+        "vram_cap_gb": None,
+        "version": _local_client_version(),
+        "platform": None,
+        "python": None,
+        "torch": None,
+        "coord": coord,
+        "mode": mode,
+        "published_ts": time.time(),
+    }
+    try:
+        card["platform"] = "%s %s" % (platform.system(), platform.release())
+        card["python"] = platform.python_version()
+    except Exception:                                         # noqa: BLE001
+        pass
+    try:
+        import torch
+        card["torch"] = str(getattr(torch, "__version__", None))
+        if torch.cuda.is_available():
+            card["gpu_count"] = int(torch.cuda.device_count())
+            card["gpu_name"] = str(torch.cuda.get_device_name(0))
+            free_b, total_b = torch.cuda.mem_get_info()
+            card["vram_total_gb"] = round(float(total_b) / float(1 << 30), 2)
+            card["vram_free_gb"] = round(float(free_b) / float(1 << 30), 2)
+    except Exception:                                         # noqa: BLE001
+        pass
+    # The guard's measurement wins when present -- it is the number the batch sizer actually used.
+    try:
+        if _CARD_TOTAL_GIB is not None:
+            card["vram_total_gb"] = round(float(_CARD_TOTAL_GIB), 2)
+        if _APPLIED_CAP_GIB is not None:
+            card["vram_cap_gb"] = round(float(_APPLIED_CAP_GIB), 2)
+    except Exception:                                         # noqa: BLE001
+        pass
+    if extra:
+        try:
+            card.update({str(k): v for k, v in dict(extra).items()})
+        except Exception:                                     # noqa: BLE001
+            pass
+    # Non-finite floats would emit bare NaN, which json.loads in a browser rejects outright.
+    for k, v in list(card.items()):
+        if isinstance(v, float) and not math.isfinite(v):
+            card[k] = None
+    return card
+
+
+def publish_miner_card(lane, miner, address=None, coord=None, mode=None, extra=None, log=_flush):
+    """Best-effort PUT of this miner's identity card. Returns True on success, False otherwise, and
+    NEVER raises -- a dashboard nicety must not be able to stop a miner from earning."""
+    try:
+        card = build_miner_card(miner, address=address, coord=coord, mode=mode, extra=extra)
+        lane.put_json_named(miner_card_name(miner), card)
+        log("[glm-contrib %s] identity card published: %s | %s | VRAM %s GiB (cap %s) | client %s"
+            % (miner, card.get("gpu_name") or "no CUDA device",
+               card.get("platform") or "unknown platform",
+               card.get("vram_total_gb"), card.get("vram_cap_gb"), card.get("version")))
+        return True
+    except Exception as exc:                                  # noqa: BLE001
+        log("[glm-contrib %s] identity card NOT published (%s: %s) -- mining continues; this miner "
+            "will show as 'GPU not reported' on the dashboard"
+            % (miner, type(exc).__name__, exc))
+        return False
+
+
 # ==================================================================== v3.2.1 signed auto-update wire
 # Why this exists: tools/self_update.py (the signed, pinned-key, fail-closed updater) was fully built
 # but NOTHING in the GLM-only client ever called it -- the automatic startup/periodic checks lived in
@@ -5292,20 +5466,20 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 # original refreshed-only behaviour and never reads a file it was not going to read.
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                # ... and the RE-GATE is rebound on this SAME condition, never only on
-                # _refreshed. regate_ce is a closure over the val_ids ARRAY OBJECT
-                # (make_regate_ce), and the _release_ids above just close()d the mapping UNDER
-                # that object -- a closed memmap is NOT protected by refcounts, so the old
-                # closure points at unmapped pages from here on. The pre-2026-08-05 code
-                # rebuilt it only on _refreshed (i.e. ~never, while the release runs EVERY
-                # tick), so the next own-slot fold walked apply_accepted -> ce_fn ->
-                # heldout_ce's torch.as_tensor(ids[i:i+n]).to(dev) straight into the dead
-                # mapping: exit 0xC0000005 with NO Python traceback, because an access
-                # violation never unwinds. MEASURED on the reference 4060 (2026-08-03..05,
-                # ~1 crash/h once its own-slot deltas started being accepted): 9 of 13 fatal
-                # stack beats at sharddiloco_glm_expert.py:393 via exactly this lambda.
-                # log only when _refreshed: the unchanged-tick rebind re-wraps the same bytes
-                # and has nothing new to say.
+                # ... and the RE-GATE is rebound on this SAME condition, never only on _refreshed.
+                # regate_ce is a closure over the val_ids ARRAY OBJECT (make_regate_ce), and the
+                # _release_ids above just close()d the mapping UNDER that object -- a closed memmap
+                # is not protected by refcounts, so the old closure points at unmapped pages from
+                # here on. The pre-2026-08-05 code rebuilt it only on _refreshed (i.e. ~never,
+                # while the release runs EVERY tick), so the next own-slot fold walked
+                # apply_accepted -> ce_fn -> heldout_ce's torch.as_tensor(ids[i:i+n]).to(dev)
+                # straight into the dead mapping: exit 0xC0000005 with NO Python traceback,
+                # because an access violation never unwinds. MEASURED on the reference 4060
+                # (2026-08-03..05, ~1 crash/h once its own-slot deltas started being accepted):
+                # 9 of 13 fatal stack beats at sharddiloco_glm_expert.py:393 via exactly this
+                # lambda. log only when _refreshed: the unchanged-tick rebind re-wraps the same
+                # bytes and has nothing new to say (on a trunk-free base make_regate_ce logs its
+                # SECURITY-waived line, and this branch runs every tick).
                 regate_ce = make_regate_ce(G, model, val_ids, miner=miner,
                                            log=(log if _refreshed else None))
         # -- (0b) CORPUS PART ROTATION: bounded disk across an UNBOUNDED run. Default OFF.
@@ -5327,11 +5501,12 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             if _after != _before or _rot_unmapped:
                 train_ids = node_ids(args, coord_data_slot(L, E), "train")
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
-                # Same dangling-closure hazard as the resync block above: a FAILED rotation is
-                # a no-op for the FILES (_after == _before) but its _release_ids already closed
-                # the mappings the current regate_ce captured, so the re-gate is rebound
-                # whenever the ids were re-opened -- it must never be left holding a closed
-                # memmap (the 0xC0000005-in-heldout_ce shape). log only on a real part change.
+                # Same dangling-closure hazard as the resync block above: a FAILED rotation is a
+                # no-op for the FILES (_after == _before) but its _release_ids already closed the
+                # mappings the current regate_ce captured, so the re-gate is rebound whenever the
+                # ids were re-opened -- it must never be left holding a closed memmap (the
+                # 0xC0000005-in-heldout_ce shape). log only on a real part change, matching the
+                # resync block's silent-rebind rule.
                 regate_ce = make_regate_ce(G, model, val_ids, miner=miner,
                                            log=(log if _after != _before else None))
         # -- pointer read: done flag + the coordinator's advertised root. Transient failure -> pace. --
@@ -5750,6 +5925,15 @@ def main(argv=None):
     host = G.GlmExpertLaneHost(model, cfg, slots)
     _flush("[glm-contrib %s] base ready: model_root=%s.. base_digest=%s.. seq=%d"
            % (miner, model_root(host)[:12], base_digest(model)[:12], seq))
+
+    # Tell the pool what box this is, so the operator dashboard can answer "who joined, on what GPU,
+    # with how much VRAM". Placed here and not earlier because build_node_model() is what measures the
+    # card (_CARD_TOTAL_GIB/_APPLIED_CAP_GIB); reporting before it would publish nulls. Best-effort by
+    # construction -- publish_miner_card() never raises, so a store hiccup costs a dashboard row, not
+    # a mining session.
+    publish_miner_card(lane, miner,
+                       address=(wallet.address if wallet is not None else None),
+                       coord="L%d,E%d" % (L, E), mode=args.mode, log=_flush)
 
     train_ids = node_ids(args, coord_data_slot(L, E), "train")
     val_ids = node_ids(args, coord_data_slot(L, E), "val")

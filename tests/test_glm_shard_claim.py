@@ -3937,7 +3937,7 @@ class TestF8AdvanceOntoAColdCoordinate:
         args = types.SimpleNamespace(
             mode="tiny", max_rounds=2, poll=0.0, round_wait=1e9, advance_after=1, garbage=False,
             inner=self.INNER, lora_r=4, lr=1e-3, batch=self.BATCH, outer=0.7, wire="lora",
-            data_dir=".")
+            data_dir=".", domains="daily")
         lane = _MiniLane(host)
         nxt = N.next_claim_coord(list(host.slots), (1, 0), identity=self.MINER)
         assert nxt is not None and tuple(nxt) != (1, 0)
@@ -4130,7 +4130,8 @@ class TestV0NeverBlockOnCatchUp:
         host = G.GlmExpertLaneHost(model, cfg, list(self.COORDS), claimable=list(self.COORDS))
         args = types.SimpleNamespace(
             mode="tiny", max_rounds=2, poll=0.0, round_wait=1e9, advance_after=1, garbage=False,
-            inner=2, lora_r=4, lr=1e-3, batch=4, outer=0.7, wire="lora", data_dir=".")
+            inner=2, lora_r=4, lr=1e-3, batch=4, outer=0.7, wire="lora", data_dir=".",
+            domains="daily")
         blocked = N.next_claim_coord(list(self.COORDS), (1, 0), identity=self.MINER)
         assert blocked is not None and tuple(blocked) != (1, 0)
         lane = _StallingLane(host, [tuple(blocked)])

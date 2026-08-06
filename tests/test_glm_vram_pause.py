@@ -93,7 +93,9 @@ def test_pause_releases_our_own_cache_before_every_measurement(monkeypatch):
                         lambda: events.append("release") or True)
     monkeypatch.setattr(C, "_free_vram_gib",
                         lambda: events.append("measure") or next(frees))
-    monkeypatch.setattr(C, "_min_free_vram_gib", lambda: 0.30)
+    # **_ absorbs the log/miner kwargs the real _min_free_vram_gib grew when the clamp learned to
+    # announce itself; this test pins the release/measure ORDER, not the bar's value.
+    monkeypatch.setattr(C, "_min_free_vram_gib", lambda **_: 0.30)
 
     logs = []
     waits = C._pause_on_low_free_vram(logs.append, miner="m", poll_s=15.0,

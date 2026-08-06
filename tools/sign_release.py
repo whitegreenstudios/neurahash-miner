@@ -98,6 +98,61 @@ def _default_commit():
         return ""
 
 
+def _version_at_commit(commit, repo=None):
+    """Return the STRIPPED text of the VERSION file AS COMMITTED at `commit`, or None if absent.
+
+    `git show <rev>:VERSION` reads the blob out of the object store, so this is the version the
+    miner will actually find after `git checkout <commit>` -- not whatever the operator's dirty
+    working tree happens to say. Missing path -> None (the caller refuses); any OTHER git failure
+    (git absent, unreadable object store) is a hard error rather than a silent "absent".
+    """
+    repo = REPO if repo is None else repo
+    try:
+        out = subprocess.check_output(["git", "-C", repo, "show", f"{commit}:VERSION"],
+                                      encoding="utf-8", errors="replace",
+                                      stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+        return None                                    # no VERSION at that commit
+    except Exception as e:
+        raise SystemExit(f"ERROR: could not read VERSION at commit {commit} via git ({e})")
+    return out.strip()
+
+
+def _assert_version_matches_commit(version, commit, repo=None):
+    """UNCONDITIONAL gate: the VERSION file AT THE SIGNED COMMIT must equal --version, or refuse.
+
+    NEAR MISS 2026-07-25 (memory `shard-claim-v340-released`): a signed manifest declared v3.4.0
+    while pointing at a commit whose VERSION file said 3.3.2, and this tool printed
+    `pinned match : YES` -- because the SIGNATURE was valid. It was valid over the WRONG TREE.
+    Every miner that takes such a manifest checks out the commit, reads 3.3.2, sees the manifest
+    still offering 3.4.0, and re-execs forever: a fleet-wide update loop with a good signature on it.
+
+    Compares STRIPPED text (the blob is compared as committed, so a CRLF-committed VERSION still
+    matches -- .gitattributes pins `VERSION text eol=lf` so it should not happen in the first place).
+
+    There is deliberately NO --force, no --skip-version-check and no env override: a release signer
+    with an escape hatch is not a gate. Bump VERSION, commit it, and sign THAT commit.
+    """
+    want = str(version).strip()
+    at_commit = _version_at_commit(commit, repo)
+    if at_commit is None:
+        raise SystemExit(
+            f"ERROR: refusing to sign version {want} -- commit {commit} has NO VERSION file.\n"
+            f"       That commit predates VERSION tracking (VERSION became tracked in b6db6ce), or "
+            f"VERSION was deleted there.\n"
+            f"       A miner checking out {commit} would find no version to compare against, which "
+            f"is exactly the 3.4.0 near-miss shape. Sign a commit that CONTAINS VERSION = {want}.")
+    if at_commit != want:
+        raise SystemExit(
+            f"ERROR: refusing to sign -- VERSION MISMATCH between the manifest and the signed tree.\n"
+            f"       --version says   : {want}\n"
+            f"       VERSION at commit: {at_commit}\n"
+            f"       commit           : {commit}\n"
+            f"       The signature would be valid over the WRONG TREE: miners would check out this "
+            f"commit, read {at_commit}, still be offered {want}, and re-exec in a loop.\n"
+            f"       Fix: bump VERSION to {want}, commit it, and sign THAT commit.")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Sign a NeuraHash miner release manifest (release.json).")
     ap.add_argument("--version", required=True,
@@ -131,6 +186,9 @@ def main(argv=None):
     commit = _full_commit(args.commit) if args.commit else _default_commit()
     if not commit:
         raise SystemExit("ERROR: could not determine --commit (pass it explicitly)")
+    # Refuse BEFORE the private key is ever read: a mismatched release is caught without the
+    # operator's offline key touching this process at all.
+    _assert_version_matches_commit(args.version, commit)
     ts = args.published_ts if args.published_ts is not None else int(time.time())
 
     acct = account_from_key(_load_privkey(args.key, args.key_env))

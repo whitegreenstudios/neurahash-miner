@@ -2,3 +2,4 @@
 # rewrite them (issue #86 class: english.txt differed 762,087 vs 758,699 bytes on one commit).
 corpus_data/*.txt -text
 *.npy binary
+VERSION text eol=lf

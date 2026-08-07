@@ -371,6 +371,112 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-07 — **We tested whether the crippled training target was the problem. It was not.** Training against the real, complete model came out slightly *worse* than the broken one it was meant to replace. And at the good dose, your work leaves the model intact but no smarter.
+
+**Yesterday's hopeful reading survives — it just buys less than we hoped.** Three measurements landed
+overnight. None of them is the one we wanted, and all three are below.
+
+#### 1. At 1/8 dose the model is intact — and no better
+
+Yesterday we reported that the 84 accepted deltas at alpha 0.125 beat the base model on held-out CE,
+but we had no benchmark score at that dose. Now we do. MEASURED:
+
+    ARC-Easy         base         alpha 0.125     change
+    acc              0.8236532    0.8190236       -0.46 points
+    acc_norm         0.8118687    0.8097643       -0.21 points
+    agreement        --           0.9739          (it was 0.402 at full dose)
+
+The number that matters is **agreement 0.9739**. At full dose the folded model agreed with the base
+model on only 40.2% of answers — it had become a different function. At 1/8 dose it agrees on
+**97.4%**: it is still the same model. The damage is gone.
+
+But **capability is flat, not better** — both scores move slightly *down*. So "your work is recoverable
+at a lower dose" is confirmed in the sense that it stops hurting the model. It is not confirmed in the
+sense of making the model smarter. We are not going to describe a −0.46 point move as a win.
+
+#### 2. The experiment we said would settle it came back negative
+
+Background in one sentence: miners have been training against a stand-in version of the network in
+which 45 of its 46 expert layers return exactly zero, and we suspected that stand-in was what was
+holding your contributions back.
+
+So we ran the direct comparison. Same expert slot, same **7,680-token** training budget, one published
+contribution each, both folded into the real 47-layer model at full dose. MEASURED:
+
+    base                          4.816991313811272
+    trained on the REAL network   4.815933404430265    -0.00105791
+    trained on the stand-in       4.815606086484848    -0.00138523   <-- BETTER
+
+**Training against the real, complete network was marginally worse than training against the crippled
+stand-in.** We registered this test in advance with a stated failure condition — "does not beat a
+merely-rescaled stand-in delta" — and that is the condition that fired. We are reporting it that way
+rather than looking for a reading that saves the theory.
+
+What this means for you: the stand-in was **not** what was limiting the value of a single contribution.
+The accept gate still has to move onto the full model — you cannot grade a product against a different
+model — but "train on the real network and each contribution gets better" is now a measured negative,
+not an open opportunity.
+
+#### 3. The reframe: one contribution is fine, it is the stacking that hurts
+
+Put §2 next to yesterday's headline result and the shape of the problem changes completely:
+
+    1  contribution  at full dose  ->  -0.00139 nats    (helps)
+    84 contributions at full dose  ->  +0.434   nats    (destroys the model)
+
+**A single contribution at full dose is fine. It is the accumulation of many that does the damage.**
+That moves the problem: we had been treating this as a dose/scaling bug in each contribution, and the
+evidence says each contribution is healthy while the rule for combining them is what fails.
+
+It also gives an honest size for what one accepted contribution is currently worth: **about 0.001 nats
+of full-model CE** — and per §2, that number does not depend on how it was trained.
+
+This lines up with two earlier results already published above rather than being a new claim: our merge
+width measurement (2026-07-31) found that merging 2 different experts yields about what merging 1
+yields, and layer composition (2026-07-29/30) failed at every dose we tried. Three separate
+measurements now point at the same wall, and it is the one we have to get through.
+
+#### 4. The dose curve is jagged, not a smooth bowl — so 1/8 is not a safe setting
+
+We added a point below yesterday's lowest. MEASURED:
+
+    alpha     full-model CE     vs base
+    0         4.816991           0            control, bit-exact
+    0.0625    4.948256         +0.131264      WORSE than base
+    0.125     4.784680         -0.032311      better
+    0.25      4.994049         +0.177058
+    0.5       5.219627         +0.402636
+    0.75      5.160449         +0.343458      better than 0.5
+    1.0       5.251066         +0.434075      control, bit-exact
+
+Between alpha 0 and alpha 0.125 the score **rises 0.131 then falls 0.163**. Our evaluation is bit-exact
+deterministic — both controls reproduce to the digit — so **this jaggedness is real, not noise in the
+measurement**.
+
+That matters practically: **alpha 0.125 is not a robust optimum.** Half that dose is 0.131 nats *worse*
+than applying nothing at all. Yesterday we said we would put a dose search into the accept path; on a
+surface this bumpy, a simple search can walk straight into a bad setting, so that plan goes back to the
+drawing board before anything ships.
+
+INFERRED, **not measured**: scaling a contribution shifts the router's scores across the boundary where
+it picks its top experts, so the response comes in steps rather than a smooth curve. That would explain
+the shape. It is a hypothesis, and we have not tested it.
+
+#### 5. What we have NOT measured
+
+- **The experiment in §2 is a single sample** — one expert slot, one contribution. On its own it does
+  not generalise.
+- **Everything between 1 and 84 contributions is unmeasured.** A sweep is running now. We are not
+  reporting or predicting its result here; it gets its own entry when it lands.
+- **The benchmark in §1 was only run at alpha 0.125.** No other dose has a capability measurement.
+- **The router explanation in §4 is an inference, not a measurement.**
+
+#### 6. What you should do
+
+Nothing changes for miners today. No release, no config change, no re-pull required beyond yesterday's
+`git pull`. Nothing already minted is affected. The open work is on our side: the combining rule, not
+your GPUs.
+
 ### 2026-08-06 — **The accepted work made the model worse — and the exact same work makes it BETTER at 1/8 the dose.** Your mining was not wasted. The number we multiplied it by was wrong, by about 8×.
 
 **If you mined the last campaign, read this whole entry.** We finally scored the accepted work against

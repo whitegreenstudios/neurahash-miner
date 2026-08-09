@@ -17,6 +17,7 @@ It signs the SAME canonical bytes tools/self_update.verify_manifest recovers aga
 produced here verifies there and nowhere else. See SIGNING.md for keygen + the full release recipe.
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -66,6 +67,113 @@ def _load_config(spec):
     if not isinstance(cfg, dict):
         raise SystemExit("ERROR: --config must be a JSON OBJECT (got %s)" % type(cfg).__name__)
     return cfg
+
+
+def files_at_commit(commit, repo=None):
+    """{path: sha256hex} for EVERY file in the tree at `commit`, read out of the object store.
+
+    Built with one `git ls-tree -r` plus one streaming `git cat-file --batch`, so it is the tree the
+    miner will actually have after `git checkout <commit>` -- not the operator's dirty working
+    directory (the same reasoning as _version_at_commit above)."""
+    repo = REPO if repo is None else repo
+    out = subprocess.check_output(["git", "-C", repo, "ls-tree", "-r", "--full-tree",
+                                   "--format=%(objectname) %(path)", commit],
+                                  encoding="utf-8", errors="replace")
+    entries = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        oid, _sp, path = line.partition(" ")
+        if oid and path:
+            entries.append((oid, path))
+    if not entries:
+        raise SystemExit(f"ERROR: `git ls-tree` found no files at commit {commit}")
+    p = subprocess.Popen(["git", "-C", repo, "cat-file", "--batch"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        files = {}
+        # ONE REQUEST, ONE RESPONSE, in lockstep. Queueing every oid up front and only then reading
+        # DEADLOCKS on any real repo: git fills the stdout pipe buffer and blocks, while this
+        # process is still blocked writing stdin. (Measured: hung past a 120 s timeout on this
+        # repo's HEAD.) The lockstep costs nothing that matters -- this is a release tool.
+        for oid, path in entries:
+            p.stdin.write((oid + "\n").encode("ascii"))
+            p.stdin.flush()
+            header = p.stdout.readline().decode("utf-8", "replace").split()
+            if len(header) < 3:
+                raise SystemExit(f"ERROR: unexpected `git cat-file --batch` header for {path!r}: "
+                                 f"{header!r}")
+            want = int(header[2])
+            blob = b""
+            while len(blob) < want:                             # read() may return short
+                chunk = p.stdout.read(want - len(blob))
+                if not chunk:
+                    raise SystemExit(f"ERROR: truncated blob for {path!r}")
+                blob += chunk
+            p.stdout.read(1)                                    # the trailing newline
+            files[path] = hashlib.sha256(blob).hexdigest()
+        p.stdin.close()
+    finally:
+        for h in (p.stdin, p.stdout):
+            try:
+                h.close()
+            except Exception:
+                pass
+        p.wait()
+    return files
+
+
+def _load_files(spec, commit):
+    """Return the v3 `files` map {relative/path: sha256hex}, or None if unset.
+
+    `--files auto` builds it from the SIGNED COMMIT. Anything else is read as a JSON file or a
+    literal JSON object and then CROSS-CHECKED against that commit -- it must match exactly.
+
+    WHY THERE IS NO ESCAPE HATCH (adversarial review 2026-08-08, finding F2). This map is the
+    DELETION ALLOWLIST the miner will apply on the NEXT release: a path this release declares and
+    the next one drops becomes a deletion candidate. An operator who reads "the files this release
+    ships" as "the files this release CHANGED" would hand every miner a map that makes the rest of
+    the install obsolete -- measured on a 5-file fixture, a 1-path map deleted tools/self_update.py
+    itself. A partial map is not a smaller mistake than a wrong one, so it is refused here, exactly
+    like the VERSION/commit gate above. (The client carries its own mass-delete ceiling too; this is
+    the belt to that pair of braces.) Path SAFETY is re-checked at the miner's deletion site -- a
+    signed manifest is never a licence to name `../../`."""
+    if spec is None:
+        return None
+    actual = files_at_commit(commit)
+    if str(spec).strip().lower() == "auto":
+        return actual
+    text = spec
+    if os.path.exists(spec):
+        with open(spec, "r", encoding="utf-8") as f:
+            text = f.read()
+    try:
+        files = json.loads(text)
+    except Exception as e:
+        raise SystemExit(f"ERROR: --files is neither `auto`, a readable JSON file, nor valid JSON ({e})")
+    if not isinstance(files, dict):
+        raise SystemExit("ERROR: --files must be a JSON OBJECT {path: sha256} (got %s)"
+                         % type(files).__name__)
+    for k, v in files.items():
+        if not isinstance(k, str) or not k.strip():
+            raise SystemExit(f"ERROR: --files has a non-string/empty path key: {k!r}")
+        if not (isinstance(v, str) and len(v.strip()) == 64
+                and all(c in "0123456789abcdefABCDEF" for c in v.strip())):
+            raise SystemExit(f"ERROR: --files[{k!r}] is not a 64-hex sha256: {v!r}")
+    files = {k: v.strip().lower() for k, v in files.items()}
+    missing = sorted(set(actual) - set(files))
+    extra = sorted(set(files) - set(actual))
+    wrong = sorted(k for k in set(files) & set(actual) if files[k] != actual[k])
+    if missing or extra or wrong:
+        raise SystemExit(
+            f"ERROR: refusing to sign -- --files does not match the tree at {commit}.\n"
+            f"       missing from --files : {len(missing)} (first: {missing[:3]})\n"
+            f"       not in the commit    : {len(extra)} (first: {extra[:3]})\n"
+            f"       wrong sha256         : {len(wrong)} (first: {wrong[:3]})\n"
+            f"       This map is the miners' DELETION ALLOWLIST for the next release: every path\n"
+            f"       it omits becomes a deletion candidate on every miner. Use `--files auto`.")
+    return files
 
 
 def _full_commit(ref):
@@ -178,6 +286,12 @@ def main(argv=None):
                     help="v2: path to a JSON file, or a literal JSON object, carrying the signed "
                          "network config (merge_url / content_url / corpus_sha / protocol). Clients "
                          "apply it as DEFAULTS -- an explicitly set environment variable still wins.")
+    ap.add_argument("--files", default=None, metavar="FILE_OR_JSON",
+                    help="v3: `auto` (recommended -- built from the signed commit), or a JSON file / literal "
+                         "JSON object mapping every SHIPPED relative path to its sha256, which is then "
+                         "CROSS-CHECKED against that commit and refused unless it matches exactly. Clients "
+                         "may reclaim a dropped path later (opt-in, dry-run by default). Omit it and the "
+                         "manifest is byte-identical to before.")
     args = ap.parse_args(argv)
 
     parse_version(args.version)                       # fail fast on a bad version string
@@ -198,6 +312,9 @@ def main(argv=None):
     cfg = _load_config(args.config)
     if cfg is not None:
         manifest_body["config"] = cfg
+    files = _load_files(args.files, commit)
+    if files is not None:
+        manifest_body["files"] = files
     data = canonical_manifest_bytes(manifest_body)
     signature = sign_bytes(acct, data)
 
@@ -221,6 +338,9 @@ def main(argv=None):
               f"(older clients will refuse to publish)", flush=True)
     if "config" in manifest_body:
         print(f"  config keys  : {', '.join(sorted(manifest_body['config']))}", flush=True)
+    if "files" in manifest_body:
+        print(f"  shipped files: {len(manifest_body['files'])} paths (reclaim allowlist for the "
+              f"NEXT release)", flush=True)
     print(f"  manifest ver : {'v2' if len(manifest_body) > 3 else 'v1 (byte-identical to before)'}",
           flush=True)
     print(f"  signer       : {acct.address}", flush=True)

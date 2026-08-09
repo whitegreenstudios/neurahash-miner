@@ -2288,6 +2288,55 @@ def _verify_vram_cap_enforced(idx, log=None):
     return enforced
 
 
+def _plan_vram_cap(free_gib, total_gib, need_gib, cap_gb=None, cap_frac=None):
+    """The cap POLICY as pure arithmetic: returns (cap_gib, how). No torch, no GPU, no globals.
+
+    EXTRACTED from apply_vram_guard 2026-08-08, byte-identical behaviour, so the ladder from a
+    32 GiB card down to an 8 GiB one can be pinned by unit tests on a machine with no GPU (see
+    tests/test_glm_vram_desktop_share.py). Every WHY comment moved here with the code it explains.
+
+    THE CAP IS SIZED FROM *FREE*, NOT FROM TOTAL, AND NOT BY SUBTRACTING A CONSTANT. That is the
+    whole reason it degrades sensibly across card sizes: memory the desktop compositor and every
+    other process already hold is simply not part of `free_gib`, so a 8 GiB card shared with a
+    Windows desktop books less than a dedicated one WITHOUT any per-card special case. A constant
+    subtraction cannot do that -- it is either too small to protect a 32 GiB card or larger than an
+    8 GiB card has to give.
+    """
+    if cap_gb:
+        return float(cap_gb), "NEURAHASH_VRAM_CAP_GB"
+    if cap_frac:
+        return float(cap_frac) * total_gib, "NEURAHASH_VRAM_CAP_FRAC"
+
+    # Two ceilings, take the lower. The free-fraction keeps concurrent launches from
+    # oversubscribing the card; the need-multiple keeps ONE buggy process (a runaway eval, an
+    # unchunked log_softmax) from eating a whole card that its siblings still need.
+    cap_gib = min(free_gib * DEFAULT_HEADROOM, need_gib * RUNAWAY_SLACK)
+    how = "min(%.0f%% of free, %.1fx need)" % (DEFAULT_HEADROOM * 100, RUNAWAY_SLACK)
+
+    # THE FREE-FRACTION MUST NOT REFUSE A CARD THAT ACTUALLY FITS.
+    # Reported from an external RTX 3070 (issue #71, 2026-08-03): need 6.40, free 6.95 -- it
+    # fits -- and the guard refused, because cap = free x 0.90 = 6.25 < need. Solve it and the
+    # rule says a role can only start when free >= need / 0.90 = 7.111 GiB, i.e. on an 8.00 GiB
+    # card the OS and desktop compositor must hold under 0.89 GiB. A stock Windows desktop holds
+    # ~1.05 GiB. So the free-fraction invalidated the exact margin GLM_CONTRIB_NEED_GIB was sized
+    # to provide -- and on the very card class its own comment names ("4060: ~6.9 GiB usable",
+    # also below 7.111). The two constants contradicted each other.
+    #
+    # The free-fraction exists to stop CONCURRENT launches oversubscribing a shared card. It is
+    # not the defence against one runaway process -- RUNAWAY_SLACK is, and it still applies. So
+    # when the role genuinely fits inside currently-free memory WITH a real margin, cap at need
+    # rather than refusing. We never cap flush against free: FIT_MARGIN_GIB is held back, so the
+    # anti-spill property the refusal message is protecting is preserved.
+    # Confirmed by the reporter: an explicit 6.60 GiB cap on that same card built all 60 resident
+    # coordinates of layer 1 cleanly in ~5 s, with the cap probe verifying enforcement.
+    if cap_gib < need_gib <= free_gib - FIT_MARGIN_GIB:
+        cap_gib = need_gib
+        how = ("need (%.2f GiB fits in %.2f GiB free with %.2f GiB held back; the free-fraction "
+               "ceiling %.2f GiB would have refused a card that fits)"
+               % (need_gib, free_gib, FIT_MARGIN_GIB, free_gib * DEFAULT_HEADROOM))
+    return cap_gib, how
+
+
 def apply_vram_guard(device, need_gib, log=None):
     """Hard per-process VRAM ceiling + a refuse-to-start preflight. MUST be called before any model
     is materialised on CUDA.
@@ -2318,39 +2367,9 @@ def apply_vram_guard(device, need_gib, log=None):
     free_b, total_b = torch.cuda.mem_get_info(idx)
     free_gib, total_gib = free_b / 2 ** 30, total_b / 2 ** 30
 
-    cap_gb, cap_frac = os.environ.get("NEURAHASH_VRAM_CAP_GB"), os.environ.get("NEURAHASH_VRAM_CAP_FRAC")
-    if cap_gb:
-        cap_gib, how = float(cap_gb), "NEURAHASH_VRAM_CAP_GB"
-    elif cap_frac:
-        cap_gib, how = float(cap_frac) * total_gib, "NEURAHASH_VRAM_CAP_FRAC"
-    else:
-        # Two ceilings, take the lower. The free-fraction keeps concurrent launches from
-        # oversubscribing the card; the need-multiple keeps ONE buggy process (a runaway eval, an
-        # unchunked log_softmax) from eating a whole card that its siblings still need.
-        cap_gib = min(free_gib * DEFAULT_HEADROOM, need_gib * RUNAWAY_SLACK)
-        how = "min(%.0f%% of free, %.1fx need)" % (DEFAULT_HEADROOM * 100, RUNAWAY_SLACK)
-
-        # THE FREE-FRACTION MUST NOT REFUSE A CARD THAT ACTUALLY FITS.
-        # Reported from an external RTX 3070 (issue #71, 2026-08-03): need 6.40, free 6.95 -- it
-        # fits -- and the guard refused, because cap = free x 0.90 = 6.25 < need. Solve it and the
-        # rule says a role can only start when free >= need / 0.90 = 7.111 GiB, i.e. on an 8.00 GiB
-        # card the OS and desktop compositor must hold under 0.89 GiB. A stock Windows desktop holds
-        # ~1.05 GiB. So the free-fraction invalidated the exact margin GLM_CONTRIB_NEED_GIB was sized
-        # to provide -- and on the very card class its own comment names ("4060: ~6.9 GiB usable",
-        # also below 7.111). The two constants contradicted each other.
-        #
-        # The free-fraction exists to stop CONCURRENT launches oversubscribing a shared card. It is
-        # not the defence against one runaway process -- RUNAWAY_SLACK is, and it still applies. So
-        # when the role genuinely fits inside currently-free memory WITH a real margin, cap at need
-        # rather than refusing. We never cap flush against free: FIT_MARGIN_GIB is held back, so the
-        # anti-spill property the refusal message is protecting is preserved.
-        # Confirmed by the reporter: an explicit 6.60 GiB cap on that same card built all 60 resident
-        # coordinates of layer 1 cleanly in ~5 s, with the cap probe verifying enforcement.
-        if cap_gib < need_gib <= free_gib - FIT_MARGIN_GIB:
-            cap_gib = need_gib
-            how = ("need (%.2f GiB fits in %.2f GiB free with %.2f GiB held back; the free-fraction "
-                   "ceiling %.2f GiB would have refused a card that fits)"
-                   % (need_gib, free_gib, FIT_MARGIN_GIB, free_gib * DEFAULT_HEADROOM))
+    cap_gib, how = _plan_vram_cap(free_gib, total_gib, need_gib,
+                                  os.environ.get("NEURAHASH_VRAM_CAP_GB"),
+                                  os.environ.get("NEURAHASH_VRAM_CAP_FRAC"))
 
     if cap_gib < need_gib:
         raise SystemExit(
@@ -2375,11 +2394,25 @@ def apply_vram_guard(device, need_gib, log=None):
 
     frac = min(1.0, cap_gib / total_gib)
     torch.cuda.set_per_process_memory_fraction(frac, idx)
-    # Remember what we reserved and how big the card is. _min_free_vram_gib needs both: the
-    # "is the card starved?" bar has to be judged against the memory we are NOT holding, or a
+    # Remember what we reserved, how big the card is, AND what was already spoken for. All three:
+    # the "is the card starved?" bar has to be judged against the memory we are NOT holding, or a
     # legitimately-capped miner waits forever for memory it is itself holding (see there).
-    global _APPLIED_CAP_GIB, _CARD_TOTAL_GIB
+    #
+    # THE THIRD NUMBER IS THE 2026-08-08 FIX (issue #152). total-minus-cap models only two
+    # consumers -- us, and a hypothetical future intruder -- and a real desktop has a third that is
+    # already there: explorer, the compositor, NVIDIA Overlay, TeamViewer, WebView2. On the
+    # reference 4060 that is ~1.07 GiB, which this very function measured (it prints "%.2f GiB was
+    # free" one line below) and then threw away. Keeping it is what makes the bar satisfiable:
+    #     free at guard time 6.93 of 8.00  ->  baseline 1.07
+    #     steady-state free  =  8.00 - 6.40 - 1.07  =  0.53 GiB
+    #     old bar  = (8.00 - 6.40) x 0.5        = 0.80  -> ABOVE 0.53, unsatisfiable, parks forever
+    #     new bar  = (8.00 - 6.40 - 1.07) x 0.5 = 0.265 -> below 0.53, the miner runs
+    # Measured AT CAP TIME, which the docstring already requires to be before any model is
+    # materialised, so it is other processes plus our own CUDA context -- both of which sit OUTSIDE
+    # the per-process cap and therefore both belong in the baseline.
+    global _APPLIED_CAP_GIB, _CARD_TOTAL_GIB, _EXTERNAL_BASELINE_GIB
     _APPLIED_CAP_GIB, _CARD_TOTAL_GIB = float(cap_gib), float(total_gib)
+    _EXTERNAL_BASELINE_GIB = max(0.0, float(total_gib) - float(free_gib))
     msg = ("[vram-guard] capped to %.2f GiB (%.1f%% of the %.2f GiB card; %.2f GiB was free; %s). "
            "Cap VERIFIED enforced by probe. OOMs at the cap, never spills to sysmem. Need ~%.2f GiB."
            % (cap_gib, frac * 100, total_gib, free_gib, how, need_gib))
@@ -2507,8 +2540,42 @@ def _release_own_vram_cache():
         return False
 
 
+_PAUSE_RELOG_EVERY = 20                 # re-announce a stuck pause every N checks (~5 min at 15 s)
+_IDLE_RELEASE_MIN_INTERVAL_S = 60.0     # debounce for _release_idle_vram_cache (see there)
+_last_idle_release_t = 0.0
+
+
+def _release_idle_vram_cache(now=None, min_interval_s=None):
+    """Give the card back OUR reclaimable cache while this miner is idle -- at most once a minute.
+
+    WHY (the "an idle miner hoards its whole cap" report). set_per_process_memory_fraction is a
+    CEILING, not a reservation, so the cap itself reserves nothing; what actually keeps the memory
+    away from the desktop is PyTorch's caching allocator, which holds every freed block from the
+    last training high-water mark. A miner parked in REPAIR MODE (every claimable coordinate
+    blocked, explicitly NOT training) can sit there for many minutes still holding ~6 GiB of a
+    shared 8 GiB card -- doing nothing with it, while the operator's desktop is squeezed.
+
+    WHY DEBOUNCED AND NOT ON EVERY POLL. empty_cache() is not free: it releases the blocks to the
+    driver, so the next training round pays the cudaMalloc back. The idle loop polls at ~1 s, and
+    calling it 60x a minute would trade a real refill cost for no extra benefit -- the cache is
+    already empty after the first call and stays empty while nothing allocates. Once a minute
+    reclaims within one poll of going idle and costs at most one refill per training resumption.
+
+    Returns True only when a release was actually attempted (debounce open AND torch/CUDA present),
+    which is what the tests assert on. `now`/`min_interval_s` are test seams.
+    """
+    global _last_idle_release_t
+    t = time.time() if now is None else float(now)
+    gap = _IDLE_RELEASE_MIN_INTERVAL_S if min_interval_s is None else float(min_interval_s)
+    if t - _last_idle_release_t < gap:
+        return False
+    _last_idle_release_t = t
+    return _release_own_vram_cache()
+
+
 _APPLIED_CAP_GIB = None          # set by apply_vram_guard once the cap is actually enforced
 _CARD_TOTAL_GIB = None
+_EXTERNAL_BASELINE_GIB = None    # VRAM everything else already held when the cap was applied (#152)
 _BAR_CLAMP_WARNED = False        # latch: the clamp warning below runs on every 15 s poll
 
 
@@ -2529,11 +2596,31 @@ def _min_free_vram_gib(log=None, miner=""):
 
     A flat absolute bar cannot be right for both an 8 GiB and a 32 GiB card. What the pause actually
     wants to know is "is something ELSE crowding me out?", and the memory something else can occupy
-    is (total - cap). Clamping the bar to half of that keeps the original 1.0 GiB behaviour on big
-    cards (32 GiB card, 24 GiB cap -> min(1.0, 3.9) = 1.0, unchanged) while making it satisfiable on
-    small ones (8.00 GiB card, 6.40 GiB cap -> min(1.0, 0.80) = 0.80, and the measured 1.00 GiB free
-    now correctly reads as healthy). An explicit NEURAHASH_VRAM_MIN_FREE_GB is still clamped the
-    same way -- an operator cannot accidentally configure a livelock either.
+    is (total - cap - what is already in use). Clamping the bar to half of that keeps the original
+    1.0 GiB behaviour on big cards (32 GiB card, 24 GiB cap -> min(1.0, ~3.9) = 1.0, unchanged)
+    while making it satisfiable on small ones. An explicit NEURAHASH_VRAM_MIN_FREE_GB is still
+    clamped the same way -- an operator cannot accidentally configure a livelock either.
+
+    THE 2026-08-08 CORRECTION (issue #152), and why the 2026-08-03 version was still unsatisfiable.
+    The clamp above modelled exactly two consumers: us, up to the cap, and a hypothetical intruder.
+    A desktop-shared card has a third, and it is already resident before the miner starts -- on the
+    reference 4060, ~1.07 GiB of explorer/compositor/Overlay/TeamViewer/WebView2. MEASURED on a
+    true stranger rebuild, with the machine-wide NEURAHASH_VRAM_CAP_GB popped:
+
+        [vram-guard] capped to 6.40 GiB (80.0% of the 8.00 GiB card; 6.93 GiB was free)
+        bar               = (8.00 - 6.40) x 0.5        = 0.80 GiB   <- from the CAP ALONE
+        steady-state free =  8.00 - 6.40 - 1.07        = 0.53 GiB   <- permanently under the bar
+
+    9+ minutes of heartbeats inside _pause_on_low_free_vram, zero contributions, zero log growth,
+    and a supervisor calling it healthy. So the headroom subtracts the baseline apply_vram_guard
+    measured at cap time too: (8.00 - 6.40 - 1.07) x 0.5 = 0.265 GiB, comfortably below the 0.53
+    the card actually settles at, so the miner runs -- while a genuinely large outside allocation
+    still drives free under 0.265 and still pauses. THE INVARIANT, and what the tests pin: taking
+    half of the headroom means the bar is STRICTLY below the steady state whenever the steady state
+    is positive at all, on every card size, with no constant anywhere in the arithmetic.
+
+    The baseline is only known once apply_vram_guard has run. Absent it (no cap applied, or the
+    opt-in VramManager path) this degrades to exactly the 2026-08-03 arithmetic.
     """
     raw = os.environ.get("NEURAHASH_VRAM_MIN_FREE_GB")
     explicit = raw not in (None, "")
@@ -2543,8 +2630,13 @@ def _min_free_vram_gib(log=None, miner=""):
         bar, explicit = 1.0, False
     asked = bar
     if _APPLIED_CAP_GIB is not None and _CARD_TOTAL_GIB is not None:
-        headroom = max(0.0, _CARD_TOTAL_GIB - _APPLIED_CAP_GIB)
+        baseline = float(_EXTERNAL_BASELINE_GIB or 0.0)
+        headroom = max(0.0, _CARD_TOTAL_GIB - _APPLIED_CAP_GIB - baseline)
         bar = min(bar, headroom * 0.5)
+        # Name the baseline in both messages below, but ONLY when there is one: a dedicated card
+        # reads 0.00 and the extra clause would be noise on the one configuration that is fine.
+        held = (" -- %.2f GiB of the card was already in use by other processes when the cap was "
+                "applied" % baseline) if baseline > 0.0 else ""
         # SAY SO WHEN THE CLAMP BITES. The clamp is what keeps the bar satisfiable (see above), but
         # it is arithmetic no operator can see from outside: a cap set to the WHOLE card leaves
         # headroom 0, which drives the bar to 0.00 and disables the elastic pause outright --
@@ -2556,17 +2648,18 @@ def _min_free_vram_gib(log=None, miner=""):
             if bar <= 0.0:
                 _BAR_CLAMP_WARNED = True
                 log("[glm-contrib %s] WARNING: the elastic VRAM pause is DISABLED -- the applied "
-                    "cap %.2f GiB leaves no headroom on a %.2f GiB card, so the bar clamps to 0.00 "
-                    "GiB and this miner will never pause for external memory pressure%s. Lower "
-                    "NEURAHASH_VRAM_CAP_GB if you want the guard back."
-                    % (miner, _APPLIED_CAP_GIB, _CARD_TOTAL_GIB,
+                    "cap %.2f GiB leaves no headroom on a %.2f GiB card%s, so the bar clamps to "
+                    "0.00 GiB and this miner will never pause for external memory pressure%s. "
+                    "Lower NEURAHASH_VRAM_CAP_GB if you want the guard back."
+                    % (miner, _APPLIED_CAP_GIB, _CARD_TOTAL_GIB, held,
                        " (NEURAHASH_VRAM_MIN_FREE_GB=%s is ignored)" % raw if explicit else ""))
             elif explicit and bar < asked:
                 _BAR_CLAMP_WARNED = True
                 log("[glm-contrib %s] NOTE: NEURAHASH_VRAM_MIN_FREE_GB=%.2f GiB is NOT in force -- "
                     "clamped to %.2f GiB, half the %.2f GiB an outside process could occupy (card "
-                    "%.2f - cap %.2f). A bar above that is unsatisfiable and would livelock."
-                    % (miner, asked, bar, headroom, _CARD_TOTAL_GIB, _APPLIED_CAP_GIB))
+                    "%.2f - cap %.2f%s). A bar above that is unsatisfiable and would livelock."
+                    % (miner, asked, bar, headroom, _CARD_TOTAL_GIB, _APPLIED_CAP_GIB,
+                       " - %.2f already in use" % baseline if baseline > 0.0 else ""))
     return bar
 
 
@@ -2608,6 +2701,16 @@ def _pause_on_low_free_vram(log, miner="", poll_s=15.0, sleep_fn=None, max_waits
             return waits
         if max_waits is not None and waits >= max_waits:
             return waits
+        # SAY IT IS STILL HERE. The #152 report is as much about silence as about arithmetic: 9+
+        # minutes of 5 s heartbeats, every one inside this loop, zero log growth, and a supervisor
+        # calling the process healthy because it was alive. One line per _PAUSE_RELOG_EVERY checks
+        # (~5 min at the default 15 s poll) is enough for a human or a log scraper to see a parked
+        # miner, and rare enough not to bury the log of a card under brief real pressure.
+        if waits % _PAUSE_RELOG_EVERY == 0:
+            log("[glm-contrib %s] STILL PAUSED on VRAM after %d checks (~%.0fs): %.2f GiB free vs "
+                "a %.2f GiB bar. This miner is NOT training and NOT earning. If nothing else is "
+                "using the card, the bar is too high -- report it with these numbers."
+                % (miner, waits, waits * poll_s, free, need))
 
 
 def _vram_units(vm=None):
@@ -5665,6 +5768,11 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                                             "; ".join(cooldown.describe(claim_coords,
                                                                         dec.get("event"))) or
                                             "no coordinate is claimable at all"))
+            # IDLE MEANS IDLE ON THE CARD TOO. Nothing here trains, but the caching allocator still
+            # holds the last round's high-water mark, so a miner parked in repair squeezes the
+            # operator's desktop for as long as it stays blocked. Debounced to once a minute so the
+            # ~1 s poll cannot thrash empty_cache() -- see _release_idle_vram_cache.
+            _release_idle_vram_cache()
             time.sleep(max(float(args.poll or 0.0), 1.0))
             continue
 

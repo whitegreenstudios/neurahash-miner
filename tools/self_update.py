@@ -50,9 +50,19 @@ OPT-OUT + RATE LIMIT
     crash-loop costs one bounded GET per restart and a run-forever miner still does not hammer
     GitHub.
 
+OBSOLETE-FILE RECLAIM (task #119, added 2026-08-08) -- DEFAULT OFF
+    A miner that has updated for months keeps files an old release installed and the current one no
+    longer needs. Step 6b reclaims them, but ONLY by a positive ALLOWLIST: paths a PREVIOUS SIGNED
+    manifest declared it shipped (`files`) which the CURRENT one no longer declares. It NEVER
+    derives a deletion set from the filesystem -- a miner's directory legitimately holds wallet
+    keystores, campaign state, logs, checkpoints and the operator's own files that no manifest ever
+    mentions, and deleting those loses money with no recovery. With `NEURAHASH_UPDATE_RECLAIM`
+    unset it is a DRY RUN that prints what it would remove and removes nothing; `=1` arms it, `=0`
+    switches it off entirely. See the block above `reclaim_mode` for the five refusal rules.
+
 Everything network/git/pip/re-exec is injectable (fetch_fn/git_fn/pip_fn/reexec_fn) so the whole
 policy is unit-tested with NO real network, git, pip, or process replacement -- see
-tests/test_self_update.py and tests/test_miner_manifest.py.
+tests/test_self_update.py, tests/test_miner_manifest.py and tests/test_self_update_reclaim.py.
 """
 import json
 import os
@@ -112,6 +122,8 @@ RELEASE_KIND = "neurahash-miner-release"
 
 AUTOUPDATE_ENV = "NEURAHASH_AUTOUPDATE"          # "0"/"false"/"no"/"off" => disabled
 STATE_ENV = "NEURAHASH_AUTOUPDATE_STATE"         # override the rate-limit dotfile path (tests/ops)
+RECLAIM_ENV = "NEURAHASH_UPDATE_RECLAIM"         # obsolete-file reclaim: absent => DRY RUN (see below)
+MANIFEST_FILES_KEY = "files"                     # v3 signed shipped-file list {relpath: sha256hex}
 DEFAULT_RATE_LIMIT_S = 6 * 3600                  # at most one PERIODIC check per 6h
 STARTUP_TIMEOUT_S = 6                            # per-mirror; bounds the cost of a restart loop
 MAX_MANIFEST_BYTES = 1 << 20                     # a real manifest is ~300 bytes; refuse a flood
@@ -183,6 +195,13 @@ def canonical_manifest_bytes(manifest):
         body["min_client_version"] = str(manifest["min_client_version"])
     if manifest.get("config"):
         body["config"] = manifest["config"]
+    # v3 (2026-08-08, task #119): the SHIPPED FILE LIST -- {relative/path: sha256hex}. Same
+    # truthiness rule and the same backward-compatibility guarantee: a manifest that omits it (or
+    # carries `{}` / `null`) canonicalises BYTE-IDENTICALLY to v1/v2, so every already-signed
+    # manifest keeps verifying. It MUST be signed, because it is the input to file DELETION: an
+    # unsigned "here is what the old release shipped" list would let anyone name a path to remove.
+    if manifest.get(MANIFEST_FILES_KEY):
+        body[MANIFEST_FILES_KEY] = manifest[MANIFEST_FILES_KEY]
     return _canon(body)
 
 
@@ -218,6 +237,9 @@ def verify_manifest(manifest, pubkey=PINNED_RELEASE_PUBKEY):
         return False, f"version malformed: {e}"
     if manifest.get("config") is not None and not isinstance(manifest["config"], dict):
         return False, f"config is not a JSON object: {type(manifest['config']).__name__}"
+    if manifest.get(MANIFEST_FILES_KEY) is not None and not isinstance(manifest[MANIFEST_FILES_KEY], dict):
+        return False, (f"{MANIFEST_FILES_KEY} is not a JSON object: "
+                       f"{type(manifest[MANIFEST_FILES_KEY]).__name__}")
     if manifest.get("min_client_version") is not None:
         try:
             parse_version(str(manifest["min_client_version"]))
@@ -615,11 +637,451 @@ def _sha256_file(path):
         return None
 
 
+# ===========================================================================================
+#  OBSOLETE-FILE RECLAIM (task #119) -- DELETE ONLY BY SHIPPED ALLOWLIST, NEVER BY COMPLEMENT
+# ===========================================================================================
+# THE PROBLEM. A miner that has self-updated for months carries files that some PAST release
+# installed and the CURRENT one no longer needs. They accumulate forever on every miner in the
+# world.
+#
+# THE OBVIOUS IMPLEMENTATION IS CATASTROPHIC. "delete everything in the install dir that is not in
+# the current manifest" is a COMPLEMENT rule, and a miner's directory legitimately contains files
+# no manifest ever mentions: the WALLET KEYSTORE it is paid into (neurahash/wallet.py defaults to
+# `miner_wallet.json`), `.neurahash_keys/` PQC secrets, `keystore/*.json`, campaign state
+# (`_state_*`, `_poollive/`), logs, checkpoints, corpus caches, and the operator's own files.
+# Deleting those destroys money and identity with NO recovery, and it does it on every machine at
+# once, with a valid signature on it. So:
+#
+#     THE DELETION SET IS AN ALLOWLIST -- paths a PREVIOUS SHIPPED manifest is known to have
+#     installed, which the CURRENT manifest no longer ships. It is NEVER derived from the
+#     filesystem. A file that is in neither manifest is not a candidate and cannot become one.
+#
+# WHERE THE "PREVIOUS" LIST COMES FROM. Each verified manifest may carry a SIGNED `files` map
+# {relative/path: sha256hex} (canonical_manifest_bytes above). After an update lands, the client
+# persists a cumulative ledger of it in the updater state dotfile; the next update compares that
+# ledger against the new manifest's map. The ledger is a LOCAL file and it is NOT signed, so every
+# entry is re-validated at the deletion site below (a corrupted/tampered dotfile must not be able
+# to name `../../` anything).
+#
+# KNOWN RESIDUAL, stated honestly (adversarial review finding F3): because the PREVIOUS half of the
+# allowlist comes from that unsigned dotfile, "only a signed manifest can name a deletion" is true
+# of the CURRENT half only. Whoever can write `~/.neurahash_autoupdate.json` (or set
+# NEURAHASH_AUTOUPDATE_STATE) chooses candidates -- bounded by every rule below: safe relative path,
+# not never-touch, inside the root, a regular file, a sha256 they must already know, under the
+# mass-delete ceiling, and with the whole feature off by default. An attacker with write access to
+# that dotfile generally has write access to the install directory anyway. Closing it properly means
+# binding each ledger entry to the manifest signature that declared it; not done here.
+#
+# FIVE REFUSALS, EACH LOGGED BY NAME (silence must never read as success):
+#   1. the path is not a safe RELATIVE path (absolute, drive-qualified, UNC, or contains `..`);
+#   2. it resolves -- after symlink resolution -- outside the install root;
+#   3. it matches the hard-coded NEVER-TOUCH list (wallet/keystore/state/log/checkpoint/corpus/
+#      .git/venv). These should already be impossible by construction, because they were never in
+#      any manifest. The list is DEFENCE IN DEPTH: this is the failure mode that loses money, and
+#      the cost of a false refusal is one stale file, while the cost of a false delete is a wallet;
+#   4. it is not a REGULAR FILE (a symlink, a directory, a device);
+#   5. its sha256 does not match what the old manifest recorded shipping -- i.e. the operator has
+#      edited it, or it is not the file we think it is. Leave it.
+#
+# DEFAULT IS NOT DELETION. With the knob unset this is a DRY RUN: it prints exactly what it would
+# remove and removes nothing. Deleting requires an explicit opt-in (`NEURAHASH_UPDATE_RECLAIM=1`).
+RECLAIM_MODE_OFF = "off"                 # do not even look
+RECLAIM_MODE_DRY = "dry-run"             # look, report, delete NOTHING  <-- the default
+RECLAIM_MODE_DELETE = "delete"           # actually unlink (explicit opt-in only)
+_RECLAIM_ARMED = {"1", "true", "yes", "on", "delete", "apply", "reclaim", "enabled"}
+_RECLAIM_DISABLED = {"0", "false", "no", "off", "never", "disabled"}
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_WIN_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)] + [f"LPT{i}" for i in range(1, 10)])
+# A pass that wants to remove MOST of what was previously shipped is not a cleanup, it is an
+# accident (a hand-written / partial `files` map -- adversarial review finding F2, measured: a map
+# listing 1 of 5 shipped paths deleted the updater itself). Refuse the whole pass rather than
+# half-destroy the install; small passes are still allowed by the absolute floor.
+RECLAIM_MAX_FRACTION = 0.25
+RECLAIM_MIN_ABSOLUTE = 5
+
+# A path component equal to any of these makes the whole path untouchable. Lowercased compare.
+NEVER_TOUCH_DIR_PARTS = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules", "site-packages", "__pycache__",
+    "wallet", "wallets", "keystore", "keystores", "key", "keys", "secret", "secrets",
+    "state", "logs", "log", "checkpoint", "checkpoints", "ckpt", "ckpts", "runs", "artifacts",
+    "corpus", "corpora", "corpus_cache", "cache", "data", "datasets", "_poollive",
+})
+# A path component STARTING with any of these (this repo's own experiment/state dir conventions).
+NEVER_TOUCH_PART_PREFIXES = ("_state", "_poollive", ".neurahash", "_rl_", "_granite", "_rung",
+                             "_xarch", "_olmoe")
+# Exact basenames (lowercased) that must survive regardless of what any manifest says.
+NEVER_TOUCH_NAMES = frozenset({
+    "version", "requirements.txt", "release.json", ".env", ".gitignore", ".gitattributes",
+    "miner_wallet.json", "wallet.json", "keystore.json", "identity.json",
+})
+NEVER_TOUCH_SUFFIXES = (".key", ".pem", ".p12", ".pfx", ".keystore", ".seed", ".mnemonic",
+                        ".log", ".pt", ".pth", ".bin", ".safetensors", ".ckpt", ".npy", ".npz",
+                        ".db", ".sqlite", ".sqlite3", ".pid", ".sock", ".lock")
+# Matched against the WHOLE lowercased relative path, not just the basename. Deliberately broad:
+# a false refusal costs one stale file; a false delete costs the miner's wallet.
+NEVER_TOUCH_SUBSTRINGS = ("wallet", "keystore", "privkey", "private_key", "secret", "mnemonic",
+                          "passphrase", "credential", "seed_phrase", "token")
+
+
+def reclaim_mode(environ=None, override=None):
+    """Resolve the reclaim mode. Returns exactly one of RECLAIM_MODE_OFF/DRY/DELETE.
+
+    UNSET => DRY RUN. Deletion is opt-in and nothing else: an operator who has never heard of this
+    feature can never lose a byte to it, but they DO get told what it would have removed.
+
+    Two rules the adversarial review (finding F6) forced:
+      * an explicit `NEURAHASH_UPDATE_RECLAIM=0` is the operator's KILL SWITCH and no caller-side
+        `override` may lift it -- a knob you can be overridden out of is not a kill switch;
+      * an unrecognised `override` (`True`, "yes", a typo) falls back to the DRY RUN rather than
+        being passed through as a mode string. Previously `reclaim=True` stringified to "true",
+        matched nothing, and silently did nothing while reading as "armed" at the call site."""
+    env = os.environ if environ is None else environ
+    raw = str(env.get(RECLAIM_ENV, "")).strip().lower()
+    env_off = raw in _RECLAIM_DISABLED
+    if override:
+        ov = str(override).strip().lower()
+        if env_off:
+            return RECLAIM_MODE_OFF
+        return ov if ov in (RECLAIM_MODE_OFF, RECLAIM_MODE_DRY, RECLAIM_MODE_DELETE) else RECLAIM_MODE_DRY
+    if raw in _RECLAIM_ARMED:
+        return RECLAIM_MODE_DELETE
+    if env_off:
+        return RECLAIM_MODE_OFF
+    return RECLAIM_MODE_DRY
+
+
+def manifest_files(manifest):
+    """The manifest's signed `files` map as {str: str}. Absent/not-an-object -> {}.
+
+    Entries are NOT validated here on purpose -- a bad path must be refused at the DELETION site
+    (`plan_reclaim`), which is the only place that can be bypassed by neither a caller nor a
+    corrupted state file. Filtering here would move a security check away from the thing it
+    protects."""
+    if not isinstance(manifest, dict):
+        return {}
+    raw = manifest.get(MANIFEST_FILES_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()}
+
+
+def _normalise_relpath(rel):
+    """(normalised_posix_relpath, None) or (None, reason). Refuses anything that is not a plain
+    relative path INSIDE the tree: absolute, drive-qualified (`C:/..`), UNC (`//host/share`), any
+    `..` component, a NUL byte, or an empty result.
+
+    WINDOWS PATH EQUIVALENCE (adversarial review 2026-08-08, finding F1 -- MEASURED, not
+    theoretical). Windows silently strips a trailing `.` or space from every path component and
+    treats `name:stream` as an alternate data stream of `name`. So `.git./HEAD` opens `.git/HEAD`
+    and `identity.json.` opens `identity.json`. Every name-based guard downstream (the never-touch
+    list, the still-shipped exclusion) compares the STRING it was given, while `os.remove` acts on
+    the RESOLVED file -- a one-character spelling change walked straight past the never-touch list
+    and deleted `.git/HEAD`, `keys/node_id.json` and `identity.json` in a probe. Refusing these
+    spellings here is the only place that closes the whole class at once: no legitimate shipped
+    path needs a trailing dot, a trailing space, or a colon in a component."""
+    if not isinstance(rel, str) or not rel.strip():
+        return None, "path is empty or not a string"
+    s = rel.strip().replace("\\", "/")
+    if "\x00" in s:
+        return None, "NUL byte in path"
+    if s.startswith("//"):
+        return None, "UNC path (starts with //)"
+    if s.startswith("/"):
+        return None, "absolute path (starts with /)"
+    if _DRIVE_RE.match(s):
+        return None, "drive-qualified absolute path"
+    parts = [p for p in s.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None, "'..' traversal component"
+    if not parts:
+        return None, "path normalises to nothing"
+    for p in parts:
+        if p != p.rstrip(". "):
+            return None, (f"component {p!r} ends in a dot or space (Windows strips it, so it "
+                          f"aliases another file)")
+        if ":" in p:
+            return None, f"component {p!r} contains ':' (Windows alternate data stream)"
+        if any(ord(c) < 32 for c in p):
+            return None, f"component {p!r} contains a control character"
+        if p.split(".")[0].upper() in _WIN_RESERVED_NAMES:
+            return None, f"component {p!r} is a reserved Windows device name"
+    return "/".join(parts), None
+
+
+def _never_touch_reason(norm_rel):
+    """Why this path is on the hard-coded never-touch list, or None."""
+    low = norm_rel.lower()
+    parts = low.split("/")
+    for p in parts:
+        if p in NEVER_TOUCH_DIR_PARTS:
+            return f"never-touch path component {p!r}"
+        for pre in NEVER_TOUCH_PART_PREFIXES:
+            if p.startswith(pre):
+                return f"never-touch component prefix {pre!r}"
+    name = parts[-1]
+    if name in NEVER_TOUCH_NAMES:
+        return f"never-touch filename {name!r}"
+    for suf in NEVER_TOUCH_SUFFIXES:
+        if name.endswith(suf):
+            return f"never-touch suffix {suf!r}"
+    for sub in NEVER_TOUCH_SUBSTRINGS:
+        if sub in low:
+            return f"never-touch substring {sub!r}"
+    return None
+
+
+def _inside(root_real, target_real):
+    """True iff target_real is root_real or lives under it (case-insensitive on Windows)."""
+    r = os.path.normcase(os.path.abspath(root_real)).rstrip(os.sep)
+    t = os.path.normcase(os.path.abspath(target_real))
+    return t == r or t.startswith(r + os.sep)
+
+
+class ReclaimAction:
+    """One candidate and what happened to it. `verdict` is one of:
+    'delete' (removed), 'would-delete' (dry run), 'refused' (a safety rule said no),
+    'absent' (already gone), 'error' (removal failed). `reason` is ALWAYS populated."""
+
+    def __init__(self, rel, verdict, reason, path=None):
+        self.rel = rel
+        self.verdict = verdict
+        self.reason = reason
+        self.path = path
+
+    def __repr__(self):
+        return f"ReclaimAction({self.rel!r}, {self.verdict!r}, {self.reason!r})"
+
+
+class ReclaimReport:
+    """Outcome of one reclaim pass. Every candidate appears in `actions` with a reason."""
+
+    def __init__(self, mode, actions=None, candidates=None):
+        self.mode = mode
+        self.actions = list(actions or [])
+        self.candidates = list(candidates or [])
+
+    def _of(self, verdict):
+        return [a.rel for a in self.actions if a.verdict == verdict]
+
+    @property
+    def deleted(self):
+        return self._of("delete")
+
+    @property
+    def would_delete(self):
+        return self._of("would-delete")
+
+    @property
+    def refused(self):
+        return [(a.rel, a.reason) for a in self.actions if a.verdict in ("refused", "error")]
+
+    @property
+    def absent(self):
+        return self._of("absent")
+
+    def summary(self):
+        return (f"mode={self.mode} candidates={len(self.candidates)} deleted={len(self.deleted)} "
+                f"would_delete={len(self.would_delete)} refused={len(self.refused)} "
+                f"already_absent={len(self.absent)}")
+
+    def __repr__(self):
+        return f"ReclaimReport({self.summary()})"
+
+
+def plan_reclaim(install_root, prev_files, cur_files):
+    """Decide, WITHOUT touching the filesystem's contents, what each candidate's fate is.
+
+    candidates = keys(prev_files) - keys(cur_files). That is the whole allowlist. The filesystem is
+    only ever ASKED ABOUT these paths; it is never enumerated, so a file that no manifest shipped
+    is not a candidate and cannot become one. Returns (candidates, [ReclaimAction, ...]) where every
+    action carries a non-empty reason."""
+    prev_files = prev_files if isinstance(prev_files, dict) else {}
+    cur_files = cur_files if isinstance(cur_files, dict) else {}
+    root_real = os.path.realpath(os.path.abspath(install_root))
+    cur_norm, cur_ids = set(), set()
+    for k in cur_files:
+        n, _why = _normalise_relpath(k)
+        if not n:
+            continue
+        cur_norm.add(os.path.normcase(n))
+        # IDENTITY, not spelling. A string set alone is defeated by every way two names can mean
+        # one file: case on Windows/macOS, 8.3 short names, hard links, trailing dots. (st_dev,
+        # st_ino) is what the filesystem itself considers the same file, so a candidate that
+        # resolves onto a file the CURRENT release ships is caught however it was spelled.
+        try:
+            st = os.stat(os.path.join(root_real, *n.split("/")))
+            cur_ids.add((st.st_dev, st.st_ino))
+        except OSError:
+            pass
+    # THE ALLOWLIST: shipped-before minus shipped-now. An unsafe path cannot be normalised, so it
+    # cannot be matched against the current list either -- it stays a candidate and gets refused
+    # below by name, rather than being dropped silently.
+    candidates = []
+    for rel in sorted(str(k) for k in prev_files):
+        norm, _why = _normalise_relpath(rel)
+        if norm is not None and os.path.normcase(norm) in cur_norm:
+            continue                                     # still shipped -- not a candidate at all
+        candidates.append(rel)
+    actions = []
+    # F2 mass-delete guard: refuse the WHOLE pass rather than gut the install on a bad `files` map.
+    ceiling = max(RECLAIM_MIN_ABSOLUTE, int(RECLAIM_MAX_FRACTION * len(prev_files)))
+    if len(candidates) > ceiling:
+        why = (f"REFUSING THE WHOLE PASS: {len(candidates)} of {len(prev_files)} previously shipped "
+               f"paths would be removed (> {ceiling}); that is a partial/garbage `files` map, not a "
+               f"cleanup")
+        return candidates, [ReclaimAction(rel, "refused", why) for rel in candidates]
+    for rel in candidates:
+        norm, why = _normalise_relpath(rel)
+        if norm is None:
+            actions.append(ReclaimAction(rel, "refused", f"unsafe path: {why}"))
+            continue
+        why = _never_touch_reason(norm)
+        if why:
+            actions.append(ReclaimAction(rel, "refused", why))
+            continue
+        target = os.path.join(root_real, *norm.split("/"))
+        # realpath BEFORE the containment test: a symlinked component that points out of the tree
+        # would otherwise pass a pure-string check and delete somebody else's file.
+        target_real = os.path.realpath(target)
+        if not _inside(root_real, target_real):
+            actions.append(ReclaimAction(rel, "refused",
+                                         "resolves outside the install root (symlink or traversal)"))
+            continue
+        if os.path.islink(target):
+            actions.append(ReclaimAction(rel, "refused", "is a symlink, not a regular file", target))
+            continue
+        if not os.path.exists(target):
+            actions.append(ReclaimAction(rel, "absent", "already gone", target))
+            continue
+        if not os.path.isfile(target):
+            actions.append(ReclaimAction(rel, "refused", "not a regular file (directory or device)",
+                                         target))
+            continue
+        try:
+            st = os.stat(target)
+            same_as_current = (st.st_dev, st.st_ino) in cur_ids
+        except OSError:
+            same_as_current = False
+        if same_as_current:
+            actions.append(ReclaimAction(rel, "refused",
+                                         "resolves onto a file the CURRENT manifest still ships",
+                                         target))
+            continue
+        want = str(prev_files.get(rel, "")).strip().lower()
+        if not _SHA256_RE.match(want):
+            actions.append(ReclaimAction(rel, "refused",
+                                         "old manifest recorded no usable sha256 for it", target))
+            continue
+        have = _sha256_file(target)
+        if have is None:
+            actions.append(ReclaimAction(rel, "refused", "could not be hashed (unreadable)", target))
+            continue
+        if have.lower() != want:
+            actions.append(ReclaimAction(rel, "refused",
+                                         f"content differs from the shipped file (on-disk "
+                                         f"{have[:12]} != shipped {want[:12]}) -- user-modified",
+                                         target))
+            continue
+        actions.append(ReclaimAction(rel, "would-delete", "shipped by an older release, dropped by "
+                                                          "the current one, unmodified", target))
+    return candidates, actions
+
+
+def reclaim_obsolete_files(install_root, prev_files, cur_files, *, mode=None, environ=None,
+                           log_fn=None):
+    """Run one reclaim pass and return a ReclaimReport. NEVER raises.
+
+    `mode` (RECLAIM_MODE_*) overrides the knob; otherwise `reclaim_mode(environ)` decides, and with
+    the knob unset that is a DRY RUN. Every candidate is logged with the reason it was kept or
+    removed -- a silent pass is indistinguishable from a broken one, so there is no silent pass."""
+    log_fn = log_fn or log
+    mode = reclaim_mode(environ, mode)
+    if mode == RECLAIM_MODE_OFF:
+        log_fn(f"[reclaim] disabled ({RECLAIM_ENV} is off); no obsolete-file check was made")
+        return ReclaimReport(mode)
+    # AN ABSENT LIST MEANS "UNDECLARED", NEVER "SHIPS NOTHING". Caught by
+    # test_a_manifest_without_files_never_reclaims_anything, which deleted the WHOLE previous
+    # release: every live manifest today is v1/v2 and carries no `files`, so without this guard the
+    # first release after this feature ships would have emptied every miner's install directory of
+    # everything the previous one installed -- including tools/self_update.py itself. Only a manifest
+    # that explicitly declares what it ships may cause a deletion.
+    if not cur_files:
+        log_fn("[reclaim] the current manifest declares no shipped file list; NO-OP (an absent "
+               "list means 'undeclared', never 'ships nothing')")
+        return ReclaimReport(mode)
+    try:
+        candidates, actions = plan_reclaim(install_root, prev_files, cur_files)
+    except Exception as e:
+        log_fn(f"[reclaim] WARN: planning failed ({type(e).__name__}: {e}); nothing was deleted")
+        return ReclaimReport(mode)
+    if mode == RECLAIM_MODE_DELETE:
+        for a in actions:
+            if a.verdict != "would-delete":
+                continue
+            # TOCTOU (adversarial review finding F4, measured): plan_reclaim hashes ALL candidates
+            # and only then returns, so for candidate #1 the hash->unlink gap spans the full read of
+            # candidates #2..N. An operator edit landing in that window was destroyed. Re-hash
+            # HERE, immediately before the unlink, so the window is as small as the OS allows.
+            want = str(prev_files.get(a.rel, "")).strip().lower()
+            have = _sha256_file(a.path)
+            if have is None or have.lower() != want:
+                a.verdict = "refused"
+                a.reason = ("content changed between the check and the removal -- kept "
+                            "(re-verified immediately before unlink)")
+                continue
+            try:
+                os.remove(a.path)
+                a.verdict, a.reason = "delete", "removed (obsolete, unmodified, inside the root)"
+            except Exception as e:
+                a.verdict, a.reason = "error", f"removal failed ({type(e).__name__}: {e})"
+    report = ReclaimReport(mode, actions, candidates)
+    if not candidates:
+        log_fn(f"[reclaim] {mode}: no previous release file list to compare against yet "
+               f"(0 candidates); nothing to do")
+        return report
+    for a in actions:
+        log_fn(f"[reclaim] {a.verdict.upper():<12} {a.rel} -- {a.reason}")
+    log_fn(f"[reclaim] {report.summary()}")
+    if mode == RECLAIM_MODE_DRY and report.would_delete:
+        log_fn(f"[reclaim] DRY RUN -- deleted nothing. Set {RECLAIM_ENV}=1 to actually reclaim "
+               f"the {len(report.would_delete)} file(s) above.")
+    return report
+
+
+def _reclaim_after_update(repo_dir, state_path, manifest, *, mode=None, environ=None, log_fn=None):
+    """Reclaim step wired into an applied update, plus the persisted shipped-file ledger.
+
+    The ledger is CUMULATIVE ({**previous, **current}) so a miner that skips releases still knows
+    what an older one installed; paths that were actually deleted drop out of it. Never raises: a
+    failure here must never strand a miner mid-update."""
+    log_fn = log_fn or log
+    try:
+        st = _load_state(state_path)
+        prev = st.get("shipped_files")
+        prev = {str(k): str(v) for k, v in prev.items()} if isinstance(prev, dict) else {}
+        cur = manifest_files(manifest)
+        report = reclaim_obsolete_files(repo_dir, prev, cur, mode=mode, environ=environ,
+                                        log_fn=log_fn)
+        ledger = dict(prev)
+        ledger.update(cur)
+        for rel in report.deleted:
+            ledger.pop(rel, None)
+        if ledger != prev:
+            _save_state(state_path, shipped_files=ledger)
+        return report
+    except Exception as e:
+        log_fn(f"[reclaim] WARN: reclaim step raised ({type(e).__name__}: {e}); nothing was deleted")
+        return ReclaimReport(reclaim_mode(environ, mode))
+
+
 # ------------------------------------------------------------------ the orchestrator
 def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=None,
                      pubkey=PINNED_RELEASE_PUBKEY, enabled=None, state_path=None,
                      rate_limit_s=DEFAULT_RATE_LIMIT_S, now=None, honor_rate_limit=True,
-                     timeout=STARTUP_TIMEOUT_S, manifest=None,
+                     timeout=STARTUP_TIMEOUT_S, manifest=None, reclaim=None, environ=None,
                      fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None):
     """Do at most one signed-update check and, if a VERIFIED forward release exists, apply it and
     re-exec. Returns an UpdateResult. FAIL CLOSED: any error is caught, logged as a warning, and
@@ -628,6 +1090,9 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
     `mirrors` (or the legacy single `manifest_url`) selects where to look; the default is the
     compiled MIRRORS list, and the BEST VERIFIED version across all of them wins. `manifest` lets a
     caller pass an ALREADY-VERIFIED manifest so a startup sync does not fetch twice.
+
+    `reclaim` overrides the obsolete-file reclaim mode (RECLAIM_MODE_*); unset means the
+    NEURAHASH_UPDATE_RECLAIM knob decides, and an absent knob is a DRY RUN that deletes nothing.
 
     Injectables (real defaults if None): fetch_fn(url)->text, git_fn(repo,*args)->(rc,out),
     pip_fn(repo)->(rc,out), reexec_fn(argv)->NoReturn. Tests pass fakes so nothing real happens.
@@ -749,6 +1214,12 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
                             local_version=local_version, target_version=target_version,
                             manifest=manifest, fetch=fetch)
 
+    # 6b) reclaim files an OLDER release shipped that this one no longer does ------------------
+    # Placed HERE deliberately: after HEAD is proven to equal the signed commit (so `manifest` is
+    # the manifest for the tree now on disk) and BEFORE the re-exec (which never returns). Nothing
+    # below the reclaim depends on it, and it can never fail the update -- it is best-effort.
+    _reclaim_after_update(repo_dir, spath, manifest, mode=reclaim, environ=environ, log_fn=log)
+
     # 7) pip install ONLY if requirements.txt actually changed --------------------------------
     pip_ran = False
     req_after = _sha256_file(os.path.join(repo_dir, REQUIREMENTS_FILE))
@@ -800,7 +1271,7 @@ class SyncResult:
 def sync_from_manifest(repo_dir=REPO, argv=None, *, startup=True, mirrors=None,
                        pubkey=PINNED_RELEASE_PUBKEY, enabled=None, state_path=None,
                        rate_limit_s=DEFAULT_RATE_LIMIT_S, now=None,
-                       timeout=STARTUP_TIMEOUT_S, environ=None,
+                       timeout=STARTUP_TIMEOUT_S, environ=None, reclaim=None,
                        fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None):
     """The ONE call a launcher makes. Order is docs/MINER_MANIFEST_DESIGN.md sec.3:
 
@@ -847,6 +1318,7 @@ def sync_from_manifest(repo_dir=REPO, argv=None, *, startup=True, mirrors=None,
         upd = check_and_update(repo_dir, argv, manifest=fetch.manifest, pubkey=pubkey,
                                enabled=enabled, state_path=state_path, rate_limit_s=rate_limit_s,
                                now=now, honor_rate_limit=not startup, timeout=timeout,
+                               reclaim=reclaim, environ=environ,
                                git_fn=git_fn, pip_fn=pip_fn, reexec_fn=reexec_fn)
         upd.fetch = fetch
 

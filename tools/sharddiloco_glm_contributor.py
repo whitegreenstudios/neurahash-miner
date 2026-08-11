@@ -5365,6 +5365,43 @@ def publish_miner_card(lane, miner, address=None, coord=None, mode=None, extra=N
         return False
 
 
+# The card is republished on this cadence so that its `published_ts` MEANS something. Publishing once
+# at process start (which is all this used to do) cannot express liveness: the public snapshot has no
+# way to tell a miner that started an hour ago and is still training from one that died 59 minutes
+# ago. The reader's window is 600 s (pool_snapshot.ONLINE_MAX_AGE_CARD_S), so 120 s survives four
+# consecutive failed PUTs before a healthy miner reads offline.
+CARD_REPUBLISH_INTERVAL_S = 120.0
+_card_last_publish = {}                                       # miner_id -> epoch of last attempt
+
+
+def heartbeat_miner_card(lane, miner, address=None, coord=None, mode=None, extra=None,
+                         log=_flush, now=None, interval_s=CARD_REPUBLISH_INTERVAL_S,
+                         state=_card_last_publish):
+    """Debounced republish of this miner's identity card. Returns True if a PUT was attempted and
+    succeeded, False otherwise (including 'too soon'). NEVER raises.
+
+    Called from the round loops, so it must be cheap and silent in the common case: it does nothing
+    at all until `interval_s` has elapsed, and it logs only on FAILURE (at most once per interval),
+    because a per-round success line would drown the mining log it shares.
+
+    NOT a protocol change and NOT an attestation: same self-reported object, same name, no coordinator
+    involvement, and nothing may gate payment on it."""
+    try:
+        t = float(now) if now is not None else time.time()
+        last = state.get(miner)
+        if last is not None and (t - float(last)) < float(interval_s):
+            return False
+        state[miner] = t
+        ok = publish_miner_card(lane, miner, address=address, coord=coord, mode=mode, extra=extra,
+                                log=lambda _m: None)
+        if not ok:
+            log("[glm-contrib %s] identity card heartbeat failed; this miner may read OFFLINE on the "
+                "public page until the next successful publish -- mining is unaffected" % (miner,))
+        return bool(ok)
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
 # ==================================================================== v3.2.1 signed auto-update wire
 # Why this exists: tools/self_update.py (the signed, pinned-key, fail-closed updater) was fully built
 # but NOTHING in the GLM-only client ever called it -- the automatic startup/periodic checks lived in
@@ -5530,6 +5567,12 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # internally 6h rate-limited via dotfile, so this is one cheap file-stat on all but ~4
         # checks/day. A verified forward release re-execs us here -- never mid-train.
         _maybe_self_update(log)
+        # -- (0b) identity-card heartbeat. Debounced to CARD_REPUBLISH_INTERVAL_S internally, so this
+        # is a dict lookup on all but ~1 tick in 120 s. Without it `published_ts` is frozen at process
+        # start and the public page cannot distinguish this live miner from a dead one.
+        heartbeat_miner_card(lane, miner,
+                             address=(wallet.address if wallet is not None else None),
+                             coord="L%d,E%d" % (L, E), mode=args.mode, log=log)
         # -- ONE MANIFEST PER TICK (2026-07-27), fetched FIRST and handed to every consumer below.
         # This tick used to pull THREE full manifests: one inside lane.read_pointer()
         # (sharddiloco_harness.ContentLane.read_pointer), one inside the corpus re-sync's
@@ -6042,6 +6085,9 @@ def main(argv=None):
     publish_miner_card(lane, miner,
                        address=(wallet.address if wallet is not None else None),
                        coord="L%d,E%d" % (L, E), mode=args.mode, log=_flush)
+    # Start the heartbeat debounce here so the first round tick does not immediately re-PUT what we
+    # just published. From now on the round loops refresh it every CARD_REPUBLISH_INTERVAL_S.
+    _card_last_publish[miner] = time.time()
 
     train_ids = node_ids(args, coord_data_slot(L, E), "train")
     val_ids = node_ids(args, coord_data_slot(L, E), "val")
@@ -6149,6 +6195,12 @@ def main(argv=None):
     applied = -1            # last round whose ACCEPTED record has been replayed locally
     rounds_done = 0
     while rounds_done < args.max_rounds:
+        # Identity-card heartbeat (same reason as the async path): debounced internally, so this is a
+        # dict lookup on all but ~1 tick in 120 s, and a frozen published_ts is what made every
+        # stranger read OFFLINE on the public page.
+        heartbeat_miner_card(lane, miner,
+                             address=(wallet.address if wallet is not None else None),
+                             coord="L%d,E%d" % (L, E), mode=args.mode, log=_flush)
         try:
             ptr = lane.read_pointer()
         except Exception:                                        # noqa: BLE001

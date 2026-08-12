@@ -371,6 +371,421 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-13 — **If the pool page said you were offline, that was two bugs on our side and you were mining fine.** Also: two claims we published earlier this week were wrong in the same way, and we are withdrawing both here.
+
+#### 1. The pool page called every miner offline. No miner was at fault.
+
+For a stretch this week `neoo.com/pool` showed **0 online** while the fleet was demonstrably mining
+and minting. Two independent bugs, either one enough on its own:
+
+- The page decided whether you were online by reading a flag that **nothing in our code has ever
+  written**. The "missing" answer was therefore the permanent answer.
+- Your miner published its status card once, at startup, and then never again. So even a reader that
+  worked correctly would have seen a single stale timestamp for the whole life of the process.
+
+Both are fixed. Your miner now republishes its card every **120** seconds, seeded at startup and
+wired into both round loops, and the page counts you online if your card is younger than **600**
+seconds, with **60** seconds of clock-skew tolerance so a slightly-off system clock cannot delete you
+from the roster.
+
+We checked it against the live page rather than a local file: the published status feed **22 s** old,
+**miners_online 1**, an RTX 4060 at coordinate **L1,E20** with **27** accepts and **1.2179** minted.
+
+Nothing about your earnings was affected — the page was reporting wrongly, not paying wrongly.
+
+#### 2. Two withdrawals, one shared cause
+
+This log is only worth reading if we retract in it as loudly as we announce. Two numbers published
+earlier this week were wrong, and both were wrong the same way.
+
+- **WITHDRAWN: "pinning the router lifts retention from 1.8% to 37.4%."** The correct like-for-like
+  figure is **31.30%**, and most of that improvement comes from the intervention *restoring the
+  individual contributions*, not from removing the thing we were blaming.
+- **WITHDRAWN: "refreshing the cached training target alone costs +0.062 nats."** That was measured
+  at **29.6%** of the reference dose and then compared against arms run at full dose. At matched
+  dose it costs **+1.895626** — about **30x** more. Refreshing is not a mild tax; on its own it is
+  destructive.
+
+**The shared cause is worth naming, because it is the kind of error that flatters us.** In both
+cases the *baseline moved* when we applied the change, and we compared against the baseline that had
+not moved. The mechanical check that catches it: before dividing one number by another, confirm both
+were measured under the same conditions. Every new experiment in this line now states that check up
+front.
+
+#### 3. Why contributions still do not add up — routing turns out to be a small part of it
+
+Short version, because it is the least actionable item here. Two contributions trained on different
+layers do not add up to the sum of their parts; that has been a dead end in weight space since
+2026-08-10. The leading suspect was routing: change layer 1 and you change which experts fire
+downstream, so a contribution trained at layer 5 lands on a model that behaves differently from the
+one it learned against.
+
+We tested it by replaying the base model's own recorded routing decisions, holding "which experts
+fire" fixed, and re-measuring the same pair:
+
+    layer 1 alone                 -0.095165   (helps)
+    layer 5 alone                 -0.054498   (helps)
+    the two together, predicted   -0.149663
+    the two together, measured    -0.002736   (almost nothing survives)
+
+Holding routing fixed shrinks the interference by **16.3%**. So **~84% of the failure-to-add is not
+routing, and we have no mechanism for it.** One more result from the same run, in case anyone was
+hoping for a cheap patch: pinning routing only at the layer supposedly being disturbed made things
+**worse than not pinning at all**. Any remedy would have to be global.
+
+Nothing here changes what your miner does. It changes what we are allowed to claim about why the
+pool does not yet scale with participants.
+
+#### 4. An ops failure we should own: a restart loop is not a health check
+
+One of our own cards was dead for **~19 hours**. Its supervisor did exactly what it was built to do —
+it restarted the miner **40** times — and every single launch died about **2 minutes** in because a
+directory it needed no longer existed. An intact copy was sitting right beside it the whole time.
+
+The supervisor's health signal was "I am restarting things", which in every log we watch is
+indistinguishable from "work is happening". If you run a supervisor around your miner, make it check
+that a launch got *past* startup, not merely that a launch happened.
+
+### 2026-08-11 — **The gate that decides what gets paid is SIGN-INVERTED: most of what it accepted made the real model worse, not better.** The replacement is built, default-OFF, and NOT deployed — so this is a disclosure, not yet a fix. Also: capability came back NULL at a stated resolution, and your 8 GB card carries 6 expert layers, not 1.
+
+**If you have mined here, read section 1 and section 2.** They are the most important thing we have
+published about this pool.
+
+#### 1. We have been paying against a proxy that is wrong in one direction
+
+You are graded by a stand-in metric — one expert layer — rather than by the real 47-layer model.
+We already knew that stand-in was imprecise. It is worse than imprecise. We scored the **same 84 paid
+records** both ways:
+
+    what the pay gate saw (1-layer proxy)     -1.8277 nats   BETTER
+    what the real product did (full 47)       +0.4341 nats   WORSE
+
+Per contribution the classification is the damning part: **6 were paid for damage, 0 were missed
+gains**, 1 both ways agreed to reject. The proxy has never once rejected something the real model
+would have accepted. It errs in exactly one direction — **it accepts damage.** No amount of
+tightening the margin fixes a sign.
+
+The real model can absolutely resolve this, which removes the last excuse. Its run-to-run noise floor
+is **exactly 0.0**: **28** measurements across **22** independent processes returned the identical
+number every time. One accepted contribution moves that metric by **+0.03451930322954677 nats**,
+which is **5.77x** the accept margin the campaign was calibrated to.
+
+#### 2. What this does and does not mean for you
+
+**It is not deployed.** The corrected gate exists behind a switch that defaults to off, and with the
+switch off the accept path is byte-identical to what it has always been. No live component was
+changed, restarted, or reconfigured. **Today's mining is still judged by the old gate.**
+
+**Nothing already minted is being clawed back.** Coins you earned are yours. What we are telling you
+is that a majority of the work this pool bought did not improve the product it was bought for. That
+is our design error, not yours, and we are not going to describe it as anything softer.
+
+> **We are actively working on this, and it is not a closed book.** The replacement gate scores
+> against the real 47-layer model and is already built and passing its controls in testing — what is
+> left is the economic decision above, re-setting the accept margin, and putting the judging machine
+> on a GPU. Alongside that we are running a pre-registered series to find out *why* separately-trained
+> contributions do not add up, which is the underlying cause of the damage the old gate could not
+> see; two of those experiments have run in the last week and the next is running as this is
+> published. We will report each result here whether it goes our way or not. **What we will not do is
+> switch the corrected gate on quietly, or tell you this is fixed before it is.**
+
+**Turning the corrected gate on is not a flag flip, it is an economic decision, and it is the owner's
+to make.** On this evidence, accepts go to roughly zero on day one and **miner payout stops until
+training actually improves the 47-layer model.** It also needs the accept margin re-set (the old one
+was calibrated against the proxy's noise, and the real metric's floor is zero, so the margin becomes
+a policy choice rather than a measurement), and the judging machine needs a GPU and the full layer
+pack — it runs on CPU today. We would rather say all of that out loud than quietly ship a gate that
+zeroes your income overnight.
+
+#### 3. Capability came back NULL, and the one significant result points the wrong way
+
+The decisive test: three paired benchmarks, both models scored in one process over identical batches,
+registered in advance and unedited since.
+
+    GSM8K, N = 1110
+      cross-entropy   +0.050628 nats   95% CI [-0.0189, +0.1202]   p = 0.154
+      accuracy        +0.45 pp         95% CI [-1.271, +2.172] pp  p = 0.682
+      resolution      MDE 2.46 pp
+
+    ARC-Easy, N = 2376
+      cross-entropy   -0.043999 nats   95% CI [-0.0736, -0.0144]   p = 0.0036
+      accuracy        -0.4630 pp                                   p = 0.152
+      resolution      MDE 0.8254 pp
+
+Every GSM8K number leans the way the cross-entropy win predicts, and **none is significant.** After
+correcting for multiple tests, **the single significant result in the whole study is the ARC-Easy
+regression, and it points the wrong way.** That regression carries its own caveat: scored one way it
+is -0.0440 (p = 0.0036), scored another it is +0.0049 (p = 0.37), so part of it may be a shift in
+length preference rather than in real discrimination. What is unambiguous is that **no ARC number
+moved positively at significance, under either scoring.**
+
+**The effect has shrunk every time we grew the sample**: +1.68 pp at 119 problems, +0.85 pp pooled at
+235, and now **+0.45 pp at 1110**. That is what a fluctuation collapsing toward zero looks like. And
+the honest arithmetic on the remaining hope: the smaller of our two predictions is **+0.26 pp**, which
+would need **N = 138,547** paired problems against a 1319-item test set — that is not underpowered,
+it is **permanently unresolvable at this scale**.
+
+One asymmetry is now confirmed across the whole record: **damage transfers, improvement does not.**
+Breaking the model is easy; improving it measurably is not.
+
+#### 4. Benchmark contamination, disclosed
+
+We scanned our **2,009,771,008-token** training corpus for verbatim overlap with the benchmarks we
+score on:
+
+    GSM8K test set (1319 items)      169,728 fragments    35 hits, in 6 distinct corpus regions
+    ARC-Easy (2284 items)             39,746 fragments    59 hits
+    held-out control, same scan       32,698 fragments     0 hits
+
+The zero-hit control is what makes this a real finding rather than scanner background. At **0.021%**
+of GSM8K's fragments it is far too small to explain the cross-entropy movement we saw — but it is the
+same order as the leftover accuracy lean, which **strengthens the null above rather than weakening
+it**. Separately, we found 120 rows lifted straight from a benchmark test set sitting in a
+reinforcement-learning task bank. It is disjoint from the training lane above and touched none of
+these numbers, but it is a real cleanup debt and we are naming it rather than waiting to be caught.
+
+#### 5. Your 8 GB card carries 6 expert layers, not 1 — so the full model needs 9 cards, not 47
+
+This is the good news in this entry. Under the enforced **7.356 GiB** cap, the old stage loader ran
+out of memory at **2** resident layers and only ever managed **1**. The fixed loader reaches **6**,
+with a genuine out-of-memory at 7. Peak usage fell from **11.9531** to **5.9485 GiB**.
+
+Two causes, and the second one surprised us. The loader built the whole model and trimmed afterwards,
+materialising the entire **4.0239 GiB** trunk before throwing most of it away. And **37 of the 602**
+expert pieces straddle two layers, so a stage would drag in a neighbouring layer at a full **1.125
+GiB** each, only to discard it moments later.
+
+It is bit-exact: all 80 state tensors hash identically, and stage outputs match the old path at
+`max|diff| = 0.0` over 1,048,576 elements and 79,298,560 head values. **Practically: a 47-layer
+model is a 9-card job, not a 47-card job.**
+
+#### 6. Evaluation got 43.4x cheaper, bit-exactly
+
+Reading each layer once per group instead of once per batch takes a full 47-layer evaluation from
+**91.3 min to 2.1 min** — a **43.4x** wall-clock speedup, and a separate **110x** reduction in bytes
+read, which is a different multiplier and not a speed claim. It is an exact reordering, not an
+approximation: **0 of 1280** per-row values differ, `max |diff|` exactly **0.000e+00**, and 0 items
+changed prediction.
+
+Honest asterisk: this was applied to the **evaluation** loop only. The **training** loop still sweeps
+the model many times per step, so the disk-bound problem has moved, not gone. This tooling is
+operator-side and is not part of the public miner, so nothing on your machine changed.
+
+#### 7. What you should do
+
+Nothing today. No release, no config change. Keep mining if you are mining; you are being paid under
+the same rules as yesterday. The decision that could change your income — turning on the corrected
+gate — will be announced here before it happens, not after.
+
+### 2026-08-10 — **Alpha 3.8.0 is live and a real clone updated itself to it.** Stacking contributions in weight space is now a closed dead end, and a speedup we quoted at 64x is really 4.58x.
+
+#### 1. The update path is proven end to end
+
+A genuine fresh clone running 3.7.2 upgraded itself to **3.8.0**: signature verified before anything
+ran, the new dependency installed, landed on the signed commit, correctly declined to update a second
+time, and — the part that matters — **the resulting tree started**. That last check exists because
+3.7.1 passed 697 tests and still bricked every miner who took it.
+
+Two update defects surfaced while proving it, and both can affect you:
+
+- The update rate-limit file is keyed per **user**, not per clone, so one clone checking for updates
+  can starve every other miner on the same box for **6 h**.
+- An update check that decides to do nothing logs nothing at all — which is why a miner that *could
+  never* update looked exactly like a miner that was already current.
+
+Both are recorded and being fixed. If you run several miners on one machine, that is the behaviour
+you have been seeing.
+
+#### 2. Stacking contributions in weight space: closed, not open
+
+We had been carrying a sentence saying composition "has never been tested with an honest gate". That
+sentence was false when it was written — the test had already been run under a different name. Both
+layers were chosen *because each one individually improved the goal metric*, the damaging layer was
+excluded, and both were far above measurement resolution:
+
+    layer 1 alone            -0.095165    (9.5x the resolution bar)
+    layer 5 alone            -0.054498    (5.4x)
+    clean prediction         -0.149663
+    the two together         -0.002736    retains 1.8%
+
+Applying them one after another instead of together fails too, at every dose we tried. So none of the
+three things we used to blame — scale, subject matter, resolution — explains it, and **no gate design
+repairs it**: a perfect gate would correctly pay about one contributor and zero-pay everybody else,
+which is not a pool.
+
+**What this does not say.** Our earlier five-way fleet result (51% → 100%) still stands, and so does
+the two-box WAN run (loss 16.07 → 12.14). Reading across the whole record, the distinguishing variable
+is now visible: **every unambiguous success we have had was synchronized** — contributors gated
+against a moving, shared best-so-far — **and every failure was independent parallel merging.**
+Synchrony is the variable, not unit size and not gate quality.
+
+#### 3. Correction: the speedup is 4.58x, not 64x
+
+Layer-major scoring is bit-exact against the old ordering — 0 mismatches, `max |diff|` exactly
+0.000e+00, with a self-control proving the scorer agrees with itself first. Measured throughput:
+**198.0 GiB / 94.1 s → 49.5 GiB / 20.6 s**, a **4.58x** wall speedup. We had been quoting **64x**;
+that was a bytes-read ratio repeated as if it were a time. The measured wall clock is the number.
+
+Also measured: our host-RAM tier does not change what it measures — held-out cross-entropy is
+bit-identical with it on and off at 4.8100134711111746 over 256 sequences — so it is a pure **1.51x**
+speed win and every measurement taken with it on is clean.
+
+### 2026-08-09 — **If you run an 8 GB card shared with your desktop, your miner could park forever. Fixed.** And the accuracy test came back NULL: the cross-entropy win does not turn into correct answers.
+
+#### 1. The 8 GB parking bug, and why it was invisible
+
+The safety bar that pauses your miner when free VRAM runs low was computed from the cap alone —
+`(total - cap) x 0.5` — which models exactly two consumers: us, and a hypothetical intruder. It
+missed the third and most common one: **an ordinary desktop already holds ~1.07 GiB before your
+miner starts.** On a shared 8 GB card that put the bar at **0.80 GiB** while the steady state was
+**0.53 GiB**, permanently below it. Your miner parked forever and its supervisor reported it healthy.
+
+The external baseline was already being measured and then thrown away. It is now subtracted, moving
+the bar to **0.265 GiB**. Large cards are untouched — a 32 GiB card with a 24 GiB cap still yields
+exactly 1.0.
+
+Proven both ways: restoring the old arithmetic fails 7 tests and reproduces the field log verbatim,
+and clamping the bar to zero fails 7 tests for neutering the guard. **1205 tests pass** across
+everything that imports it. Two further changes you will notice: a silent park now **re-announces
+every 20 checks** instead of going quiet, and an idle miner no longer holds its whole cap.
+
+A belief we had recorded was refuted along the way: the VRAM cap does **not** subtract a constant
+8 GiB. It sizes from *free* memory, which is precisely why it already degrades correctly from 32 GiB
+down to 8 GiB. Left alone and pinned with tests instead.
+
+#### 2. The accuracy test: NULL
+
+    N                base      alpha 0.125    change      p
+    119 (previous)   84.03%    85.71%         +1.68 pp    0.754
+    180 (complete)   78.33%    78.89%         +0.56 pp    1.0000
+    55 (all new)     69.09%    70.91%         +1.82 pp    1.0000
+    235 pooled       76.17%    77.02%         +0.85 pp    0.8506
+
+**The estimate halved as the sample doubled.** That is a fluctuation regressing toward zero, not a
+real effect coming into focus. Pooled disagreements are 13 against 15 — a coin flip. So the
+**-0.2375 nat** cross-entropy gain (p = 1.1e-4) **does not convert into correct answers** at any
+sample size we can currently afford.
+
+Two caveats stated rather than buried: the runs are not independent folds (only 55 of the second
+run's problems were new, so the pooled row is over 235 *unique* problems), and resolution at 235 is
+still ~6 pp — this rules out a large effect, not a small one.
+
+#### 3. A reproducibility floor we had never measured
+
+The 55 overlapping problems were scored twice by both models with identical weights and prompts — 110
+scorings that should have been byte-identical. **8 disagreed (7.3%).** The only difference between
+the runs was *batching*, and this model's expert math is sensitive to which sequences ride along
+together: different neighbours, slightly different scores, occasionally a different chosen word.
+
+For comparison, the difference between the two *models* was 11.9%. Those are uncomfortably close.
+This does not invalidate within-run comparisons — both models share the batching inside a run — but
+**no accuracy claim below ~7 pp should be believed without a re-run control printed beside it.** We
+have had a bit-exact control for cross-entropy for months; answer generation never had one.
+
+#### 4. Throughput: batch width is the lever
+
+    batch    s/step     s/sequence/step    peak
+    8        27.561     3.445              9.59 GiB
+    16       28.606     1.788              11.75 GiB
+    24       28.426     1.184              13.95 GiB
+
+Step time is flat while the batch triples, so per-sequence throughput is **2.9x**: one generation step
+is a full sweep of the streamed weights however many sequences ride along. Two earlier calls were
+wrong and are corrected here — pinning more layers is **not** a null (at 8 pinned it is 1.22x scoring,
+1.19x generation; the curve is flat and then improves), and the layer-major speedup is **not** the
+unlock for benchmark measurement, because it speeds up scoring while accuracy is generation-bound.
+
+### 2026-08-08 — **Joining now costs 5.08 GiB instead of 6.34, with no client update.** And accept counts turn out to measure *when* a coordinate registered, not what it is worth — so stop using them to pick one.
+
+#### 1. The smaller download is live, delivered without a release
+
+The coordinator now serves a stripped trunk on a fresh campaign, `34f6b309d1204861`. **No miner
+release was needed and none should have been cut** — your miner fetches the trunk by a fixed name,
+and that name now resolves to the smaller file, so the saving arrives entirely from the data side to
+the signed **3.7.2** client you already have.
+
+    trunk, stripped     4,320,733,320 B    what a joiner gets now
+    total base pulled   5,453,562,255 B    5.08 GiB, against 6.34 GiB before
+
+**Proven on the path a stranger actually walks**, not on our own box: a fresh clone of the public
+repo with every project environment variable cleared, base fetched with **no token**, 13/13 pieces
+good, then join → claim a coordinate → 60 training steps in **83.5 s** → publish → **the coordinator
+judged it** (a reject, at held-out CE 7.83578). A judged reject is the right proof; an unjudged
+publish would prove nothing. Deleting the old base freed **6,801,794,367 B**.
+
+#### 2. Accept counts cannot tell you which coordinate is worth claiming
+
+You pick your own coordinate, so this one changes what you should do. We measured the relationship
+between how *early* a coordinate registered and how often it gets accepted:
+
+    campaign 34f6b309d1204861   (9 coordinates)     rho = -0.888
+    campaign 31627ec8f184cfd6   (59 coordinates)    rho = -0.301
+
+At **-0.888** that is not a hint, it is mostly the whole story. The mechanism is our own gate: it is a
+best-so-far ratchet. At the start of a campaign the model's score is poor (8.19741) and a modest
+contribution clears the margin easily; as the ratchet drags the score down, the bar rises for
+everyone, so **a coordinate that registers later faces a strictly harder gate for identical work.**
+The obvious alternative explanation is ruled out — the correlation between expert id and registration
+time is 0.067, so coordinate assignment really is time-independent.
+
+Two consequences:
+
+- **For you:** "coordinate X has more accepts, so X must matter more" is not a valid inference, and
+  neither is picking a coordinate by its accept count. It is largely a clock reading.
+- **For us:** a miner joining later earns less for the same work. The ratchet is correct and stays,
+  but who it advantages should be a stated policy rather than an accident, and it sits badly with
+  open unlimited slots.
+
+**Correction to something we said earlier in the same week:** one coordinate took 9 of 18 mints and
+we read that as agreeing with our earlier finding that one coordinate supplies most of its layer's
+gain. It does not agree with anything — that coordinate also registered first, and that alone
+explains the concentration.
+
+#### 3. Release blocker found on the same walk: a desktop-shared 8 GB card parks forever
+
+Running as a real stranger does — with the machine-wide VRAM cap variable cleared — the miner sat for
+**9+ minutes** of five-second heartbeats entirely inside the low-VRAM pause: zero log growth, zero
+contributions, and a supervisor reporting it alive and therefore fine.
+
+    capped to 6.40 GiB   (80.0% of the 8.00 GiB card; 6.93 GiB was free)
+    pause bar            (8.00 - 6.40) x 0.5 = 0.80 GiB     from the cap alone
+    steady-state free     8.00 - 6.40 - 1.07 = 0.53 GiB     permanently below the bar
+
+**The bar ignored memory already in use.** Deterministic, not flaky, and it is exactly the population
+we recruit — our own 4060 only ever worked because a cap we had set by hand incidentally pushed the
+bar down to 0.30. See the 2026-08-09 entry above for the fix. **A miner that never earns and never
+errors is worse than one that crashes, because nothing escalates.**
+
+#### 4. Training the "math expert" does not work — measured, negative
+
+The intuition is reasonable: there are many experts, so train the math one and the model gets better
+at math. Testable, and the answer is that **this is not what our mining is doing.** The three layer-1
+experts our frozen router distinctively prefers for math were accepted at **3/90 = 0.0333**, *below*
+the **83/1344 = 0.0618** rate of every other coordinate — the effect runs backwards. The one
+positive-looking contrast (**29/209 = 0.1388** against **57/1225 = 0.0465**, p = 0.0303) is carried
+entirely by three high-traffic *generalist* experts, dies once you correct for multiple tests
+(adjusted p = 0.182), and reverses sign under two stricter definitions of "math expert".
+
+Resolution is 2.5x at 80% power, so a large math effect is ruled out and anything below 2x remains
+unresolvable — we are labelling that rather than claiming zero.
+
+#### 5. Live campaign state, stated honestly
+
+One 4060 was carrying the campaign alone: **195 rounds** at **86.3 s/round**, **140 judged events**,
+**17–18 accepted (12.1% goodput)**, gate score **8.19741 → 7.78145 (−0.416 nats)** across 9 layer-1
+coordinates, with evict-and-reclaim working unsupervised.
+
+**That is the gate metric, and the gate is measured not to predict capability.** So the correct
+reading is "the mining loop is healthy and earning under its own rules" — **not** "the model
+improved". The 2026-08-11 entry above is what happened when we finally scored those same accepts
+against the real product.
+
+One more disclosure about the public page: it was pairing two different experiments. It showed an
+ARC number (0.8237 → 0.8190, near-flat) from the 1/8-dose fold next to a cross-entropy number
+(4.817 → 5.251, much worse) from the full-dose fold. Nothing was mislabelled and the verdict still
+computed "worse", but the two headline numbers did not describe the same object, and the mismatch ran
+in the flattering direction.
+
 ### 2026-08-07 — **We tested whether the crippled training target was the problem. It was not.** Training against the real, complete model came out slightly *worse* than the broken one it was meant to replace. And at the good dose, your work leaves the model intact but no smarter.
 
 **Yesterday's hopeful reading survives — it just buys less than we hoped.** Three measurements landed

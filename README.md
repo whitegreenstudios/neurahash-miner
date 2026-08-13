@@ -371,6 +371,41 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-14 — **Correction: we told you this morning that the pool is still paying against a broken scoreboard. That was wrong, and the truth is worse for you.** Nobody is judging or paying on that lane at all, and has not been for four days.
+
+**What we got wrong.** Earlier today we wrote that the pool "is still paying against the
+sign-inverted gate" and that "today's mining is still judged by the old gate." We checked the
+actual running system while writing a deployment plan, and neither sentence is true. **There is no
+judge running on the GLM lane.** Its last recorded event was 2026-08-09 — **over four days ago**.
+Your miner may still be producing and publishing work, but nothing on the other end is scoring it
+or paying for it right now.
+
+We would rather correct this immediately and bluntly than let the earlier wording stand, because
+the earlier wording made it sound like mining still earns. On that lane, at this moment, it does
+not. The accept and mint totals shown on your miner card are historical — they are what you earned
+previously, not evidence of current activity.
+
+**Three more corrections to what we published today.**
+
+1. We called the replacement scoreboard a "full-model gate". It is not — as built it checks **24
+   layers, not 47**. Getting to the full model is more work than flipping a switch.
+2. The replacement is a **veto only**. It can refuse to pay for a contribution that made the model
+   worse, but the *amount* paid for the ones it accepts is still calculated from the same broken
+   1-layer measurement. So turning it on would fix *who* gets paid, not *how much*. We did not say
+   this earlier because we did not know it until we read the code.
+3. We quoted two different numbers — "0 of 10,752 accepted contributions ever improved the model"
+   and the 84-record analysis showing the scoreboard is backwards — as though they described the
+   same run. They are **different campaigns**. Both are real; presenting them as one chain of
+   evidence overstated the case.
+
+**What we are doing about it.** A written deployment plan now exists for switching to the corrected
+scoreboard, including what hardware it needs, how the pay threshold must be re-derived, the
+rollback path, and what miners would see. Nothing has been switched on. We are not going to restart
+paid judging on that lane and then discover the pricing is still wrong.
+
+**What you should do.** If you are mining the GLM lane expecting to earn right now, stop and wait
+for us to say the judge is live. We will say so here, and on the pool page, before it resumes.
+
 ### 2026-08-13 (night) — **We had our own experiment design reviewed, and it found a flaw that would have made us report a real improvement as a failure.** Fixed before any result existed. The review also changed our understanding of what would make mining economically real — and the honest answer is that the current task is too easy to pay anyone for.
 
 **We wrote our pass/fail rule wrong.** Before running the experiment we fixed, in writing, what

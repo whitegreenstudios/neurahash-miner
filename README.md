@@ -371,6 +371,54 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-13 (later) — **What we are changing next, and why: the kind of work we ask your GPU to do is going to change.** Paying for weight updates that get merged together is a dead end — we have now proved that to our own satisfaction. The next thing we test pays for something a machine can check exactly: reasoning that reaches the right answer.
+
+**The short version.** For months the deal has been: your GPU trains a slice of the model, sends
+back a weight update, and we merge everyone's updates together. We have now established three
+things that, taken together, end that design.
+
+1. **The updates do not add up.** We hand-picked the two best individual updates we had — each one
+   genuinely improved the real model on its own — and combined them. Together they kept **1.8%** of
+   what they should have. We then spent a week finding out why. The interference does not shrink
+   when you make the updates smaller, which rules out the easy explanations and means there is no
+   clever averaging trick waiting to fix it.
+2. **The scoreboard was pointed the wrong way**, which is the disclosure in the section below.
+3. **And here is the part that stings the most.** Suppose we had solved both of those perfectly.
+   The thing all this work produces is a better score on a statistical measure called
+   cross-entropy — roughly, "the model is less surprised by ordinary text". We finally tested
+   whether that turns into the model *answering more questions correctly*. It does not. Not once,
+   in this entire project. So we have been carefully building a delivery system for a payload we
+   cannot show does anything.
+
+We would rather tell you that than keep the mining running and stay quiet about it.
+
+**What we are testing instead.** Have the model attempt problems that have known answers, keep only
+the attempts that actually reach the correct answer, and train on those. Why this is different in a
+way that matters to you: **the test is the goal.** Checking a contribution means checking whether an
+answer is right. That cannot be subtly wrong in one direction the way our current scoreboard turned
+out to be — the failure that this week's disclosure is about. It is also naturally parallel, and it
+runs on modest cards, so the role for a stranger's GPU survives: **you would generate attempts, and
+correctness decides what counts.**
+
+**We are not claiming this works.** Published results for this method elsewhere are encouraging, but
+this project has already watched strong outside evidence fail to reproduce on our own model, so we
+are treating it as a hypothesis. Before anything else we are running a one-day check on a question
+that could sink it immediately: **can our hardware even run the full model to generate text?** The
+model is far too large for a single card — it needs roughly nine to hold all of it — and one path we
+already measured is so slow at loading weights that generation on it would be pointless. If the
+honest answer is "not on this hardware", we will publish that, and it will change the plan again.
+
+**What this means for you, concretely, today.** Nothing changes yet. Your miner keeps running the
+work it is running, judged by the gate described below, and nothing minted is affected. If the new
+direction survives its feasibility check, we will publish the design *before* asking anyone to run
+it, including what the new gate checks and how payment would work. **We will not quietly swap what
+your GPU is doing.**
+
+**And one commitment.** The result of the test above gets published here whether it succeeds or
+fails. Everything in this changelog for the past week has been a negative result or a correction of
+something we got wrong. That is not a comfortable pattern to publish, but it is the real state of
+the work, and you are entitled to it before you decide whether to keep pointing a GPU at us.
+
 ### 2026-08-13 — **If the pool page said you were offline, that was two bugs on our side and you were mining fine.** Also: two claims we published earlier this week were wrong in the same way, and we are withdrawing both here.
 
 #### 1. The pool page called every miner offline. No miner was at fault.

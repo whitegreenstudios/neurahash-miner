@@ -371,6 +371,46 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-13 (night) — **We had our own experiment design reviewed, and it found a flaw that would have made us report a real improvement as a failure.** Fixed before any result existed. The review also changed our understanding of what would make mining economically real — and the honest answer is that the current task is too easy to pay anyone for.
+
+**We wrote our pass/fail rule wrong.** Before running the experiment we fixed, in writing, what
+would count as success. The rule had two conditions joined by "or" — and at the sample size we plan
+to use, those two conditions trigger at almost exactly the same point. The effect is that **a
+genuine, statistically solid improvement that happened to land slightly under our size threshold
+would have been written down as a failure.** We caught it because we asked an outside reviewer to
+attack the design, not to approve it.
+
+It is fixed, and we fixed it the right way: the original rule is left visible, the change is
+appended underneath with the reason, and we recorded that at the time of the change **no training
+run, no trained model, and no evaluation existed** — so the change could not have been steered by a
+result we had already seen. That ordering is the whole point of writing rules down in advance, and
+it only counts if you can show it.
+
+**The more important finding is about mining itself, and it is not comfortable.** We have been
+saying the hard part of paying people for verified reasoning is proving a submission is genuinely
+theirs. The review pointed out that this is solvable — give each miner different problems, pay only
+the first correct solution, and keep the answer key private — and that we were holding this new idea
+to a standard the OLD one never met either. Our weight-update mining never had working
+pay-for-usefulness, which is exactly what this week's disclosure was about.
+
+**The real problem is simpler: the work is not scarce.** One of our machines produced a complete
+training set in under three hours, because the model already solves about 83% of these problems on
+the first try. If the work is that easy to produce, there is nothing to pay a stranger for, no matter
+how well we verify it. Mining only becomes economically real on problems that are **hard to solve and
+easy to check** — where a solution takes real effort to find. Grade-school maths is the right
+difficulty for proving the method works, and the wrong difficulty for a coin.
+
+So we are being explicit about what this week is and is not: it is a test of whether the training
+method makes the model smarter, and it **does not, by itself, fix mining**. We would rather label it
+that way now than let a good result read as more than it is.
+
+**One more check before we spend the week.** Our measure of how much room there is to improve was
+taken on the practice problems, not the exam. The model does noticeably better on practice than on
+the exam, and we know some exam questions leaked into its original training data. So the room to
+improve may be smaller than it looks — and if it is small enough, the experiment cannot detect a
+result either way and should not be run. That check is running now and costs about two hours. If it
+says stop, we will say so here.
+
 ### 2026-08-13 (evening) — **The new direction passed its first real test: the model runs on a single card, and we can now train it on one too.** Two things we had believed for weeks turned out to be wrong, both in our favour. Nothing about your mining changes today.
 
 **Short version.** Earlier today we told you we were abandoning "your GPU produces a weight update

@@ -371,6 +371,55 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+### 2026-08-13 (evening) — **The new direction passed its first real test: the model runs on a single card, and we can now train it on one too.** Two things we had believed for weeks turned out to be wrong, both in our favour. Nothing about your mining changes today.
+
+**Short version.** Earlier today we told you we were abandoning "your GPU produces a weight update
+that we merge" and testing something else: the model attempts problems with known answers, we keep
+only the attempts that reach the right answer, and we train on those. That direction had two
+possible show-stoppers. We checked both. **Both cleared.**
+
+**Show-stopper 1: could our hardware even run the full model to generate text?** We thought this
+needed roughly nine graphics cards. It does not. That "nine cards" number describes what training
+needs at full precision, and we had been wrongly applying it to *generation*. A compressed 4-bit
+copy of the model is about 18.5 GB and runs on **one** card. Generation rate measured on our own
+machine: **74,616 verified-correct solutions per day**, against a threshold we had set at 300 before
+running. We were not close to the limit; we were 249 times past it.
+
+We checked the compression honestly rather than trusting it. The model's expert layers are 93% of
+it, and a compression that quietly skipped them would look fine and be useless — that exact mistake
+crashed one of our machines in July. The file is small enough that skipping them is arithmetically
+impossible. We also measured what compression costs: on the same problems, the compressed model
+solves **62.7%** versus **70.0%** for the full-precision one. So it is slightly worse, and we treat
+that as a real cost rather than rounding it away. It only reduces how many good answers we harvest;
+it cannot corrupt them, because an answer is kept or discarded on whether it is *correct*.
+
+**Show-stopper 2: could we train the model on one card?** The full-precision model is 58 GiB against
+a 32 GB card, so on the face of it, no. The insight that resolves it: a frozen model is never
+*written to*, only read — so it can be streamed from disk a piece at a time and discarded, instead
+of being held in memory all at once. We had also been quoting a "disk is 1,300x too slow" figure for
+years. That measurement was taken on an old mechanical hard drive. On the solid-state drive the
+model actually lives on, reading the entire 62 GB takes **24 seconds**. Training on one card is
+feasible.
+
+**What we honestly do not know yet.** Whether any of this makes the model *smarter*. The method can
+only sharpen reasoning the model can already sometimes do — and we measured that headroom at **12.5
+percentage points**. That is real and it is stable, but it is not large, and every previous attempt
+in this project to turn a training gain into better answers has come back null. The experiment is
+registered in advance with a fixed pass mark, and we will publish the result either way.
+
+**We also found a second contaminated data file** — 1,249 rows of test questions sitting inside a
+file whose name says "train". Training on it would have produced a fake improvement that looked
+real. It is now blocked by name, along with the one we found earlier.
+
+**For you, right now: nothing changes.** Your miner runs the same work, judged by the same gate
+described below — the one we disclosed this morning as pointing the wrong way. That remains true and
+remains unfixed. We are not going to switch what your GPU does without publishing the design first.
+
+**And the honest gap.** Even if all of the above works, we do not yet have a design for what a
+*miner* would do in this new direction. Generating attempts is easy to distribute; proving that the
+attempt is genuinely yours, and deciding what it is worth, is not solved. We would rather say that
+out loud now than let you assume there is a plan we have not written.
+
 ### 2026-08-13 (later) — **What we are changing next, and why: the kind of work we ask your GPU to do is going to change.** Paying for weight updates that get merged together is a dead end — we have now proved that to our own satisfaction. The next thing we test pays for something a machine can check exactly: reasoning that reaches the right answer.
 
 **The short version.** For months the deal has been: your GPU trains a slice of the model, sends

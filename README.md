@@ -49,6 +49,116 @@ else runs (or that you run from the full node package).
 
 ---
 
+## 🔒 Known security & operational risks (2026-08-14) — open by design during testing
+
+**Read this before running the miner on a machine you care about.**
+
+Every item below is **open right now and will be closed before public release.** They are listed
+here because we would rather you decide with the full picture than discover it yourself. Several are
+deliberate testing-phase tradeoffs — they make it easy to iterate quickly on an alpha where the only
+participants are testers — and they are **not acceptable for a network handling real value.**
+Where an item is already fixed, it says so and names the version.
+
+Prompted by an external security review of this repo, 2026-08-14. We agreed with most of it, and
+one of its points was already out of date.
+
+### 1. The auto-updater runs by default, and the trust root cannot be revoked — OPEN
+
+The miner self-updates: it fetches a signed release manifest, `git checkout`s the named commit, and
+re-execs. It can also run `pip install`. This is a **supply-chain path onto your machine**, and it
+is on by default.
+
+- **Turn it off with `NEURAHASH_AUTOUPDATE=0`** (or `--no-auto-update`) and update by hand after
+  reviewing the diff. The mechanism is designed to be disabled; nothing else breaks.
+- **The deeper problem, which is ours to fix:** there is a **single pinned release key and no
+  revocation mechanism**. If that key were compromised, there is currently no way to tell running
+  miners to stop trusting it — we would have to reach every operator out of band. Key rotation and
+  revocation are required before public release.
+
+### 2. Dependencies are not pinned or hashed — OPEN
+
+`requirements.txt` currently has **7 of 11 entries unpinned and zero hashes**. A fresh install can
+resolve to versions we have never tested.
+
+- `torch` is unpinned **deliberately** — you must install the build matching your CUDA/CPU, and we
+  cannot choose that for you. That one stays.
+- The rest (`numpy` and friends) should be pinned, and the file should ship hashes. That is on us.
+- **Meanwhile:** install into a dedicated `venv`/`conda` environment, never system-wide.
+
+### 3. Blast radius — run it isolated — OPEN (advice, not a bug)
+
+The miner runs large ML workloads, downloads multi-GB blobs, and talks to an HTTP coordinator. Treat
+it accordingly:
+
+- Run it in a **VM, a restricted container, or a burner machine.**
+- The host should hold **no credentials, SSH keys, cloud tokens, or wallets** other than the
+  per-node `~/.neurahash/glm_miner_key` the miner generates for itself.
+- Outbound-only is by design: **block all inbound.** If you allowlist outbound, include
+  `raw.githubusercontent.com` (the **primary** release-manifest source), the Hugging Face domains,
+  and the public content store — allowlisting only the latter two silently pushes update discovery
+  onto the mirrors.
+
+### 4. Wasted electricity on a dead lane — FIXED in 3.8.2
+
+Previously the miner kept training when the coordinator was gone, burning power on work nobody would
+ever score. **As of 3.8.2 it detects a lane whose event counter and accepted-record count have both
+stopped moving for 3 hours** (`NEURAHASH_SD_STALE_LANE_S`, `--stale-lane-s`, `0` disables), prints a
+banner, and **pauses training** while still polling — resuming by itself with `LANE RECOVERED`. It
+never exits on its own.
+
+Also use the VRAM cap (`NEURAHASH_VRAM_CAP_GB`) and run under a supervisor with CPU/memory limits.
+
+### 5. A hostile or broken coordinator can waste your compute — OPEN
+
+Corpus integrity is gated by `corpus_sha` and every delta is signature-verified, so a coordinator
+cannot silently swap the model out from under you. But it **can** serve you training data that leads
+nowhere, and you would burn GPU time on it. There is currently no miner-side quality check on the
+work it is handed.
+
+### 6. The self-update file-reclaim path — MOSTLY CLOSED, one residual
+
+The updater can delete files that a release stops shipping. Its safety properties today:
+deletion candidates come **only from an allowlist** (files a signed manifest previously declared),
+never from scanning your disk; an **unset** `NEURAHASH_UPDATE_RECLAIM` is a **dry run that deletes
+nothing**; an explicit `0` is a kill switch no caller can override; and wallet/keystore, `_data/`,
+config and logs are on a never-touch list. There is exactly one `os.remove` in the module and it
+only ever acts on an allowlist entry.
+
+**Residual:** the *previous* half of that allowlist is read from an **unsigned local state file**, so
+someone who can already write to your miner directory can influence the candidate set. Bounded by
+every guard above, and such an attacker usually has write access anyway — but it will be closed by
+binding each ledger entry to the manifest signature that declared it.
+
+### 7. Untracked files can permanently block updates — MADE LOUD in 3.8.2
+
+`git checkout` **aborts** when a commit adds a file that already exists untracked in your tree. Once
+that happens, every future self-update fails. Before 3.8.2 this scrolled past as a single ~200-character
+line. It now prints a full banner naming the exact blocking files, tells you to move them by hand,
+and keeps mining on the code you already have. **It deliberately does not offer to run `git clean` or
+`checkout -f`** — your wallet lives in that directory.
+
+### 8. Earnings — see "Honest status" above, and take it literally
+
+The economics are the weakest part of this system today, and the section above is not modesty:
+**0 of 10,752 accepted deltas ever improved held-out validation**, and the accept gate was measured
+**sign-inverted** — in 6 of 7 cases it paid for work that made the model worse. The GLM lane's judge
+has been inactive since 2026-08-10, so nothing is being scored or paid at present.
+
+**Treat anything the CLI shows as testnet points, not redeemable value.** Do not buy hardware or rent
+cloud GPUs for this. Run it because you want to help test distributed training. An independently
+auditable live ledger is a public-release requirement, and it does not exist yet.
+
+### Fixed already, listed so the record is complete
+
+- **Reward forgery on the RLVR lane (fixed 2026-08-14).** The reward is now derived from the
+  `completion_ids` inside the signed blob and re-checked, so forging the extracted answer *and* the
+  reward together no longer survives. Without a tokenizer the check **fails closed** rather than
+  silently opting out.
+- **Held-out contamination (fixed 2026-08-14).** 96 held-out evaluation questions were reachable as
+  training data. The split is now authoritative and **raises** rather than filtering silently.
+
+---
+
 ## 🔬 What we found in run 5, and what changes for you (2026-07-28)
 
 **Read this if you mined run 5.** We measured, on a real benchmark, that run 5's *accepted* work

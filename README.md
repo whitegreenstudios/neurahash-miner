@@ -371,6 +371,63 @@ fix becomes a different one.
 > material rather than a cleverer merge formula. That experiment is built and gated, and we will
 > publish it either way.
 
+## Alpha 3.8.2 (2026-08-14) — the miner now tells you when it is wasting your electricity, and stops
+
+Both fixes in this release exist because of the same failure: **the miner stayed quiet about things
+you would obviously have wanted to know.** Nothing about how work is trained, signed, or published
+changes. No new dependency, no new network call, no config you must edit.
+
+**1. Your GPU no longer trains for a lane nobody is judging.** Our own 4060 mined a lane whose
+coordinator and judge had both been gone for **4.27 days**. It trained, it published, and nothing
+on the other end scored or paid for a single delta of it. It never complained, because nothing in
+the miner watched for *absence* — the one no-progress guard we had compares global model roots,
+and on a shard-claim lane those are never comparable, so it was skipped forever.
+
+The miner now watches the two counters a live coordinator cannot help moving (the pointer `event`
+and the count of accepted records in the lane manifest). If **neither** moves for 3 hours, you get
+an unmissable banner instead of silence:
+
+```
+!! NEURAHASH: THIS LANE LOOKS DEAD -- NOTHING IS SCORING YOUR WORK.
+!! The coordinator's event counter has not moved for 214 min (threshold 180 min).
+!! TRAINING IS PAUSED so your GPU is not burned on work nobody is paying for.
+!! The miner keeps polling and RESUMES BY ITSELF the moment the lane moves --
+!! do NOT restart it.
+```
+
+It **pauses, it does not quit.** A miner that exits because the pool was briefly slow would be a
+worse bug than the one being fixed — it turns a 20-minute coordinator restart into a fleet that
+never comes back without a human at every machine. While paused it keeps the cheap manifest poll
+running and prints `LANE RECOVERED` and resumes on its own the moment a counter moves.
+
+Why 3 hours: the slowest legitimate step we have ever measured on this project is ~660 s, and the
+coordinator gives up on an idle lane after 600 s by its own configuration — so 10,800 s is ~16x
+the slowest real cadence, and still fires **34x sooner** than the outage that prompted it. Change
+it with `NEURAHASH_SD_STALE_LANE_S=<seconds>` or `--stale-lane-s <seconds>`; `0` disables the
+detector entirely (the miner then says so at startup, so a disabled safety net is never silent).
+
+**2. A failed self-update is now loud, complete, and actionable.** Previously an update failure was
+one line, truncated to ~200 characters, printed between two loss lines — in practice it scrolled
+past and was gone, and the truncation reliably kept the *least* useful part of the message. Update
+failures now print a bordered `NEURAHASH SELF-UPDATE FAILURE` banner with the **full** diagnosis
+(a real traceback, not `str(e)`), pure ASCII so a Windows console cannot turn your error report
+into a *different* error. You can also ask at any time:
+
+```
+python tools/self_update.py --status
+```
+
+which tells you what happened the last time this miner tried to update itself.
+
+It also names a specific trap. `git checkout` **aborts** when a file it must write already exists
+untracked in your clone — and once that is true it fails on *every* future update attempt, forever,
+silently. If that is why an update failed, the miner now says so and lists the offending files, so
+the fix is obvious instead of mysterious.
+
+**Unchanged and deliberate:** a failed update is still **fail-closed** — your miner keeps mining on
+the code it already has, and only ever runs an update whose signature verifies against the pinned
+release key.
+
 ### 2026-08-14 — **Correction: we told you this morning that the pool is still paying against a broken scoreboard. That was wrong, and the truth is worse for you.** Nobody is judging or paying on that lane at all, and has not been for four days.
 
 **What we got wrong.** Earlier today we wrote that the pool "is still paying against the

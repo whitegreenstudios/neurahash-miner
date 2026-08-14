@@ -133,10 +133,69 @@ VERSION_FILE = "VERSION"
 REQUIREMENTS_FILE = "requirements.txt"
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")  # a bare git commit id -- NOT an arbitrary ref
 
+# How much of a failing subprocess's output we keep, and FROM WHICH END. Both matter.
+# A chained failure puts the PRIMARY exception FIRST and the unwinding finalizer's secondary
+# exception LAST, so the tail is exactly the half that does not explain anything: a recorded
+# incident here kept `stderr[-200:]`, threw away a plain out-of-disk `RuntimeError` and spent six
+# days blaming torch for the serialization error that followed it. Keep the HEAD, and keep enough
+# of it that a multi-line git/pip diagnosis (the untracked-file list below is one) survives whole.
+MAX_ERROR_CHARS = 4000
+_TRUNC_NOTE = "\n...[truncated after %d chars; the FULL text is in the updater state file]"
+
+# The state key that answers "what happened the last time this miner tried to update?".
+LAST_UPDATE_KEY = "last_update"
+
+# Outcomes that are NORMAL and must NOT shout: nothing failed, there is simply nothing to do.
+BENIGN_ACTIONS = frozenset({"disabled", "rate-limited", "no-op-not-forward", "applied"})
+
 
 def log(msg):
     """One ASCII line, flushed -- safe on the Windows cp1252 console."""
     print(f"[self_update] {msg}", flush=True)
+
+
+def _head(text, limit=MAX_ERROR_CHARS):
+    """HEAD-first truncation (see MAX_ERROR_CHARS). Returns ASCII-safe text, never None."""
+    s = "" if text is None else str(text)
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + (_TRUNC_NOTE % limit)
+
+
+def _exc_text(e):
+    """The FULL traceback for an exception, not `str(e)`. `str(e)` on an OSError is often just
+    'Permission denied' with no hint which path or which call site produced it -- the very shape
+    of report that made a self-update failure unactionable."""
+    import traceback
+    try:
+        return "".join(traceback.format_exception(type(e), e, e.__traceback__)).strip() or repr(e)
+    except Exception:                                            # noqa: BLE001
+        return repr(e)
+
+
+def _ascii(s):
+    """Force pure ASCII. The Windows console is cp1252: one non-ASCII byte in a failure banner
+    turns the loud failure this module exists to produce into a UnicodeEncodeError."""
+    return str(s).encode("ascii", "replace").decode("ascii")
+
+
+def loud(title, detail_lines=(), log_fn=None):
+    """Print an UNMISSABLE, pure-ASCII banner. Used for every update FAILURE.
+
+    A one-line WARN in the middle of a training log is not observable by the person running the
+    miner -- it scrolls past between two loss lines and is gone. A banner with a solid rule above
+    and below survives skimming, survives `grep NEURAHASH`, and survives a screenshot."""
+    emit = log_fn or (lambda m: print(m, flush=True))
+    bar = "!" * 78
+    emit(bar)
+    emit("!! NEURAHASH SELF-UPDATE FAILURE: " + _ascii(title))
+    for ln in detail_lines:
+        for sub in _ascii(ln).splitlines() or [""]:
+            emit("!! " + sub)
+    emit("!! The miner KEEPS MINING on the code it already has (fail-closed, by design).")
+    emit("!! Update state on demand:  python tools/self_update.py --status")
+    emit(bar)
 
 
 # ------------------------------------------------------------------ version parsing / ordering
@@ -514,6 +573,54 @@ def _default_git(repo_dir, *args, timeout=180):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+# ------------------------------------------------------- untracked-file awareness (issue #156)
+# THE FAILURE THIS EXISTS FOR. `git checkout <commit>` ABORTS -- it does not merge, overwrite or
+# warn -- when a file the target commit introduces already exists in the working tree as an
+# UNTRACKED file. This is not hypothetical here: commit 4b03c06 ("durability: track the five
+# import/release-critical modules that were in NO git ref") newly TRACKED five files that had
+# existed only as untracked files on working machines, `tools/self_update.py` among them. Every
+# clone that carries any of those files untracked will fail its next checkout forever, at every
+# 6-hourly check, with the same error -- a permanently stuck miner whose only symptom, before this
+# change, was one WARN line carrying a 200-character tail of git's message.
+#
+# We DETECT and NAME it; we never fix it by deleting. `git checkout -f` / `git clean` would resolve
+# it instantly and is exactly the operation this module has already refused once (see the reclaim
+# never-touch rules): a miner's directory holds the WALLET KEYSTORE it is paid into, campaign state
+# and the operator's own files. Blowing those away to land an update is a worse outcome than not
+# updating. So: loud, named, with the one-line manual remedy, and the miner keeps mining.
+_UNTRACKED_MARKERS = (
+    "untracked working tree files would be overwritten",
+    "untracked working tree files would be removed",
+)
+_GIT_TAIL_MARKERS = ("please move or remove them", "aborting", "please commit your changes")
+
+
+def untracked_blockers(git_output):
+    """Parse git's abort message and return the untracked paths that block the checkout, in the
+    order git listed them. Returns [] when the output is not that failure -- so a caller can use a
+    non-empty result as the classification itself."""
+    text = str(git_output or "")
+    low = text.lower()
+    if not any(m in low for m in _UNTRACKED_MARKERS):
+        return []
+    out, collecting = [], False
+    for raw in text.splitlines():
+        line = raw.strip()
+        low_line = line.lower()
+        if any(m in low_line for m in _UNTRACKED_MARKERS):
+            collecting = True
+            continue
+        if not collecting:
+            continue
+        if not line or any(low_line.startswith(m) for m in _GIT_TAIL_MARKERS):
+            break
+        # git indents each listed path with a tab or spaces; anything unindented ends the list.
+        if raw[:1] not in ("\t", " "):
+            break
+        out.append(line)
+    return out
+
+
 def _default_pip(repo_dir, timeout=1800):
     """`<python> -m pip install -r requirements.txt` (the CURRENT interpreter). No shell."""
     req = os.path.join(repo_dir, REQUIREMENTS_FILE)
@@ -606,7 +713,7 @@ class UpdateResult:
     ManifestFetch describing every mirror that was tried."""
 
     def __init__(self, applied, action, reason="", local_version=None, target_version=None,
-                 checked_out=None, pip_ran=False, manifest=None, fetch=None):
+                 checked_out=None, pip_ran=False, manifest=None, fetch=None, blockers=None):
         self.applied = applied
         self.action = action
         self.reason = reason
@@ -616,11 +723,125 @@ class UpdateResult:
         self.pip_ran = pip_ran
         self.manifest = manifest
         self.fetch = fetch
+        # untracked working-tree paths that blocked the checkout (issue #156); [] otherwise.
+        self.blockers = list(blockers or [])
+
+    @property
+    def failed(self):
+        """True iff this outcome is a FAILURE the operator needs to see. 'nothing to do' is not a
+        failure, and neither is a successful apply -- everything else is."""
+        return self.action not in BENIGN_ACTIONS
+
+    def loud_lines(self):
+        """The banner body for this failure: what failed, why, and what to do about it."""
+        lines = [f"what failed : {self.action}",
+                 f"local ver   : v{self.local_version}",
+                 f"target ver  : v{self.target_version}" if self.target_version else
+                 "target ver  : (none -- no verified manifest was obtained)",
+                 "why         : " + (self.reason or "(no detail recorded)")]
+        if self.blockers:
+            lines.append("")
+            lines.append("BLOCKED BY UNTRACKED FILES ALREADY IN YOUR WORKING TREE. The signed "
+                         "release adds files")
+            lines.append("that exist here as untracked copies, so git refuses to overwrite them. "
+                         "This will")
+            lines.append("repeat at EVERY update check until it is resolved. The files are:")
+            for rel in self.blockers[:40]:
+                lines.append("    " + rel)
+            if len(self.blockers) > 40:
+                lines.append(f"    ... and {len(self.blockers) - 40} more (full list in --status)")
+            lines.append("")
+            lines.append("REMEDY (do this yourself -- the updater will NOT delete files for you;")
+            lines.append("your wallet keystore and campaign state live in this directory too):")
+            lines.append("    1. move the listed files somewhere outside the miner directory")
+            lines.append("    2. restart the miner; the update applies on the startup check")
+        return lines
+
+    def as_state(self, now=None):
+        """The JSON-able record persisted for `--status`. The reason is stored in FULL."""
+        return {"ts": float(time.time() if now is None else now),
+                "action": self.action,
+                "applied": bool(self.applied),
+                "local_version": self.local_version,
+                "target_version": self.target_version,
+                "checked_out": self.checked_out,
+                "reason": self.reason or "",
+                "blockers": list(self.blockers)}
 
     def __repr__(self):
         return (f"UpdateResult(applied={self.applied}, action={self.action!r}, "
                 f"local={self.local_version}, target={self.target_version}, "
                 f"checked_out={self.checked_out}, pip_ran={self.pip_ran}, reason={self.reason!r})")
+
+
+# ------------------------------------------------- "what happened last time?" (state + report)
+def _record_attempt(state_path, result, now=None, log_fn=None):
+    """Persist the outcome of ONE check so it can be reported on demand later. Best-effort: a
+    miner never fails to mine because it could not write a status file."""
+    try:
+        _save_state(state_path, **{LAST_UPDATE_KEY: result.as_state(now)})
+    except Exception as e:                                       # noqa: BLE001
+        (log_fn or log)(f"WARN: could not record the update attempt ({e})")
+    return result
+
+
+def _announce(result, state_path=None, now=None, log_fn=None):
+    """Record the attempt and, if it FAILED, shout about it. The single choke point every exit
+    path of check_and_update goes through, so no failure mode can be added later that forgets to
+    be loud."""
+    if state_path:
+        _record_attempt(state_path, result, now=now, log_fn=log_fn)
+    if result.failed:
+        loud(result.action, result.loud_lines(), log_fn=log_fn)
+    return result
+
+
+def update_status(repo_dir=REPO, state_path=None):
+    """Everything the operator can ask about this miner's update state, as a dict:
+    current version, whether auto-update is on, when the last check ran, and the FULL outcome
+    (action + untruncated reason + untracked blockers) of the last attempt."""
+    spath = _state_path(repo_dir, state_path)
+    st = _load_state(spath)
+    try:
+        cur = read_local_version(repo_dir)
+    except Exception as e:                                       # noqa: BLE001
+        cur = f"UNREADABLE ({e})"
+    last = st.get(LAST_UPDATE_KEY)
+    return {"version": cur,
+            "enabled": _env_enabled(),
+            "state_path": spath,
+            "last_check_ts": st.get("last_check"),
+            "last_update": last if isinstance(last, dict) else None,
+            "min_client_version": st.get("min_client_version")}
+
+
+def format_update_status(status):
+    """Render update_status() as pure-ASCII lines (cp1252-safe)."""
+    def _ts(v):
+        try:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(v)))
+        except Exception:                                        # noqa: BLE001
+            return "never"
+
+    out = ["neurahash self-update status",
+           f"  version      : {status.get('version')}",
+           f"  auto-update  : {'ON' if status.get('enabled') else 'OFF'}",
+           f"  state file   : {status.get('state_path')}",
+           f"  last check   : {_ts(status.get('last_check_ts'))}"]
+    last = status.get("last_update")
+    if not last:
+        out.append("  last attempt : none recorded yet")
+        return [_ascii(x) for x in out]
+    out += [f"  last attempt : {_ts(last.get('ts'))}",
+            f"  outcome      : {last.get('action')} "
+            f"({'APPLIED' if last.get('applied') else 'not applied'})",
+            f"  from -> to   : v{last.get('local_version')} -> v{last.get('target_version')}",
+            "  reason       :"]
+    for ln in str(last.get("reason") or "(none)").splitlines() or ["(none)"]:
+        out.append("      " + ln)
+    for rel in last.get("blockers") or []:
+        out.append("  blocked by untracked file: " + rel)
+    return [_ascii(x) for x in out]
 
 
 def _env_enabled():
@@ -1107,17 +1328,20 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
     if mirrors is None:
         mirrors = ((("manifest-url", manifest_url),) if manifest_url else MIRRORS)
 
+    spath = _state_path(repo_dir, state_path)
+
     try:
         local_version = read_local_version(repo_dir)
     except Exception as e:
-        log(f"WARN: cannot read local {VERSION_FILE} ({e}); skipping auto-update, staying put")
-        return UpdateResult(False, "no-version-file", reason=str(e), manifest=manifest)
+        return _announce(UpdateResult(False, "no-version-file",
+                                      reason=f"cannot read local {VERSION_FILE}: "
+                                             f"{_head(_exc_text(e))}", manifest=manifest),
+                         spath, now=now)
 
     if not enabled:
         return UpdateResult(False, "disabled", reason=f"{AUTOUPDATE_ENV} is off",
                             local_version=local_version, manifest=manifest)
 
-    spath = _state_path(repo_dir, state_path)
     if honor_rate_limit:
         last = _load_last_check(spath)
         if now - last < rate_limit_s:
@@ -1135,22 +1359,26 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
         # `git checkout` below on any path that has not recovered the pinned key.
         ok, info = verify_manifest(manifest, pubkey)
         if not ok:
-            log(f"WARN: supplied release manifest REJECTED ({info}); staying on v{local_version} "
-                f"(never running unverified code)")
-            return UpdateResult(False, "verify-failed", reason=info, local_version=local_version)
+            return _announce(UpdateResult(False, "verify-failed",
+                                          reason=f"supplied release manifest REJECTED by the "
+                                                 f"pinned release key: {_head(info)}",
+                                          local_version=local_version), spath, now=now)
     if manifest is None:
         fetch = fetch_best_manifest(mirrors, pubkey, fetch_fn=fetch_fn, timeout=timeout)
         manifest = fetch.manifest
         if manifest is None:
             if not fetch.any_parsed:
-                log(f"WARN: no release manifest reachable on any mirror ({fetch.summary()}); "
-                    f"staying on v{local_version}")
-                return UpdateResult(False, "fetch-failed", reason=fetch.summary(),
-                                    local_version=local_version, fetch=fetch)
-            log(f"WARN: release manifest REJECTED on every mirror ({fetch.summary()}); staying on "
-                f"v{local_version} (never running unverified code)")
-            return UpdateResult(False, "verify-failed", reason=fetch.summary(),
-                                local_version=local_version, fetch=fetch)
+                return _announce(UpdateResult(False, "fetch-failed",
+                                              reason=f"no release manifest reachable on any "
+                                                     f"mirror: {_head(fetch.summary())}",
+                                              local_version=local_version, fetch=fetch),
+                                 spath, now=now)
+            return _announce(UpdateResult(False, "verify-failed",
+                                          reason=f"release manifest REJECTED on every mirror "
+                                                 f"(never running unverified code): "
+                                                 f"{_head(fetch.summary())}",
+                                          local_version=local_version, fetch=fetch),
+                             spath, now=now)
 
     target_version = str(manifest["version"])
     commit = str(manifest["git_commit"])
@@ -1159,15 +1387,16 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
     try:
         forward = is_forward(target_version, local_version)
     except Exception as e:
-        log(f"WARN: cannot compare versions ({e}); staying on v{local_version}")
-        return UpdateResult(False, "version-parse-failed", reason=str(e),
-                            local_version=local_version, target_version=target_version,
-                            manifest=manifest, fetch=fetch)
+        return _announce(UpdateResult(False, "version-parse-failed",
+                                      reason=f"cannot compare versions: {_head(_exc_text(e))}",
+                                      local_version=local_version, target_version=target_version,
+                                      manifest=manifest, fetch=fetch), spath, now=now)
     if not forward:
-        return UpdateResult(False, "no-op-not-forward",
-                            reason=f"manifest v{target_version} <= local v{local_version}",
-                            local_version=local_version, target_version=target_version,
-                            manifest=manifest, fetch=fetch)
+        return _announce(UpdateResult(False, "no-op-not-forward",
+                                      reason=f"manifest v{target_version} <= local "
+                                             f"v{local_version}",
+                                      local_version=local_version, target_version=target_version,
+                                      manifest=manifest, fetch=fetch), spath, now=now)
 
     log(f"verified signed release v{target_version} (commit {commit[:12]}) > local v{local_version}; "
         f"applying update")
@@ -1177,22 +1406,30 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
     try:
         rc, out = git_fn(repo_dir, "fetch", "--quiet", "origin")
         if rc != 0:
-            log(f"WARN: `git fetch` failed (rc={rc}); staying on v{local_version}. {out.strip()[-200:]}")
-            return UpdateResult(False, "git-fetch-failed", reason=out.strip()[-200:],
-                                local_version=local_version, target_version=target_version,
-                                manifest=manifest, fetch=fetch)
+            return _announce(UpdateResult(False, "git-fetch-failed",
+                                          reason=f"`git fetch origin` returned rc={rc}:\n"
+                                                 f"{_head(out)}",
+                                          local_version=local_version,
+                                          target_version=target_version,
+                                          manifest=manifest, fetch=fetch), spath, now=now)
         rc, out = git_fn(repo_dir, "checkout", "--quiet", commit)
         if rc != 0:
-            log(f"WARN: `git checkout {commit[:12]}` failed (rc={rc}); staying on v{local_version}. "
-                f"{out.strip()[-200:]}")
-            return UpdateResult(False, "git-checkout-failed", reason=out.strip()[-200:],
-                                local_version=local_version, target_version=target_version,
-                                manifest=manifest, fetch=fetch)
+            # Classify BEFORE reporting: an untracked-file collision is a distinct, permanent,
+            # operator-fixable condition (issue #156) and gets its own action tag and remedy.
+            blockers = untracked_blockers(out)
+            action = "git-checkout-untracked" if blockers else "git-checkout-failed"
+            return _announce(UpdateResult(False, action,
+                                          reason=f"`git checkout {commit[:12]}` returned rc={rc}:"
+                                                 f"\n{_head(out)}",
+                                          local_version=local_version,
+                                          target_version=target_version,
+                                          manifest=manifest, fetch=fetch, blockers=blockers),
+                             spath, now=now)
     except Exception as e:
-        log(f"WARN: git error during update ({e}); staying on v{local_version}")
-        return UpdateResult(False, "git-error", reason=str(e),
-                            local_version=local_version, target_version=target_version,
-                            manifest=manifest, fetch=fetch)
+        return _announce(UpdateResult(False, "git-error",
+                                      reason=f"git raised during update:\n{_head(_exc_text(e))}",
+                                      local_version=local_version, target_version=target_version,
+                                      manifest=manifest, fetch=fetch), spath, now=now)
 
     # 6) VERIFY the tree is now exactly the signed commit -------------------------------------
     try:
@@ -1200,19 +1437,24 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
         head = head.strip()
     except Exception as e:
         rc, head = 1, ""
+        head_err = _head(_exc_text(e))
         log(f"WARN: could not read HEAD after checkout ({e})")
+    else:
+        head_err = ""
     if rc != 0 or head.lower() != commit.lower():
-        log(f"WARN: post-checkout HEAD {head!r} != signed commit {commit!r}; "
-            f"NOT re-exec'ing. Attempting to restore v{local_version}.")
         # best-effort restore so we do not strand the miner on a half-applied tree
+        restore = ""
         try:
             git_fn(repo_dir, "checkout", "--quiet", "-")
-        except Exception:
-            pass
-        return UpdateResult(False, "head-mismatch",
-                            reason=f"HEAD {head} != {commit}",
-                            local_version=local_version, target_version=target_version,
-                            manifest=manifest, fetch=fetch)
+        except Exception as e:                                   # noqa: BLE001
+            restore = f"\nthe restore to the previous tree ALSO failed:\n{_head(_exc_text(e))}"
+        return _announce(UpdateResult(False, "head-mismatch",
+                                      reason=f"post-checkout HEAD {head!r} != signed commit "
+                                             f"{commit!r}; NOT re-exec'ing"
+                                             + (f"\n{head_err}" if head_err else "") + restore,
+                                      local_version=local_version,
+                                      target_version=target_version,
+                                      manifest=manifest, fetch=fetch), spath, now=now)
 
     # 6b) reclaim files an OLDER release shipped that this one no longer does ------------------
     # Placed HERE deliberately: after HEAD is proven to equal the signed commit (so `manifest` is
@@ -1230,15 +1472,21 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
             pip_ran = True
             if prc != 0:
                 log(f"WARN: pip install returned rc={prc}; continuing to re-exec the signed code "
-                    f"anyway (deps may already be satisfied). {pout.strip()[-200:]}")
+                    f"anyway (deps may already be satisfied).")
+                log(_head(pout))
         except Exception as e:
-            log(f"WARN: pip install error ({e}); continuing to re-exec the signed code anyway")
+            log(f"WARN: pip install error; continuing to re-exec the signed code anyway")
+            log(_head(_exc_text(e)))
 
     # 8) re-exec onto the new code ------------------------------------------------------------
     log(f"update to v{target_version} applied; re-exec'ing miner on the new code")
     result = UpdateResult(True, "applied", reason=f"v{local_version} -> v{target_version}",
                           local_version=local_version, target_version=target_version,
                           checked_out=commit, pip_ran=pip_ran, manifest=manifest, fetch=fetch)
+    # Record BEFORE the re-exec: the real reexec_fn never returns, so anything written after it
+    # would never be written at all -- and "the last thing this miner did was apply v3.7.3" is
+    # exactly what --status must be able to say after a successful update.
+    _announce(result, spath, now=now)
     reexec_fn(argv)          # real impl never returns; a test fake returns and we fall through
     return result
 
@@ -1337,7 +1585,13 @@ def sync_from_manifest(repo_dir=REPO, argv=None, *, startup=True, mirrors=None,
         return SyncResult(update=upd, fetch=fetch, manifest=fetch.manifest, config_applied=applied,
                           config_ignored=ignored, publish_block=block, local_version=local_version)
     except Exception as e:                # a miner must never crash for lack of infra
-        log(f"WARN: manifest sync raised ({e}); keeping current code and config")
+        # Never crash -- but never hide it either. `str(e)` here used to be the ONLY trace of an
+        # arbitrary failure anywhere in the sync, with no file, no line and no chained cause.
+        loud("manifest sync raised an unexpected exception",
+             ["what failed : sync-raised",
+              "why         : " + _head(_exc_text(e)),
+              "",
+              "The client keeps the code and config it already has."])
         return SyncResult()
 
 
@@ -1347,10 +1601,19 @@ def maybe_auto_update(argv=None):
     try:
         return check_and_update(argv=argv)
     except Exception as e:                       # belt-and-suspenders: never escape to the miner
-        log(f"WARN: auto-update check raised ({e}); staying on current version")
-        return UpdateResult(False, "unexpected-error", reason=str(e))
+        res = UpdateResult(False, "unexpected-error", reason=_head(_exc_text(e)))
+        try:
+            _announce(res, _state_path(REPO))
+        except Exception:                                        # noqa: BLE001
+            loud(res.action, res.loud_lines())
+        return res
 
 
 if __name__ == "__main__":
-    # Manual, one-shot check ignoring the rate limit (handy for operators testing a release).
+    # `--status` reports what this miner knows about its own updates and exits; otherwise this is
+    # a manual one-shot check ignoring the rate limit (handy for operators testing a release).
+    if "--status" in sys.argv[1:]:
+        for _line in format_update_status(update_status()):
+            print(_line, flush=True)
+        raise SystemExit(0)
     print(check_and_update(honor_rate_limit=False))

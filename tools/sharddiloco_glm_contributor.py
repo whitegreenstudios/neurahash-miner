@@ -64,6 +64,7 @@ import secrets
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -5206,6 +5207,148 @@ def async_should_abort_no_progress(local_root, pointer_root, applied_any, second
     return float(seconds_since_progress) >= float(round_wait)
 
 
+# ================================================================= STALE-LANE DETECTOR (2026-08-13)
+# WHAT WENT WRONG. Our own 4060 mined a lane whose coordinator and judge were BOTH gone for 4.27
+# days. It trained, it published, and nothing on the other end scored or paid for any of it. It
+# never complained, because nothing in the miner watches for ABSENCE. A stranger running the public
+# miner gets the same deal: the card spins, the power bill runs, and the miner reports health.
+#
+# WHY THE EXISTING GUARD DID NOT CATCH IT. `async_should_abort_no_progress` above is the only
+# no-progress logic in the client, and its FIRST rule is `if not comparable: return False`. On a
+# shard-claim lane the miner holds a different slot set from the coordinator BY CONSTRUCTION, so
+# `global_root_comparable` is False forever and the guard is skipped forever. That skip is correct
+# for what that guard does (it compares global model roots, which carry no information when the
+# slot sets differ) -- it just means there is nothing left watching the clock.
+#
+# WHAT WE CAN ACTUALLY OBSERVE. Nothing the coordinator publishes carries a wall clock: neither the
+# v2 pointer (v/event/rounds/model_root/done) nor an accepted record has a timestamp field, so we
+# cannot ask "how old is this?". What we CAN see is that the coordinator's own monotonic counters
+# MOVE while it is alive: the pointer `event` advances, and new `accepted/<campaign>/r<event>`
+# names appear in the lane manifest. A live coordinator moves them; a dead one cannot. So the
+# detector is: remember the highest counters ever seen and the LOCAL wall-clock time we first saw
+# them; the lane is stale when neither has moved for longer than the threshold.
+#
+# WHY IT IS A PAUSE AND NOT AN EXIT. A miner that quits because the pool was briefly slow is a
+# worse bug than the one being fixed -- it turns a 20-minute coordinator restart into a fleet that
+# never comes back without a human. Pausing costs nothing but the GPU cycles that were being wasted
+# anyway, keeps the cheap manifest poll running, and recovers by itself the moment a counter moves.
+STALE_LANE_ENV = "NEURAHASH_SD_STALE_LANE_S"
+# THE THRESHOLD, AND WHY THIS NUMBER.
+#   Upper bound (must fire well before the real incident): the undetected outage was 4.27 days =
+#   368,928 s. 3 h fires 34x sooner.
+#   Lower bound (must NEVER fire on a lane that is merely slow): the slowest legitimate cadence
+#   ever measured on this project is a ~660 s WAN pipeline step (memory glm-lane-manifest-
+#   throughput-bound), and the COORDINATOR itself gives up on an idle lane after
+#   NEURAHASH_SD_IDLE_EXIT_S = 600 s -- so a coordinator that is alive at all has, by its own
+#   configuration, published something inside 600 s. 10,800 s is 16.4x the slowest measured step
+#   and 18x the coordinator's own idle deadline.
+# That gap -- fires at 3 h, tolerates a 3 h round -- is deliberately enormous, because the two
+# error costs are not symmetric: a false pause wastes minutes of a slow lane, a missed detection
+# wastes days of a dead one.
+DEFAULT_STALE_LANE_S = 3 * 3600.0
+STALE_LANE_REMIND_S = 1800.0          # re-shout every 30 min while stale, so it cannot scroll away
+STALE_LANE_POLL_S = 60.0              # while paused, watch for the lane's return once a minute
+
+
+def count_accepted_names(manifest_names, campaign=None):
+    """How many accepted records the lane currently advertises. The SECOND coordinator-driven
+    counter the detector watches: it rises whenever the coordinator commits anything, including
+    for events this miner has not folded (and cannot fold, on a shard-claim lane). Pure: no I/O."""
+    pref = accepted_prefix(campaign)
+    try:
+        return sum(1 for k in manifest_names if str(k).startswith(pref))
+    except TypeError:
+        return 0
+
+
+class LaneLiveness:
+    """Tracks whether the COORDINATOR is still moving, from counters only (no lane timestamps
+    exist -- see the block above). Pure except for the clock the caller passes in.
+
+    `observe(now, event, accepted_seen)` is called once per miner tick with the pointer's `event`
+    and the number of accepted records visible on the lane. It returns one of:
+        "live"     -- a counter moved (or this is the first observation)
+        "waiting"  -- nothing moved yet, but we are inside the threshold: NORMAL, stay quiet
+        "stale"    -- nothing has moved for `threshold_s`: the lane looks dead
+        "recovered"-- we were stale and a counter has just moved
+    `stale` is reported on EVERY tick while the condition holds (so the caller can keep pausing);
+    the caller uses `should_shout(now)` to decide when to print, so a 3-hour outage does not
+    produce one line per poll."""
+
+    def __init__(self, threshold_s=None, now=0.0, environ=None):
+        self.threshold_s = (DEFAULT_STALE_LANE_S if threshold_s is None
+                            else float(threshold_s))
+        if threshold_s is None:
+            self.threshold_s = _env_num(STALE_LANE_ENV, DEFAULT_STALE_LANE_S, float,
+                                        environ=environ)
+        self.high_event = None
+        self.high_accepted = None
+        self.last_move_t = float(now)
+        self.stale = False
+        self._last_shout_t = None
+
+    @property
+    def enabled(self):
+        """<= 0 disables the detector entirely (an operator running a deliberately glacial lane)."""
+        return self.threshold_s > 0
+
+    def observe(self, now, event=None, accepted_seen=None):
+        now = float(now)
+        moved = False
+        for attr, val in (("high_event", event), ("high_accepted", accepted_seen)):
+            if val is None:
+                continue
+            try:
+                val = int(val)
+            except (TypeError, ValueError):
+                continue
+            cur = getattr(self, attr)
+            if cur is None or val > cur:            # MONOTONIC only: a counter that goes backwards
+                setattr(self, attr, val)            # is a re-read artefact, never proof of life
+                if cur is not None:
+                    moved = True
+        if moved:
+            self.last_move_t = now
+            if self.stale:
+                self.stale = False
+                self._last_shout_t = None
+                return "recovered"
+            return "live"
+        if not self.enabled:
+            return "waiting"
+        if now - self.last_move_t >= self.threshold_s:
+            self.stale = True
+            return "stale"
+        return "waiting"
+
+    def seconds_since_move(self, now):
+        return max(0.0, float(now) - self.last_move_t)
+
+    def should_shout(self, now, interval_s=STALE_LANE_REMIND_S):
+        """True the first time the lane goes stale and every `interval_s` thereafter."""
+        now = float(now)
+        if self._last_shout_t is None or now - self._last_shout_t >= float(interval_s):
+            self._last_shout_t = now
+            return True
+        return False
+
+    def stale_banner(self, now):
+        """The pure-ASCII lines printed when the lane looks dead (cp1252-safe)."""
+        mins = int(self.seconds_since_move(now) // 60)
+        bar = "!" * 78
+        return [bar,
+                "!! NEURAHASH: THIS LANE LOOKS DEAD -- NOTHING IS SCORING YOUR WORK.",
+                "!! The coordinator's event counter has not moved for %d min (threshold %d min)."
+                % (mins, int(self.threshold_s // 60)),
+                "!! Last seen: event=%s accepted_records=%s" % (self.high_event,
+                                                               self.high_accepted),
+                "!! TRAINING IS PAUSED so your GPU is not burned on work nobody is paying for.",
+                "!! The miner keeps polling and RESUMES BY ITSELF the moment the lane moves --",
+                "!! do NOT restart it. To change the threshold: %s=<seconds> (0 disables)."
+                % (STALE_LANE_ENV,),
+                bar]
+
+
 def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid, sig, train_flops,
                                delta_bytes, steps, tokens, address=None, base_slot_root=None):
     """Assemble the async-lane contribution record: today's signed record EXTENDED with the alpha-2
@@ -5423,12 +5566,28 @@ def _maybe_self_update(log=_flush, _check=None):
             from self_update import check_and_update as _check
         r = _check()
         act = getattr(r, "action", None)
-        if act not in ("rate-limited", "disabled", "no-op-not-forward", None):
+        # THE SILENCE GATE THIS REPLACES. The old condition suppressed ALL output for
+        # ("rate-limited", "disabled", "no-op-not-forward", None) -- and `None` is precisely what
+        # the except branch below returns when the check itself blew up, so a self-update that
+        # failed every 6 hours for months printed NOTHING into the miner's log. A benign
+        # "nothing to do" stays quiet; every FAILURE now goes through the updater's own banner,
+        # routed into the MINER'S log sink so it lands in the output the operator actually reads.
+        if act in ("rate-limited", "disabled", "no-op-not-forward"):
+            return r
+        if getattr(r, "failed", False):
+            try:
+                from self_update import loud as _loud
+                _loud(act, r.loud_lines(), log_fn=lambda m: log("[auto-update] %s" % (m,)))
+            except Exception:                                    # noqa: BLE001
+                log("[auto-update] FAILED: %s" % (r,))
+        else:
             log("[auto-update] %s" % (r,))
         return r
     except Exception as e:                                       # noqa: BLE001 -- never kill mining
         try:
-            log("[auto-update] WARN: check failed (%r); mining continues on current code" % (e,))
+            log("[auto-update] !! SELF-UPDATE CHECK RAISED -- this miner may be stranded on old "
+                "code; mining continues on current code. Full traceback follows.")
+            log("[auto-update] %s" % (traceback.format_exc().strip(),))
         except Exception:                                        # noqa: BLE001
             pass
         return None
@@ -5559,6 +5718,17 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     _last_rotate_round = -1
     _resync_on = _data_resync_enabled(os.environ)
     _prev_data_record = _read_data_record(lane) if _resync_on else None
+    # Stale-lane detector (2026-08-13). Seeded at loop entry: a coordinator that is already gone
+    # when we start is detected `threshold_s` after WE started, which is the earliest any
+    # counter-based detector can honestly conclude anything.
+    lane_health = LaneLiveness(getattr(args, "stale_lane_s", None), now=time.time())
+    if lane_health.enabled:
+        log("[glm-contrib %s] stale-lane detector ON: pauses training if the coordinator's event "
+            "counter does not move for %d min (%s=0 disables)"
+            % (miner, int(lane_health.threshold_s // 60), STALE_LANE_ENV))
+    else:
+        log("[glm-contrib %s] stale-lane detector DISABLED (%s<=0): a dead lane will NOT be "
+            "detected" % (miner, STALE_LANE_ENV))
     if _resync_on:
         log("[glm-contrib %s] periodic corpus resync ENABLED (NEURAHASH_GLM_DATA_RESYNC): re-checking "
             "the advertised data record at each round boundary; fail-closed keeps the old corpus" % miner)
@@ -5572,7 +5742,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # start and the public page cannot distinguish this live miner from a dead one.
         heartbeat_miner_card(lane, miner,
                              address=(wallet.address if wallet is not None else None),
-                             coord="L%d,E%d" % (L, E), mode=args.mode, log=log)
+                             coord="L%d,E%d" % (L, E), mode=getattr(args, "mode", None), log=log)
         # -- ONE MANIFEST PER TICK (2026-07-27), fetched FIRST and handed to every consumer below.
         # This tick used to pull THREE full manifests: one inside lane.read_pointer()
         # (sharddiloco_harness.ContentLane.read_pointer), one inside the corpus re-sync's
@@ -5688,6 +5858,27 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                    _ptr_camp or "the current campaign"))
             return RC_NO_CAMPAIGN
         pointer_root = dec["model_root"]
+
+        # -- (0d) STALE-LANE DETECTOR: is anything on the other end still alive? Both counters come
+        # from THIS tick's single manifest/pointer snapshot, so this costs no extra I/O. A dead
+        # coordinator cannot move either of them; a merely slow one moves them well inside the
+        # 3 h threshold (see the LaneLiveness block for the derivation). While stale we PAUSE
+        # instead of training -- and keep looping, so recovery needs no restart.
+        _lane_state = lane_health.observe(time.time(), event=dec.get("event"),
+                                          accepted_seen=count_accepted_names(
+                                              man, host_campaign_id(host)))
+        if _lane_state == "recovered":
+            log("[glm-contrib %s] LANE RECOVERED: the coordinator moved again (event=%s); resuming "
+                "training." % (miner, dec.get("event")))
+        if _lane_state == "stale":
+            _now = time.time()
+            if lane_health.should_shout(_now):
+                for _ln in lane_health.stale_banner(_now):
+                    log("[glm-contrib %s] %s" % (miner, _ln))
+            # Poll on a slow cadence: the only thing worth doing is watching for the lane to come
+            # back, and hammering a store whose coordinator is gone helps nobody.
+            time.sleep(max(float(args.poll), STALE_LANE_POLL_S))
+            continue
 
         # -- (1) NON-BLOCKING catch-up: fold every accepted record past last_applied, IN ORDER, but ONLY
         #    those that extend OUR latched lineage (P2 dead-run guard: a never-deleting store still lists a
@@ -5965,6 +6156,13 @@ def main(argv=None):
     ap.add_argument("--wait-up", type=float, default=300.0,
                     help="seconds to wait for the coordinator pointer (a real GLM load is minutes)")
     ap.add_argument("--round-wait", type=float, default=300.0)
+    ap.add_argument("--stale-lane-s", dest="stale_lane_s", type=float,
+                    default=_env_num(STALE_LANE_ENV, DEFAULT_STALE_LANE_S, float),
+                    help="pause training (loudly) if the coordinator's event counter and the "
+                         "lane's accepted-record count both stop moving for this many seconds; "
+                         "0 disables. Default %d s -- 16x the slowest measured legitimate round "
+                         "and 34x sooner than the 4.27-day dead-lane incident it exists to catch."
+                         % int(DEFAULT_STALE_LANE_S))
     ap.add_argument("--inner", type=int, default=int(os.environ.get("NEURAHASH_GLM_INNER", "60")),
                     help="H local LoRA steps per outer round (the anti-flap core: zero cross-miner comm)")
     ap.add_argument("--lora-r", type=int, default=int(os.environ.get("NEURAHASH_GLM_R", "16")))

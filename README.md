@@ -49,40 +49,48 @@ else runs (or that you run from the full node package).
 
 ---
 
-## 🧭 Where this project actually stands, and the plan to fix it (2026-08-15)
+## 🧭 Where we are, and the plan from here (2026-08-15)
 
-**The short version: we proved the hard engineering, and we have not yet proved the point.**
+**The short version: the distributed-training machinery works. Turning it into a measurably smarter
+model is the open problem, and this is how we're going after it.**
 
 A real 30B-class model trains across an RTX 5090 and an 8 GB RTX 4060 **over the open internet**,
-bit-exact against a single box, with signed auto-updates that a stranger's fresh clone picks up on
-its own schedule. That part works and is not in doubt.
+bit-exact against a single box, with signed auto-updates that a fresh install picks up on its own
+schedule. That part is done and holding — it is the hard engineering, and it is behind us.
 
-What we have **never** achieved is the part that matters: **no training signal of any kind, from any
-method we have tried, has yet moved a real capability score on this model.** Not one positive
-instance. The clearest example: one change improved the language-modelling metric by 0.2375 nats at
-p=1.1e-4 — a very strong signal — and the reasoning benchmark came out *slightly worse*. Our most
-recent fine-tuning run moved the benchmark by **exactly +0.000 pp** (37 items improved, 37 got worse).
+The part we haven't cracked yet is the one that counts: **turning training into a measurable gain in
+what the model can actually do.** No method we've tried has managed it so far. The clearest example:
+one change improved the language-modelling metric by 0.2375 nats at p=1.1e-4 — a strong signal — and
+the reasoning benchmark came out *slightly worse*. Our most recent fine-tuning run moved the
+benchmark by **exactly +0.000 pp** (37 items improved, 37 got worse).
 
-Two more results landed this week, and both are negatives:
+That gap is the whole focus now, and knowing precisely where it sits is worth a lot — it means the
+next experiments can aim at one thing instead of six.
 
-- **Combining separately-trained contributions is now refuted five different ways** — merging in
+Two results landed this week. Both are negative, and both usefully narrow the search:
+
+- **Combining separately-trained contributions hasn't worked in five different setups** — merging in
   parallel, in sequence, at reduced dose, training jointly, and (as of today) with the best-known
   academic merging operator. The last of those made the model **worse**, and we can now say exactly
-  why: the operator's update sits at **88.7 degrees** to the direction that actually helps. It does
-  not shrink the update, it replaces it.
+  why: the operator's update sits at **88.7 degrees** to the direction that actually helps. It
+  doesn't shrink the update, it replaces it. That's a clean explanation, and it closes the question
+  rather than leaving it open.
 - **A "layer contribution" turns out to be, in magnitude, a single expert.** Of 64 experts, one or
   two carry 82.5–99.9% of the whole thing, and that one is nearly rank-1. So "many miners, many
-  contributions, added together" does not describe what the maths is doing.
+  contributions, added together" isn't what the maths is doing — which tells us the fleet design
+  has to earn its scaling somewhere other than weight-space addition.
 
-### What this means for you, plainly
+### What this means for you
 
-**Corpus mining is currently a transport and reliability testbed, not model training.** Zero of
-10,752 accepted contributions have ever improved the held-out metric. The gate that accepted them
-was measured **sign-inverted** — it paid for work that made the model worse in 6 of 7 audited cases.
-So today's expected earnings from mining are **approximately zero**, and we would rather say that
-than let you find out from your electricity bill.
+**Right now, mining here is closer to a network test than to model training,** and we'd rather set
+that expectation than let anyone infer otherwise. Of 10,752 accepted contributions so far, none has
+yet improved the held-out metric. The gate that accepted them has since been measured as unreliable
+— in 6 of 7 audited cases it accepted work that didn't help the full model. Rebuilding it against
+the full model is step E4 below.
 
-Mine because you want to help us test a real distributed-training network. Not for returns.
+So we're not advertising returns, and you shouldn't expect meaningful earnings while that's the
+case. If you run a miner today, run it to help prove a real distributed-training network — that part
+genuinely works, and the reliability data you generate is what makes the rest possible.
 
 ### The plan, in order
 
@@ -90,24 +98,27 @@ Each step decides whether the next is worth running. Nothing here is a promise o
 
 | Step | What it answers | Cost |
 |---|---|---|
-| **E1** | Does our single best result mean anything? Our largest quality gain has never been checked against a reasoning benchmark. If it does not move, the number we pay for is not measuring smartness — and we will say so publicly. | ~1 GPU-hour |
-| **E2** | Can we make judging a change cheaper than making it? Right now it is not, which means we cannot referee our own claims. | ~3 GPU-hours |
-| **E3** | One last merging test, then that whole line is closed permanently and we stop spending on it. | ~3 GPU-hours |
-| **E4** | An honest paying gate, run in **shadow first** — scoring only, minting nothing — so we learn its real pass rate before any coin depends on it. | 7 days |
+| **E1** | Does our single best result carry through to reasoning? Our largest quality gain hasn't been checked against a reasoning benchmark yet. Either it moves — and single-contribution mining has real value — or we learn our quality metric isn't tracking reasoning, which is worth knowing early. Published either way. | ~1 GPU-hour |
+| **E2** | Can we make judging a change cheaper than making it? Today it isn't, which limits how quickly we can referee results — ours and yours. | ~3 GPU-hours |
+| **E3** | One final merging test to settle the question, then we close that line and move the effort somewhere with better odds. | ~3 GPU-hours |
+| **E4** | The rebuilt gate, scoring against the full model, run in **shadow first** — scoring only, minting nothing — so its real pass rate is known before any coin depends on it. | 7 days |
 | **E5** | **The real attempt.** Reinforcement learning on one narrow, checkable skill — the only approach whose effects are large enough for our instruments to detect. Two attempts maximum. | ~4–6 GPU-days each |
 | **E6** | Does the winning recipe survive being run over the real internet? If yes, "a model made measurably smarter by consumer GPUs over WAN" is finally a true sentence. | ~3–4 GPU-days |
 | **E7** | What we owe you before recruiting: published per-miner expected value from measured numbers, and honest uptime maths for a 10-card pipeline. | no GPU |
 
-**If E5 fails twice, the honest 2026 result is "mechanism proven, instrument built, capability not
-achieved"** — and we will publish it in exactly those words rather than quietly redefining success.
+E5 gets two attempts. If neither lands, the result for 2026 is **"mechanism proven, instrument built,
+capability not yet achieved"** — and we'll report it in those words rather than redefine success
+around whatever we did manage. A clear negative is still a real result, and it tells whoever comes
+next exactly where not to dig.
 
-**We will not recruit miners on earnings** until E4 shows the paying gate has a pass rate above zero
-and pays *for* the goal metric, E5/E6 land a real gain, and the per-miner expected value is published
-from measured numbers. Until then this is an open testing programme, and it is labelled as one.
+**On recruiting:** we'd rather grow this on evidence than enthusiasm. So we won't promote mining on
+earnings until E4 shows the rebuilt gate has a pass rate above zero and scores against the goal
+metric, E5/E6 land a real gain, and per-miner expected value is published from measured numbers.
+Until then this is an open testing programme, and we label it as one.
 
-*Correction in the same breath: we have said an 8 GB card holds 6 layers, implying 9 cards for the
-full model. The measured ceiling is **5 layers**, so it is **10 cards**. The earlier figure came from
-a probe that was measuring Windows paging rather than real residency.*
+*One correction while we're here: we've previously said an 8 GB card holds 6 layers, implying 9 cards
+for the full model. The measured ceiling is **5 layers**, so it's **10 cards**. The earlier figure
+came from a probe that was reading Windows paging as if it were real residency.*
 
 ---
 

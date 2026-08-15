@@ -75,6 +75,13 @@ Two results landed this week. Both are negative, and both usefully narrow the se
   why: the operator's update sits at **88.7 degrees** to the direction that actually helps. It
   doesn't shrink the update, it replaces it. That's a clean explanation, and it closes the question
   rather than leaving it open.
+
+  A follow-up arm later the same day settled the last objection — that the operator had merely been
+  applied too weakly. Re-run at **exactly the same update size as plain addition**, it still harmed
+  the model (**+0.0260** nats) where plain addition helps slightly (**−0.0027**). So the operator
+  itself is the problem, not the strength it was applied at. Worth noting against ourselves: we
+  predicted publicly, before running it, that this arm would be *worse* than the weak one. It came
+  out roughly **half** as harmful. The prediction was wrong and the record stands as written.
 - **A "layer contribution" turns out to be, in magnitude, a single expert.** Of 64 experts, one or
   two carry 82.5–99.9% of the whole thing, and that one is nearly rank-1. So "many miners, many
   contributions, added together" isn't what the maths is doing — which tells us the fleet design

@@ -618,6 +618,91 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-16 (later) — **For the first time, post-training measurably made the model better. It happened on one of our machines, not through mining — and while checking it we found our own scoreboard is far noisier than we thought.**
+
+**The good part.** We fine-tuned the model on one RTX 5090 for 8.4 hours and it got measurably
+better at science multiple-choice questions: **82.17% → 84.45%**, on a held-out set that was frozen
+before training started and scored exactly once, with the checkpoint chosen using a completely
+separate set. That discipline matters — it is the difference between a result and a story. This is
+the first time in this project that training produced a capability gain that survived a
+pre-registered test.
+
+**Be clear about what that is and is not.** It happened on **one machine**, not across the fleet. It
+does not show that mining makes the model smarter, and we are not going to imply that it does. And
+"better" here means better at multiple-choice science questions — not better at everything.
+
+**We also corrected ourselves before publishing.** We initially described a second gain as
+"transfer to a benchmark the training never targeted." That was wrong: that benchmark's training
+split was part of the training data. There is no leakage — overlapping items were removed — but it
+is ordinary generalisation, not the stronger claim we first made.
+
+**The uncomfortable part, which affects how we judge everything.** Our safety check initially
+**blocked** this model: one benchmark looked harmed, at odds of about 1-in-800 against chance. So we
+tested the scoreboard itself, by scoring the *same unchanged model* several times while varying only
+how test items are grouped into batches — something that should change nothing at all.
+
+It changed a lot. **The same model against the same items gave results ranging from "clearly
+harmed" to "no evidence of harm" — a 53-fold swing in the statistics, purely from batch grouping.**
+Scored repeatedly with grouping held fixed, the harness is perfectly deterministic, so this is not
+random flakiness; it is that the maths behind the model is sensitive to how work is batched, and
+that flips about 2% of borderline questions either way.
+
+Pooling several groupings together, the harm no longer meets our blocking threshold — though the
+direction was negative every time, so we think there is a small real cost and we are calling it a
+trade, not a clean win.
+
+**What we are doing about it, including to our own good news.** We used that pooling on the number
+that *blocked* us. We had not used it on the number that *flattered* us. That is exactly the kind of
+one-sided testing that produces confident nonsense, so the headline result above is being re-scored
+the same way right now, under a rule written down before the answer is known. **If it does not
+survive, we will say so here first and plainly, and the result comes back off the board.**
+
+**Nothing about your mining changes today.** No update, no new settings. The parked-miner issue in
+the previous entry still applies and the restart workaround still stands.
+
+### 2026-08-16 — **Your miner can silently stop earning and still look perfectly healthy. We found it, we fixed it — and the fix is NOT in the build you are running.** Restart your miner if it has been up a long time with nothing accepted.
+
+**Read this part even if you read nothing else.** If your miner starts up at a moment when the
+coordinator is down, it records the last position it saw on the lane and then waits for that
+position to move before it will train. When the coordinator comes back, it normally resumes at
+**the same position** — and because the message it publishes is byte-for-byte identical to the one
+already sitting there, your miner cannot tell "just written" from "sitting here dead for a week".
+So it keeps waiting. Forever. The position only ever moves when miners submit work, and your miner
+is the one waiting to submit — so nothing breaks the loop.
+
+**What this looks like from outside: nothing.** The process is alive. It is using no GPU, throwing
+no errors, and writing no complaints. This cost one of our own cards **six days** of mining, and it
+was only caught by sampling where the program was actually parked — not by any check that asks
+"is it running?", all of which said yes.
+
+**The fix is written but has not reached you.** It is in our private tree, not in the public
+**3.8.2** you are running: the published message needs to carry a timestamp so a re-publish is
+distinguishable from a stale one, and that is a change to both sides of the wire. Shipping it to
+you means a reviewed sync of the miner tree, not a bulk copy — the public tree is a deliberately
+reduced subset and a blind copy is how private code leaks. We would rather tell you the exposure
+exists today than quietly ship a rushed sync.
+
+**What to do right now:** if your miner has been running for a long stretch with no accepted work
+while the pool is otherwise live, **restart it**. A restart clears the recorded position and it
+reads the lane fresh. That is a complete workaround, not a partial one.
+
+**The good news, and it is directly connected.** The reason the coordinator kept being down in the
+first place is fixed. It had been dying roughly **every 25 minutes** on a bug in how it restored its
+own slot list after a restart. Since the fix it has been up **15.5 hours and counting**, with **zero**
+of those crashes, and the lane has moved from position 608 to **869** with **6** payouts. Set against
+our 2026-08-14 note that nobody was judging or paying on this lane at all: **the judge is running
+again, and your work is being scored.**
+
+**Your pay bar no longer depends on which restart you happened to join.** The threshold your work has
+to clear was being recalculated on every coordinator start, and it moved **38%** across a single one —
+so the same work could be accepted or rejected purely on timing. It is now calculated once and kept.
+We deliberately did **not** fix this by fixing the random seed, which would have made the bar
+predictable and therefore gameable by anyone who wanted to tune submissions to it.
+
+**Unchanged, and still the most important sentence in this file:** none of this makes the model
+smarter. Everything above is about getting your work correctly judged and correctly paid. We still
+have no accepted contribution that has been shown to make the model measurably better.
+
 ### 2026-08-14 — **Correction: we told you this morning that the pool is still paying against a broken scoreboard. That was wrong, and the truth is worse for you.** Nobody is judging or paying on that lane at all, and has not been for four days.
 
 **What we got wrong.** Earlier today we wrote that the pool "is still paying against the

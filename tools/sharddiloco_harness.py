@@ -57,6 +57,7 @@ for _p in (_REPO, _HERE):
 
 from neurahash.model import MoELM, expert_keys, make_examples, VOCAB, V  # noqa: E402
 from neurahash.diloco_merge import contrib_canonical_message              # noqa: E402
+from neurahash.diloco_merge import SD_PTR_PUBLISHED_AT                    # noqa: E402  (#160 publish stamp)
 
 # TRUNK = the replicated small shared params (matches tools/diloco_contributor.SHARD_TRUNK_KEYS and
 # neurahash.model.forward_offline). Router (Wr, br) is UNUSED under offline routing.
@@ -348,8 +349,17 @@ class ContentLane:
         return self.get_json(sha)
 
     # ---- pointer (canonical-state advertisement) ----
-    def publish_pointer(self, rnd, state_cid, done=False):
-        return self.put_json_named(POINTER_NAME, dict(round=int(rnd), state_cid=state_cid, done=bool(done)))
+    def publish_pointer(self, rnd, state_cid, done=False, published_at=None):
+        """Publish the v1 pointer {round, state_cid, done}.
+
+        `published_at` (#160, dm.sd_publish_stamp -> epoch ms) is ADDITIVE: None omits the key, so a caller
+        that does not pass one publishes the pre-#160 bytes exactly. It exists because a pointer republished
+        at an unchanged `round` is otherwise byte-identical to the object already on the lane, which is what
+        let a resumed coordinator wedge a miner's stale-lane detector forever (see SD_PTR_PUBLISHED_AT)."""
+        obj = dict(round=int(rnd), state_cid=state_cid, done=bool(done))
+        if published_at is not None:
+            obj[SD_PTR_PUBLISHED_AT] = int(published_at)
+        return self.put_json_named(POINTER_NAME, obj)
 
     def read_pointer(self, man=None):
         """The canonical-state pointer, or None when the lane advertises none.

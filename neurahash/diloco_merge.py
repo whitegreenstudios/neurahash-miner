@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+import time
 import urllib.request
 
 import numpy as np
@@ -40,25 +41,18 @@ DEFAULT_GATEWAYS = (
 # the coordinator can verify by re-recovering the signer from a secp256k1 signature (never trusting a
 # self-declared address). Bumping any signed field must bump this version tag — an old signature can
 # then never be reinterpreted against a new field layout.
-CONTRIB_SIG_VERSION = "neurahash-diloco-contrib-v1"
-
-
-def contrib_canonical_message(delta_cid, base_round, name, val_before, val_after):
-    """The EXACT bytes a contribution record is signed over and verified against (GAP1). BOTH the signer
-    (tools/diloco_contributor.publish_delta) and the verifier (poll_contrib_records) build the message
-    through THIS one function, so they cannot drift out of sync — a drift would silently break every
-    signature. `name` is the contributor IDENTITY string (the record's own 'contributor' field, the
-    value passed as `diloco --name`), NOT the registry-slot key. Fields are newline-joined after the
-    version tag; the numeric/None fields go through str() so JSON round-tripping is lossless
-    (json.dumps uses float.__repr__, which round-trips, and None <-> null <-> 'None')."""
-    return (
-        CONTRIB_SIG_VERSION + "\n"
-        + str(delta_cid) + "\n"
-        + str(base_round) + "\n"
-        + str(name) + "\n"
-        + str(val_before) + "\n"
-        + str(val_after)
-    ).encode("utf-8")
+# SINGLE SOURCE. Both the recipe and its version tag now live in neurahash/contrib_message.py; this
+# module used to define a second, identical copy. Two copies of a SIGNED byte layout is a latent
+# consensus break -- the signer (tools/diloco_contributor.publish_delta) and the verifier
+# (poll_contrib_records) must build byte-identical messages forever, and the day the copies drift
+# every existing contribution signature silently stops verifying. Re-exported here so the existing
+# `from neurahash.diloco_merge import contrib_canonical_message` call sites keep working.
+# The version-bump rule still applies and is restated at the definition: bumping ANY signed field
+# must bump CONTRIB_SIG_VERSION, so an old signature can never be reinterpreted against a new layout.
+from neurahash.contrib_message import (                  # noqa: F401  (re-exported: see above)
+    CONTRIB_SIG_VERSION,
+    contrib_canonical_message,
+)
 
 
 def _log(msg):
@@ -915,7 +909,16 @@ def shard_merge_round(trunk, experts, contributions, eval_expert, probe, meter, 
         frac = 1.0
     ms = _max_staleness_env() if max_stale is None else max_stale
     # ---- signature gate + (#126) max-staleness age-out BEFORE any weights move ----
-    valid_sig = [c for c in contributions if c.get("verify_ok", True)]
+    # This filter is the ONLY place the merge enforces signatures, so a MISSING key must never read as
+    # "verified": a caller that drops it (rename, new lane, written from the docstring) would merge and
+    # PAY a forged contribution in silence. Absent key -> KeyError naming the miner (#96, finding 7).
+    for _c in contributions:
+        if "verify_ok" not in _c:
+            raise KeyError(
+                "contribution is missing 'verify_ok' (miner=%r, expert=%r): the merge's only signature "
+                "gate cannot default to verified -- the caller must set verify_ok explicitly"
+                % (_c.get("miner"), _c.get("expert")))
+    valid_sig = [c for c in contributions if c["verify_ok"]]
     valid, staled = [], 0
     for c in valid_sig:
         ok, _r = staleness_ok(c.get("base_round"), rnd, ms)
@@ -1200,8 +1203,40 @@ def token_quality_weight(steps, tokens):
 _SD_PTR_V1_ROUND = "round"      # v1 monotonic-round field (aliased from v2 `event`)
 _SD_PTR_V1_ROOT = "state_cid"   # v1 model-root field (aliased from v2 `model_root`)
 
+# PUBLISH STAMP (#160, 2026-08-15). Every other pointer field describes the LANE's state; none of them
+# describes THE WRITE. That gap wedged a healthy 4060 for six days: a coordinator that dies at event=579
+# and later RESUMES at the preserved frontier republishes event=579, byte-identical to the object already
+# sitting on the lane, so "the coordinator just wrote this" and "this has been dead here for six days" are
+# indistinguishable to a reader -- and the miner's stale-lane detector (LaneLiveness), which counts only
+# strictly-increasing counters as proof of life, never sees movement and never trains again. This field
+# carries the one thing the lane could not express: WHEN this object was written. It is written by the
+# coordinator alone, on every publish, and it is ADDITIVE -- sd_pointer_decode requires specific keys and
+# ignores unknown ones, so a pre-#160 reader (v1 or v2) is bit-for-bit unaffected, and an unstamped
+# pointer decodes exactly as it always did.
+SD_PTR_PUBLISHED_AT = "published_at"     # epoch MILLISECONDS, int; absent on every pre-#160 publisher
 
-def sd_pointer_encode(event, slot_rounds, model_root, done=False):
+_SD_LAST_STAMP = [0]                     # process-local monotonic guard (see sd_publish_stamp)
+
+
+def sd_publish_stamp(now=None):
+    """A publish stamp for SD_PTR_PUBLISHED_AT: epoch milliseconds as an int, STRICTLY INCREASING within
+    this process. NOT pure (that is the point -- it is the only field that reads a clock).
+
+    Milliseconds, not seconds: two publishes inside one second must still differ, or a reader cannot tell
+    them apart -- which is the whole defect being fixed. The `_SD_LAST_STAMP` guard makes the sequence
+    strictly increasing even when two publishes land in the same millisecond, or when the host clock steps
+    backwards mid-run (NTP): a stamp that repeats or regresses reads exactly like a stale object to a
+    monotonic consumer, so the publisher never emits one. Across a restart the wall clock supplies the
+    ordering, which is what makes a resumed republish look NEWER than the object it overwrites.
+    `now` (epoch seconds, float) is injectable for tests."""
+    ms = int((time.time() if now is None else float(now)) * 1000.0)
+    if ms <= _SD_LAST_STAMP[0]:
+        ms = _SD_LAST_STAMP[0] + 1
+    _SD_LAST_STAMP[0] = ms
+    return ms
+
+
+def sd_pointer_encode(event, slot_rounds, model_root, done=False, published_at=None):
     """Build the ALPHA-2 async lane pointer (v2) as a plain JSON-ready dict. WHY v2 exists: the sync lane
     published one `round` per barrier; the async lane advances each expert slot on its own clock, so the
     pointer must carry a GLOBAL monotonic `event` sequence PLUS a per-slot outer-round map -- and still be
@@ -1213,14 +1248,19 @@ def sd_pointer_encode(event, slot_rounds, model_root, done=False):
       rounds     -> {slot: outer_round} map -- each slot's independent progress
       model_root -> the composed model root (CID / hash) this event points at
       done       -> terminal flag
+      published_at (#160) -> OPTIONAL publish stamp (sd_publish_stamp; epoch ms). OMITTED when None, so
+                     the default call reproduces the pre-#160 pointer BYTE-FOR-BYTE -- every publisher
+                     that does not opt in, and every equality assertion over an unstamped pointer, is
+                     untouched. The publish paths pass one; see SD_PTR_PUBLISHED_AT for why it exists.
     plus the v1 back-compat ALIASES (see module note above): `round` = event, `state_cid` = model_root. A
     v1 reader ignores the v2-only keys and sees a monotonic `round` + a `state_cid` root, so it stays
     correct through the migration.
 
-    Pure: no I/O. `slot_rounds` None is treated as an empty map; values are coerced to int."""
+    Pure: no I/O and no clock (the stamp is passed IN, so the pointer bytes stay a function of the
+    arguments). `slot_rounds` None is treated as an empty map; values are coerced to int."""
     rounds = {} if slot_rounds is None else {k: int(v) for k, v in dict(slot_rounds).items()}
     ev = int(event)
-    return {
+    out = {
         "v": 2,
         "event": ev,
         "rounds": rounds,
@@ -1229,6 +1269,9 @@ def sd_pointer_encode(event, slot_rounds, model_root, done=False):
         _SD_PTR_V1_ROUND: ev,         # v1 alias: monotonic round == global event
         _SD_PTR_V1_ROOT: model_root,  # v1 alias: state_cid == model_root
     }
+    if published_at is not None:
+        out[SD_PTR_PUBLISHED_AT] = int(published_at)
+    return out
 
 
 def sd_pointer_decode(obj):
@@ -1242,30 +1285,51 @@ def sd_pointer_decode(obj):
     Version is decided by the `v` key (== 2 -> v2; absent/other -> v1), matching encode (stamps v:2) and
     v1 publishers (stamp none). Malformed input -- not a dict, or missing a REQUIRED key for the detected
     shape -- raises ValueError NAMING the offending key, so a caller sees exactly what was wrong instead of
-    a silent None. `done` is optional in both shapes (defaults False)."""
+    a silent None. `done` is optional in both shapes (defaults False).
+
+    `published_at` (#160) is surfaced in BOTH shapes, but ONLY when the wire actually carried an
+    int-coercible one -- an unstamped pointer decodes to exactly the pre-#160 five-key dict, so no existing
+    reader or assertion changes shape. Read it as `dec.get("published_at")`: None means "this publisher
+    predates the stamp", which every consumer must treat as the old behaviour, never as an error. A
+    non-int stamp is IGNORED rather than raised: it is optional metadata from a foreign publisher, and
+    fail-closing the whole pointer over it would pause a miner on a lane that is demonstrably alive."""
     if not isinstance(obj, dict):
         raise ValueError("sd_pointer_decode: expected a dict pointer, got %s" % type(obj).__name__)
     if obj.get("v") == 2:
         for key in ("event", "rounds", "model_root"):
             if key not in obj:
                 raise ValueError("sd_pointer_decode: v2 pointer missing required key '%s'" % key)
-        return {
+        out = {
             "v": 2,
             "event": int(obj["event"]),
             "slot_rounds": {k: int(v) for k, v in dict(obj["rounds"]).items()},
             "model_root": obj["model_root"],
             "done": bool(obj.get("done", False)),
         }
+        return _sd_ptr_with_stamp(out, obj)
     for key in (_SD_PTR_V1_ROUND, _SD_PTR_V1_ROOT):
         if key not in obj:
             raise ValueError("sd_pointer_decode: v1 pointer missing required key '%s'" % key)
-    return {
+    return _sd_ptr_with_stamp({
         "v": 1,
         "event": int(obj[_SD_PTR_V1_ROUND]),
         "slot_rounds": None,
         "model_root": obj[_SD_PTR_V1_ROOT],
         "done": bool(obj.get("done", False)),
-    }
+    }, obj)
+
+
+def _sd_ptr_with_stamp(out, obj):
+    """Copy an int-coercible SD_PTR_PUBLISHED_AT from the wire object `obj` onto the decoded dict `out`,
+    and NOTHING otherwise -- absent or unparseable leaves `out` byte-identical to the pre-#160 shape."""
+    raw = obj.get(SD_PTR_PUBLISHED_AT)
+    if raw is None:
+        return out
+    try:
+        out[SD_PTR_PUBLISHED_AT] = int(raw)
+    except (TypeError, ValueError):
+        pass
+    return out
 
 
 class SlotClock:

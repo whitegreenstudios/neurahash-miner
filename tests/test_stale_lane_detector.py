@@ -140,6 +140,74 @@ def test_a_counter_that_goes_BACKWARDS_is_not_treated_as_proof_of_life():
     assert d.observe(10.0 + N.DEFAULT_STALE_LANE_S, event=2, accepted_seen=1) == "stale"
 
 
+# ------------------------------------------------- #160: the RESUMED-AT-THE-SAME-EVENT deadlock
+# THE SECOND INCIDENT (2026-08-09 -> 2026-08-15, six days, one healthy 4060 earning nothing).
+# The detector above recovers only when the coordinator advances PAST the miner's latched high-water
+# mark. A coordinator that dies at event=579 and is later restarted RESUMES at the preserved
+# frontier -- it republishes event=579 -- and the accepted-record count replays the same 579 names.
+# For a miner that started DURING the outage, both counters are exactly what it latched, so nothing
+# ever "moves": it stayed in the stale-lane pause forever while the lane was healthy. The event
+# counter only advances when miners submit, and nothing submitted. Deadlock.
+# The fix is a third counter that a republish ALWAYS moves: the pointer's publish stamp (#160,
+# dm.SD_PTR_PUBLISHED_AT / dm.sd_publish_stamp).
+
+def test_a_resumed_coordinator_republishing_the_SAME_event_unwedges_the_miner():
+    """THE #160 REGRESSION, at the unit the defect lives in. Latch the frontier while the lane is
+    dead, then hand back the IDENTICAL lane counters with a fresh publish stamp: that must read as
+    proof of life, because only the coordinator writes that pointer."""
+    d = N.LaneLiveness(None, now=0.0, environ={})
+    d.observe(0.0, event=579, accepted_seen=579, published_at=1_000)      # latched during the outage
+    assert d.observe(4 * HOUR, event=579, accepted_seen=579, published_at=1_000) == "stale"
+    # The coordinator restarts and RESUMES: same event, same records, new write.
+    assert d.observe(4 * HOUR + 60.0, event=579, accepted_seen=579,
+                     published_at=2_000) == "recovered", \
+        "a republished pointer at an unchanged event must count as proof of life"
+    assert d.stale is False
+    # ...and the detector is not disarmed by the recovery: a lane that then goes quiet still fires.
+    assert d.observe(4 * HOUR + 60.0 + N.DEFAULT_STALE_LANE_S, event=579, accepted_seen=579,
+                     published_at=2_000) == "stale"
+
+
+def test_a_frozen_publish_stamp_does_NOT_keep_a_dead_lane_looking_alive():
+    """The new field must not become a way to look alive forever. A stamp that is merely PRESENT and
+    unchanging is a dead lane, exactly as before."""
+    d = N.LaneLiveness(None, now=0.0, environ={})
+    d.observe(0.0, event=5, accepted_seen=5, published_at=1_000)
+    assert d.observe(N.DEFAULT_STALE_LANE_S - 1.0, event=5, accepted_seen=5,
+                     published_at=1_000) == "waiting"
+    assert d.observe(N.DEFAULT_STALE_LANE_S, event=5, accepted_seen=5, published_at=1_000) == "stale"
+
+
+def test_a_BACKWARDS_publish_stamp_is_still_not_proof_of_life():
+    """THE PROPERTY THE MONOTONIC RULE EXISTS TO PROTECT, extended to the new counter. An OLDER
+    stamp can only come from an older pointer object -- a stale mirror or cached manifest re-read --
+    so it must not reset the staleness clock. If any CHANGE counted, a store flapping between two
+    objects would keep a dead lane 'alive' forever and the detector would be unfalsifiable."""
+    d = N.LaneLiveness(None, now=0.0, environ={})
+    d.observe(0.0, event=5, accepted_seen=5, published_at=9_000)
+    assert d.observe(10.0, event=5, accepted_seen=5, published_at=1_000) == "waiting"
+    assert d.observe(N.DEFAULT_STALE_LANE_S, event=5, accepted_seen=5,
+                     published_at=1_000) == "stale"
+    # every counter backwards at once is still not movement
+    assert d.observe(N.DEFAULT_STALE_LANE_S + 1.0, event=2, accepted_seen=1,
+                     published_at=500) == "stale"
+
+
+def test_a_pointer_with_NO_publish_stamp_behaves_exactly_as_before():
+    """Older coordinators publish no stamp. Passing None must reproduce today's behaviour STATE FOR
+    STATE -- compared against a detector driven through the old two-argument call, not against a
+    hand-written expectation."""
+    old = N.LaneLiveness(None, now=0.0, environ={})
+    new = N.LaneLiveness(None, now=0.0, environ={})
+    seq = [(0.0, 0, 0), (60.0, 0, 0), (4 * HOUR, 0, 0), (4 * HOUR + 30.0, 1, 0),
+           (4 * HOUR + 60.0, 1, 0), (8 * HOUR, 1, 0), (8 * HOUR + 30.0, 0, 0)]
+    old_states = [old.observe(t, event=e, accepted_seen=a) for (t, e, a) in seq]
+    new_states = [new.observe(t, event=e, accepted_seen=a, published_at=None) for (t, e, a) in seq]
+    assert new_states == old_states
+    assert old_states[2] == "stale" and old_states[3] == "recovered", old_states
+    assert (new.high_event, new.high_accepted) == (old.high_event, old.high_accepted)
+
+
 def test_garbage_counters_do_not_crash_and_do_not_count_as_movement():
     d = _live(t0=0.0)
     for bad in ("nope", None, [], {}):
@@ -275,9 +343,50 @@ class _Lane:
         return dm.sd_pointer_encode(event=ev, slot_rounds={"0_0": ev}, model_root="root-%d" % ev)
 
 
-def _drive(tmp_path, monkeypatch, schedule):
+class _ResumedLane(_Lane):
+    """#160: a lane whose schedule is (event, wall_clock, publish_stamp). The coordinator RESUMES at
+    a preserved frontier, so `event` and the accepted-record count NEVER move -- only the stamp does.
+
+    The stamp key is written as the LITERAL "published_at" instead of dm.SD_PTR_PUBLISHED_AT / the
+    encoder's `published_at=` argument for one deliberate reason: this regression test must be
+    RUNNABLE against the PRE-FIX tree, which has neither the constant nor the parameter, or it could
+    never be shown RED -- and a regression test never shown red is not evidence. The literal is
+    pinned to the shipped constant by
+    tests/test_sd_async_helpers.py::test_the_publish_stamp_key_is_the_one_the_wire_uses."""
+
+    def _cur(self):
+        ev, t, _stamp = self.schedule[min(self.n, len(self.schedule) - 1)]
+        return ev, t
+
+    def _stamp(self):
+        return self.schedule[min(self.n, len(self.schedule) - 1)][2]
+
+    def read_pointer(self, man=None, **kw):
+        if man is None:
+            return None                                   # the pre-loop probe
+        ev, t = self._cur()
+        stamp = self._stamp()
+        self.now = float(t)
+        self.n += 1
+        ptr = dm.sd_pointer_encode(event=ev, slot_rounds={"0_0": ev}, model_root="root-%d" % ev)
+        return dict(ptr, published_at=stamp) if stamp is not None else ptr
+
+
+def _sleep_until(limit):
+    """A fake time.sleep that lets the first `limit - 1` pauses pass and RAISES on the next one, so a
+    loop that keeps pausing terminates the test instead of hanging it forever."""
+    calls = [0]
+
+    def _sleep(_s):
+        calls[0] += 1
+        if calls[0] >= limit:
+            raise _Paused()
+    return _sleep
+
+
+def _drive(tmp_path, monkeypatch, schedule, lane=None):
     """Run _run_async far enough to pass the stale-lane seam. Returns the exception the run ended
-    with, plus the log lines."""
+    with, plus the log lines. `lane` overrides the default _Lane(schedule) fixture (#160)."""
     d = str(tmp_path)
     for split in ("train", "val"):
         np.save(os.path.join(d, "ids_daily_%s.npy" % split),
@@ -295,7 +404,7 @@ def _drive(tmp_path, monkeypatch, schedule):
                                    restore_ladder=lambda ladder: (0, 0))
     monkeypatch.setattr(N, "ClaimState",
                         types.SimpleNamespace(for_args=lambda args, ident, log=None: _state))
-    lane = _Lane(schedule)
+    lane = _Lane(schedule) if lane is None else lane
     monkeypatch.setattr(N.time, "time", lambda: lane.now)
     # Reaching the catch-up means the tick got PAST the stale gate and is about to do real work.
     def _reached(*a, **k):
@@ -352,3 +461,39 @@ def test_a_paused_miner_resumes_by_itself(tmp_path, monkeypatch):
     assert "LOOKS DEAD" in joined
     assert "LANE RECOVERED" in joined, joined[-2000:]
     assert isinstance(end, _StopTick), "did not resume real work after recovery: %r" % (end,)
+
+
+def test_a_RESUMED_coordinator_at_the_SAME_event_gets_the_miner_back_to_work(tmp_path, monkeypatch):
+    """THE #160 REGRESSION AT LOOP LEVEL -- red on the pre-fix tree, and the one that reproduces the
+    six-day outage exactly.
+
+    Tick 1: the miner latches the frontier of a lane whose coordinator has been gone 4 h -> PAUSE.
+    Tick 2: the coordinator is back and RESUMES: it republishes the SAME event=579 with the SAME
+    record count, and only the publish stamp is new. Every lane counter the pre-fix miner watched is
+    byte-identical to what it latched, so the pre-fix loop pauses again, forever -- the event counter
+    can only advance when a miner submits, and no miner ever will. The fixed loop must reach the work
+    path (_StopTick) on that very tick, with no restart.
+
+    The fake sleep raises on the SECOND pause, so 'still wedged' fails fast instead of hanging."""
+    monkeypatch.setattr(N.time, "sleep", _sleep_until(2))
+    lane = _ResumedLane([(579, 4 * HOUR, 1_000), (579, 4 * HOUR + 60.0, 2_000)])
+    end, logs = _drive(tmp_path, monkeypatch, None, lane=lane)
+    joined = "\n".join(logs)
+    assert "LOOKS DEAD" in joined, "the miner never reached the wedged state: %s" % joined[-2000:]
+    assert isinstance(end, _StopTick), (
+        "WEDGED: the coordinator republished event=579 (frontier preserved) and the miner stayed in "
+        "the stale-lane pause -- this is the six-day 4060 outage (#160): %r" % (end,))
+    assert "LANE RECOVERED" in joined, joined[-2000:]
+
+
+def test_a_resumed_lane_WITHOUT_a_publish_stamp_still_behaves_exactly_as_today(tmp_path,
+                                                                               monkeypatch):
+    """The other side of the same seam: against a pre-#160 coordinator (no stamp on the wire) the
+    miner must behave EXACTLY as it does today -- it stays paused on a frozen lane and does NOT
+    invent liveness out of the missing field."""
+    monkeypatch.setattr(N.time, "sleep", _sleep_until(2))
+    lane = _ResumedLane([(579, 4 * HOUR, None), (579, 4 * HOUR + 60.0, None)])
+    end, logs = _drive(tmp_path, monkeypatch, None, lane=lane)
+    assert isinstance(end, _Paused), (
+        "an unstamped frozen lane must still read as dead: %r" % (end,))
+    assert "LANE RECOVERED" not in "\n".join(logs)

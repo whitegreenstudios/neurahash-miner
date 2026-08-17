@@ -123,6 +123,69 @@ class TestShardDiLoCoAsyncHelpers:
         assert d["done"] is False
         assert d["v"] == 1 and d["event"] == 3 and d["slot_rounds"] is None and d["model_root"] == "s"
 
+    # ------------------------------------------------- the publish stamp (#160, 2026-08-15)
+    # WHY THIS FIELD EXISTS. Every other pointer field describes the LANE; none described THE WRITE.
+    # A coordinator that resumes at a preserved frontier republishes the SAME event, producing an
+    # object byte-identical to the one already on the lane -- so a reader could not tell "just
+    # written" from "dead here for six days", and a miner's stale-lane detector wedged forever.
+    # These tests pin the wire contract: opt-in, additive, and invisible to every older reader.
+
+    def test_the_publish_stamp_key_is_the_one_the_wire_uses(self):
+        """Pins the literal. tests/test_stale_lane_detector.py writes "published_at" by hand (so its
+        regression test can be run RED against the pre-fix tree, which has no constant to import);
+        this assertion is what stops the two from drifting apart silently."""
+        assert dm.SD_PTR_PUBLISHED_AT == "published_at"
+
+    def test_an_unstamped_pointer_is_byte_identical_to_the_pre_160_pointer(self):
+        """ADDITIVE means additive: omitting the stamp must reproduce the old bytes exactly, and the
+        decode must yield the old five-key shape -- no `published_at: None` sneaking into readers."""
+        p = dm.sd_pointer_encode(event=7, slot_rounds={"1_0": 3}, model_root="r")
+        assert dm.SD_PTR_PUBLISHED_AT not in p
+        assert set(p) == {"v", "event", "rounds", "model_root", "done", "round", "state_cid"}
+        assert set(dm.sd_pointer_decode(p)) == {"v", "event", "slot_rounds", "model_root", "done"}
+        assert dm.sd_pointer_decode(p).get(dm.SD_PTR_PUBLISHED_AT) is None
+
+    def test_the_publish_stamp_round_trips_on_v2(self):
+        p = dm.sd_pointer_encode(event=579, slot_rounds={"1_0": 3}, model_root="r",
+                                 published_at=1_755_000_000_123)
+        assert p[dm.SD_PTR_PUBLISHED_AT] == 1_755_000_000_123
+        # the v1 aliases a pre-#160 reader consults are UNTOUCHED by the new key
+        assert p["round"] == 579 and p["state_cid"] == "r"
+        d = dm.sd_pointer_decode(p)
+        assert d[dm.SD_PTR_PUBLISHED_AT] == 1_755_000_000_123
+        assert d["event"] == 579 and d["model_root"] == "r"
+
+    def test_the_publish_stamp_round_trips_on_v1(self):
+        """The sync lane (harness publish_pointer) has the SAME wedge, so the stamp must survive the
+        v1 normalization path too."""
+        v1 = _real_v1_pointer(11, "state-cid-11")
+        v1[dm.SD_PTR_PUBLISHED_AT] = 42
+        d = dm.sd_pointer_decode(v1)
+        assert d["v"] == 1 and d["event"] == 11 and d[dm.SD_PTR_PUBLISHED_AT] == 42
+
+    def test_a_garbage_publish_stamp_is_IGNORED_not_raised(self):
+        """Optional metadata from a foreign publisher must never fail-close a pointer: pausing a miner
+        on a lane that is demonstrably alive would be worse than the bug being fixed. Garbage decodes
+        as 'no stamp', which is the pre-#160 behaviour."""
+        for bad in ("nope", [], {}, None):
+            p = dm.sd_pointer_encode(event=1, slot_rounds={}, model_root="r")
+            p[dm.SD_PTR_PUBLISHED_AT] = bad
+            assert dm.sd_pointer_decode(p).get(dm.SD_PTR_PUBLISHED_AT) is None
+        p = dm.sd_pointer_encode(event=1, slot_rounds={}, model_root="r")
+        p[dm.SD_PTR_PUBLISHED_AT] = "1755000000123"        # int-coercible string -> normalized
+        assert dm.sd_pointer_decode(p)[dm.SD_PTR_PUBLISHED_AT] == 1_755_000_000_123
+
+    def test_the_stamp_generator_is_strictly_increasing_even_inside_one_millisecond(self):
+        """A stamp that repeats is a stamp that cannot prove a write happened. Two publishes in the
+        same millisecond (or a host clock that steps backwards) must still produce a rising sequence,
+        because a monotonic consumer reads 'not greater' as 'stale object'."""
+        stamps = [dm.sd_publish_stamp(now=1_755_000_000.0) for _ in range(5)]
+        assert stamps == sorted(stamps) and len(set(stamps)) == 5
+        assert dm.sd_publish_stamp(now=1_000.0) > stamps[-1]      # clock stepped BACKWARDS
+        # ...and it is epoch MILLISECONDS, not seconds (seconds cannot separate two publishes in one
+        # second, which is exactly the resolution the defect needs).
+        assert dm.sd_publish_stamp(now=1_755_000_000.0) > 1_755_000_000_000
+
     # -------------------------------------------------------------- malformed pointers
 
     def test_decode_non_dict_raises(self):

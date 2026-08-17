@@ -255,8 +255,9 @@ def accepted_events_in(manifest_names, campaign=None):
 
 def pointer_campaign_id(ptr):
     """The campaign id a RAW v2 pointer advertises, or None. Read off the raw dict (like
-    `domains_digest`) because dm.sd_pointer_decode normalizes to a fixed key set and drops additive
-    fields. Pure."""
+    `domains_digest`) because dm.sd_pointer_decode normalizes to a fixed key set and drops the
+    additive fields -- all of them except the #160 publish stamp, which decode surfaces because the
+    stale-lane detector consumes it through the decoded pointer. Pure."""
     if not isinstance(ptr, dict):
         return None
     return normalize_campaign_id(ptr.get(CAMPAIGN_POINTER_KEY))
@@ -4084,7 +4085,7 @@ def _select_async_mode(ptr, env=None):
         BYTE-IDENTICALLY -- pointer-version, never env, decides this).
       * v2 pointer  -> True UNLESS NEURAHASH_SD_ASYNC is the explicit opt-out (0/false/no/off/n), in
         which case False = sync fallback. The fallback is safe and does NOT crash: a v2 pointer carries
-        the v1 aliases (round==event, state_cid==model_root, diloco_merge.py:1213) as a strict superset,
+        the v1 aliases (round==event, state_cid==model_root, diloco_merge.py:1203) as a strict superset,
         so the sync loop reads those two fields and simply ignores the per-slot breakdown.
     `env` defaults to os.environ; passed explicitly by tests. Pure: decode only, no I/O."""
     dec = dm.sd_pointer_decode(ptr)
@@ -4102,7 +4103,7 @@ def scan_accepted_events(manifest_names, last_applied, max_scan=1_000_000, campa
     e = last_applied+1, +2, ... while accepted_name(e) is present, STOPPING at the first gap.
 
     Global events are monotonic and contiguous (SlotClock bumps by 1 per advance and the coordinator
-    publishes accepted(e) for each -- diloco_merge.py:1284, ALPHA2_PLAN sec 2), so a gap means 'not yet
+    publishes accepted(e) for each -- diloco_merge.py:1335 SlotClock, ALPHA2_PLAN sec 2), so a gap means 'not yet
     visible'. We never skip a gap: applying e+1 before e would fold deltas out of the coordinator's
     order and diverge the replica. Returns [] when nothing new is visible -- the caller then trains
     against the current base rather than waiting. `max_scan` is a defensive finite cap so a malformed
@@ -5265,8 +5266,9 @@ class LaneLiveness:
     """Tracks whether the COORDINATOR is still moving, from counters only (no lane timestamps
     exist -- see the block above). Pure except for the clock the caller passes in.
 
-    `observe(now, event, accepted_seen)` is called once per miner tick with the pointer's `event`
-    and the number of accepted records visible on the lane. It returns one of:
+    `observe(now, event, accepted_seen, published_at)` is called once per miner tick with the
+    pointer's `event`, the number of accepted records visible on the lane, and (#160) the pointer's
+    publish stamp. It returns one of:
         "live"     -- a counter moved (or this is the first observation)
         "waiting"  -- nothing moved yet, but we are inside the threshold: NORMAL, stay quiet
         "stale"    -- nothing has moved for `threshold_s`: the lane looks dead
@@ -5283,6 +5285,7 @@ class LaneLiveness:
                                         environ=environ)
         self.high_event = None
         self.high_accepted = None
+        self.high_stamp = None            # #160: the pointer's publish stamp (dm.SD_PTR_PUBLISHED_AT)
         self.last_move_t = float(now)
         self.stale = False
         self._last_shout_t = None
@@ -5292,10 +5295,31 @@ class LaneLiveness:
         """<= 0 disables the detector entirely (an operator running a deliberately glacial lane)."""
         return self.threshold_s > 0
 
-    def observe(self, now, event=None, accepted_seen=None):
+    def observe(self, now, event=None, accepted_seen=None, published_at=None):
+        """#160: `published_at` is the pointer's publish stamp (epoch ms, dm.sd_publish_stamp) and is
+        watched by the SAME monotonic rule as the other two counters -- with one decisive difference:
+        it moves on EVERY publish, including a republish at an unchanged `event`.
+
+        That is the whole fix. A coordinator that dies at event=579 and later RESUMES at the preserved
+        frontier republishes event=579; the lane counters are then identical to the ones this miner
+        latched while the lane was dead, so a miner that started during the outage saw no movement,
+        stayed "stale", and never trained again (measured: six days of a healthy 4060 earning nothing).
+        The stamp is the one field a republish always changes.
+
+        WHY IT IS STILL STRICTLY MONOTONIC and not merely "different": a stamp that goes BACKWARDS can
+        only be an older pointer object -- a stale mirror/manifest re-read, the exact artefact the
+        monotonic rule exists to reject. Counting any change would make the detector unfalsifiable
+        under a flapping store (it could ping-pong between two objects forever and always look alive).
+        A real restart's republish always carries a NEWER stamp than the object it overwrites, so
+        monotonic is sufficient to unwedge and strictly safer.
+
+        `published_at=None` (every pre-#160 coordinator, and any pointer that omits the key) leaves
+        the behaviour EXACTLY as it was: the loop skips None, so nothing about the old two-counter
+        path changes."""
         now = float(now)
         moved = False
-        for attr, val in (("high_event", event), ("high_accepted", accepted_seen)):
+        for attr, val in (("high_event", event), ("high_accepted", accepted_seen),
+                          ("high_stamp", published_at)):
             if val is None:
                 continue
             try:
@@ -5864,9 +5888,14 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # coordinator cannot move either of them; a merely slow one moves them well inside the
         # 3 h threshold (see the LaneLiveness block for the derivation). While stale we PAUSE
         # instead of training -- and keep looping, so recovery needs no restart.
+        # #160: the pointer's publish stamp is the THIRD counter. A coordinator that RESUMES at a
+        # preserved frontier republishes the same `event`, so without this a miner that latched that
+        # event during the outage never sees movement and pauses forever (measured: 6 days). `.get`
+        # yields None on any pre-#160 coordinator, which is exactly the old two-counter behaviour.
         _lane_state = lane_health.observe(time.time(), event=dec.get("event"),
                                           accepted_seen=count_accepted_names(
-                                              man, host_campaign_id(host)))
+                                              man, host_campaign_id(host)),
+                                          published_at=dec.get(dm.SD_PTR_PUBLISHED_AT))
         if _lane_state == "recovered":
             log("[glm-contrib %s] LANE RECOVERED: the coordinator moved again (event=%s); resuming "
                 "training." % (miner, dec.get("event")))

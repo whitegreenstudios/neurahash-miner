@@ -618,7 +618,7 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
-### 2026-08-20 — **Your disk matters more than your GPU. We put an NVMe in our 8 GB test machine and the same training step went from 11 minutes to 2. Also: that 8 GB card now provably computes the same thing our big card does.**
+### 2026-08-20 — **Your disk matters more than your GPU. We put an NVMe in our 8 GB test machine and the same training step went from 11 minutes to just over 2. Also: that 8 GB card now provably computes the same thing our big card does.**
 
 **If you take one thing from this entry: do not mine from a spinning hard drive.** We measured our
 own second machine — an RTX 4060 (8 GB) with a 7200 rpm SATA drive — and the disk, not the GPU, was
@@ -628,11 +628,11 @@ costing almost all of the time:
 |---|---|---|
 | cold sequential read | 76 MB/s | 2,613 MB/s |
 | reading the model's layer files once | 827 s (13.8 min) | 27.8 s |
-| **one training step** | **681.8 s** | **119.0 s** |
+| **one training step** (30-step run means) | **681.8 s** | **133.9 s** |
 
 Every training step streams roughly 44.5 GB of model weights off disk. On the hard drive that was
 ~660 seconds of pure waiting per step, which works out to **8–10 days** for a full run. On the NVMe
-the same run is **5–9 hours**. Nothing about the GPU changed.
+the same run is **5–9 hours** — a measured **5.09x**, comparing 30-step means on both drives. Nothing about the GPU changed.
 
 **We checked that the disk did not change the answers.** The first two steps after the swap returned
 losses of `3.73041` and `4.49594` — *bit-identical* to the same steps on the hard drive. A faster

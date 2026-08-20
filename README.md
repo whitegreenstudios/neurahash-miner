@@ -618,6 +618,64 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-20 — **Your disk matters more than your GPU. We put an NVMe in our 8 GB test machine and the same training step went from 11 minutes to 2. Also: that 8 GB card now provably computes the same thing our big card does.**
+
+**If you take one thing from this entry: do not mine from a spinning hard drive.** We measured our
+own second machine — an RTX 4060 (8 GB) with a 7200 rpm SATA drive — and the disk, not the GPU, was
+costing almost all of the time:
+
+| | mechanical hard disk | 1 TB NVMe SSD |
+|---|---|---|
+| cold sequential read | 76 MB/s | 2,613 MB/s |
+| reading the model's layer files once | 827 s (13.8 min) | 27.8 s |
+| **one training step** | **681.8 s** | **119.0 s** |
+
+Every training step streams roughly 44.5 GB of model weights off disk. On the hard drive that was
+~660 seconds of pure waiting per step, which works out to **8–10 days** for a full run. On the NVMe
+the same run is **5–9 hours**. Nothing about the GPU changed.
+
+**We checked that the disk did not change the answers.** The first two steps after the swap returned
+losses of `3.73041` and `4.49594` — *bit-identical* to the same steps on the hard drive. A faster
+disk is not allowed to change arithmetic, and we verified it rather than assuming it. We also
+measured the disk two independent ways, including one that bypasses the operating system's cache
+entirely, because an earlier probe on this same machine reported 5,824 MB/s and was simply reading
+memory rather than the drive.
+
+**What to actually do.** An SSD (SATA or NVMe) is fine; the jump from *spinning* to *solid state* is
+where nearly all of the gain is. You do not need a fast or expensive drive — ours is a budget
+DRAM-less model and it was enough. Write speed is irrelevant here: the miner reads model weights and
+essentially never writes them. Free space matters more than speed once you are on an SSD.
+
+**Your 8 GB consumer card computes the same thing our big card does.** We ran 30 training steps on
+identical data, identical seed and identical batch size on both machines and compared them step by
+step. The average difference in loss was **−0.00570** against a step-to-step spread of **0.02678**,
+with the differences split 12 up and 18 down. That is the signature of ordinary floating-point noise,
+not of one machine drifting away from the other — and it holds despite the two boxes differing on
+every axis: different GPU architectures, different CUDA versions, different PyTorch versions,
+different Python versions.
+
+Be precise about what that does and does not mean. It shows a small card **trains faithfully**. It is
+30 steps — under 5% of one pass through the data — so it says nothing at all about whether the
+resulting model is smarter.
+
+**Why RTX 40-series and older cards carry a permanent memory penalty.** PyTorch's fast grouped
+mixture-of-experts kernel requires a GPU compute capability of **SM90 or newer**. The RTX 40-series
+is sm89 — just below that line — so it takes a fallback path that allocates an extra **768 MiB**
+during the backward pass that is never used. We patched this in our own trainer without changing any
+result. What is worth knowing: this is **not** something a future PyTorch update will fix for you.
+The open upstream issue moves that requirement *up*, not down. If you are on a 40-series or older
+card, that fallback is permanent, and any tooling that assumes it will go away is wrong.
+
+**Honest status, unchanged.** Post-training on **one machine** still makes the model measurably
+better (+2.4 percentage points, reproduced on a second seed). Mining still has **not** been shown to
+do so. The experiment that would settle it — several machines training one shared adapter on
+different slices of data and averaging their work — is written down in advance, with its pass and
+fail thresholds fixed, and **has not been run yet**. While preparing it we found that its own
+validity check was mis-specified badly enough that the experiment would have aborted on every
+single sync and produced no answer at all; we caught that on a CPU before spending any GPU time on
+it, and rewrote the check. We would rather tell you that than quietly fix it.
+
+
 ### 2026-08-16 (later) — **For the first time, post-training measurably made the model better. It happened on one of our machines, not through mining — and while checking it we found our own scoreboard is far noisier than we thought.**
 
 **The good part.** We fine-tuned the model on one RTX 5090 for 8.4 hours and it got measurably

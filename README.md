@@ -618,6 +618,62 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-21 — **We found out why pooled mining never made the model smarter, and it is not what we told you it was. The maths was fine. The problem is that every miner was learning the same thing as every other miner.** Mining stays closed, but there is now a specific job an 8 GB card could do — and we are testing it this week.
+
+**The short version.** For about a month, every test we ran said the same thing: take two machines,
+train each on different data, combine their work, and you get **nothing** — no better than the
+better of the two on its own. We concluded that combining trained work was broken, and that
+conclusion is why the mining lane was closed.
+
+Today we ran a test designed so the two machines *had* to learn genuinely different things — we
+taught each one 500 specific made-up facts, with no overlap between them, and checked afterwards
+using differently-worded questions. Combining them worked **almost perfectly**: the combined model
+was as good on each machine's own material as that machine was by itself. Measured against the best
+possible outcome, it reached **99.8%** of it.
+
+**So what was actually wrong?** We measured how much of what a machine learns is specific to *its*
+data, and how much is a generic pattern any machine would pick up. The answer was consistent across
+both: **about two-thirds of what each one learned, the other one had learned independently.** So
+when we combined them, there was very little new to add — like two people memorising the same page
+and being surprised the pair doesn't know two pages.
+
+That is a much better problem to have. "Our maths is broken" would be fatal. "We are handing out
+overlapping homework" is a work-assignment problem, and those are fixable.
+
+**One catch, and it is the important one.** There are two ways to combine work: **average** it, or
+**add** it. Averaging is what the standard method does and what our pool did — and averaging still
+gives us nothing. Adding is what worked. That is a concrete, testable change, and it is the next
+thing we try.
+
+**What this does not mean, said plainly before anyone reads it as more than it is.** This was a
+small model, not the one we actually train. It was **two** machines, not fifty — and this project has
+already seen a result look excellent at two and reverse completely at forty-seven. And it was an
+artificial memory task, not real reasoning ability. It removes a blocker. It does not reopen mining.
+
+**Now the part that matters if you own an 8 GB card.** We had been assuming the model needs about
+18 GB of graphics memory, which would have shut most volunteers out permanently. That number is real
+but it describes only one way of running it. This model only uses about 3 billion of its 30 billion
+parameters on any given word — so the bulk can sit in ordinary system memory with your CPU handling
+it, and your graphics card only handles the active part. Expected requirement: **roughly 5 GB of
+video memory.**
+
+The job would be different from what mining used to be. Your card would not *train* the model. It
+would **run** the model to hunt for questions it currently gets wrong, verify the correct answers,
+and send back a few kilobytes of text. No large uploads, no weight files, and — this is the part we
+care most about — **each item you send can be checked on its own merits**: is the answer right, does
+the current model actually fail it, is it new. That is precisely what the old system could not do,
+and why it paid out for work nobody could confirm was worth anything.
+
+**Honest unknown, and it decides whether this is real for you.** Our test machine has 32 GB of
+system memory and the model needs about 17 GB of it. If your machine has 16 GB, it does not fit as-is
+— there is a setting that splits the load more finely, but nobody has measured a box like that yet.
+We will publish that number when we have it.
+
+**Nothing about your mining changes today.** No update, no new settings, and the lane stays closed.
+The first test — can an 8 GB card run the real model at all — runs this week with its pass/fail
+thresholds written down in advance, and we will publish the result either way, including a negative
+one.
+
 ### 2026-08-20 — **Your disk matters more than your GPU. We put an NVMe in our 8 GB test machine and the same training step went from 11 minutes to just over 2. Also: that 8 GB card now provably computes the same thing our big card does.**
 
 **If you take one thing from this entry: do not mine from a spinning hard drive.** We measured our

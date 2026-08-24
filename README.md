@@ -66,85 +66,83 @@ else runs (or that you run from the full node package).
 
 ---
 
-## 🧭 Where we are, and the plan from here (2026-08-15)
+## 🧭 Where we are, and the plan from here (2026-08-24)
 
-**The short version: the distributed-training machinery works. Turning it into a measurably smarter
-model is the open problem, and this is how we're going after it.**
+**The short version: post-training now demonstrably makes the model smarter — but only on a single
+machine. Combining work from separate machines has been refuted six different ways, so we changed
+the kind of work miners would do. That new direction is being built and tested this week.**
 
 A real 30B-class model trains across an RTX 5090 and an 8 GB RTX 4060 **over the open internet**,
-bit-exact against a single box, with signed auto-updates that a fresh install picks up on its own
-schedule. That part is done and holding — it is the hard engineering, and it is behind us.
+bit-exact against a single box, with signed auto-updates a fresh install picks up on its own. That
+engineering is done and holding.
 
-The part we haven't cracked yet is the one that counts: **turning training into a measurable gain in
-what the model can actually do.** No method we've tried has managed it so far. The clearest example:
-one change improved the language-modelling metric by 0.2375 nats at p=1.1e-4 — a strong signal — and
-the reasoning benchmark came out *slightly worse*. Our most recent fine-tuning run moved the
-benchmark by **exactly +0.000 pp** (37 items improved, 37 got worse).
+### What changed since the 15 August version of this section
 
-That gap is the whole focus now, and knowing precisely where it sits is worth a lot — it means the
-next experiments can aim at one thing instead of six.
+That version said no method had yet turned training into a measurable capability gain. **That is no
+longer true, and we are correcting it here rather than leaving it to age.** Two results since:
 
-Two results landed this week. Both are negative, and both usefully narrow the search:
+- **16–17 August:** a fine-tuning run moved a real skill benchmark **82.17% → 84.45%** (+2.41 points,
+  p=0.0018), and **a second independent seed reproduced it** — both peaking at the same step. The
+  first reproducible capability gain this project has recorded.
+- **24 August:** the model absorbed 160 invented facts to **65.2%** recall on phrasings it was never
+  trained on, against 25% for guessing — **8.75 standard errors above chance.**
 
-- **Combining separately-trained contributions hasn't worked in five different setups** — merging in
-  parallel, in sequence, at reduced dose, training jointly, and (as of today) with the best-known
-  academic merging operator. The last of those made the model **worse**, and we can now say exactly
-  why: the operator's update sits at **88.7 degrees** to the direction that actually helps. It
-  doesn't shrink the update, it replaces it. That's a clean explanation, and it closes the question
-  rather than leaving it open.
+Both were **single-machine**. Neither came from mining. And on the same day we published the second
+one, we **retracted** a larger number from the day before: it had measured a guessing strategy, not
+knowledge. The retraction is in the log below, where the wrong version also still stands.
 
-  A follow-up arm later the same day settled the last objection — that the operator had merely been
-  applied too weakly. Re-run at **exactly the same update size as plain addition**, it still harmed
-  the model (**+0.0260** nats) where plain addition helps slightly (**−0.0027**). So the operator
-  itself is the problem, not the strength it was applied at. Worth noting against ourselves: we
-  predicted publicly, before running it, that this arm would be *worse* than the weak one. It came
-  out roughly **half** as harmful. The prediction was wrong and the record stands as written.
-- **A "layer contribution" turns out to be, in magnitude, a single expert.** Of 64 experts, one or
-  two carry 82.5–99.9% of the whole thing, and that one is nearly rank-1. So "many miners, many
-  contributions, added together" isn't what the maths is doing — which tells us the fleet design
-  has to earn its scaling somewhere other than weight-space addition.
+### What is now closed
+
+**Combining separately-trained weights does not work here.** Six independent attempts, the last two
+this week:
+
+| what was tried | result |
+|---|---|
+| merging expert deltas | benchmark 82.4% → **33.8%** (guessing is 25%) |
+| two machines, split then merged | **−1.44 points** vs one machine alone |
+| merging at reduced dose / jointly trained / academic operator | no arm beat its own control |
+| merging two adapters | returned **exactly** the better single one |
+| disjoint-expert partition (24 Aug) | the router **will not** separate two workers' data |
+
+The last one was measured rather than assumed, and it saved a week of both machines: we checked
+whether the model's own routing would hand us a natural boundary between two miners. It does not —
+two completely separate datasets route to the **same** experts at ~90% overlap. That closes the
+partition idea as designed, before it cost anything.
+
+### Where we are going instead
+
+**Reinforcement learning from verifiable rewards.** The model attempts a problem, a deterministic
+program checks the answer, and it learns from the attempts that worked. Miners would contribute
+**solved problems**, not weights, and one machine takes the learning step.
+
+This matters for a specific reason: **it never averages anything.** Every failure in the table above
+is a fact about averaging independently-trained weights. Change the unit of mined work to
+*experience* and none of those failures has anywhere to happen. It also fits the network people
+actually have — a full round of mined work is **under 1 MB**, about a second on a home connection,
+against the 296 Mbit/s per machine the previous design needed.
+
+Progress as of today, all of it on a small open MoE model chosen as a cheap proving ground before
+committing to the large one:
+
+- The blocker that killed this idea before — a model needs to *sometimes* succeed for RL to have
+  anything to reinforce — is **cleared**: 84.4% of problem groups carry usable training signal.
+- A security flaw was found and closed in our own learner: it trusted a number supplied by the
+  miner, which a dishonest miner could have used to hijack training. Miner-supplied numbers no
+  longer touch the gradient at all.
+- A frozen benchmark, pass marks, and stop criteria were written down **before** any of it ran.
+
+**Still unproven, and it is the whole question: none of this has crossed the network yet.**
+Everything above is one machine. The two-machine test is what is being built now.
 
 ### What this means for you
 
-**Right now, mining here is closer to a network test than to model training,** and we'd rather set
-that expectation than let anyone infer otherwise. Of 10,752 accepted contributions so far, none has
-yet improved the held-out metric. The gate that accepted them has since been measured as unreliable
-— in 6 of 7 audited cases it accepted work that didn't help the full model. Rebuilding it against
-the full model is step E4 below.
+**Mining is closed and unpaid, and stays that way** until we can show, with published evidence, that
+miner-contributed work makes the shared model measurably better. Of 10,752 contributions accepted by
+the old pooled lane, **none** improved the held-out metric — that lane is deprecated, not paused.
 
-So we're not advertising returns, and you shouldn't expect meaningful earnings while that's the
-case. If you run a miner today, run it to help prove a real distributed-training network — that part
-genuinely works, and the reliability data you generate is what makes the rest possible.
-
-### The plan, in order
-
-Each step decides whether the next is worth running. Nothing here is a promise of success.
-
-| Step | What it answers | Cost |
-|---|---|---|
-| **E1** | Does our single best result carry through to reasoning? Our largest quality gain hasn't been checked against a reasoning benchmark yet. Either it moves — and single-contribution mining has real value — or we learn our quality metric isn't tracking reasoning, which is worth knowing early. Published either way. | ~1 GPU-hour |
-| **E2** | Can we make judging a change cheaper than making it? Today it isn't, which limits how quickly we can referee results — ours and yours. | ~3 GPU-hours |
-| **E3** | One final merging test to settle the question, then we close that line and move the effort somewhere with better odds. | ~3 GPU-hours |
-| **E4** | The rebuilt gate, scoring against the full model, run in **shadow first** — scoring only, minting nothing — so its real pass rate is known before any coin depends on it. | 7 days |
-| **E5** | **The real attempt.** Reinforcement learning on one narrow, checkable skill — the only approach whose effects are large enough for our instruments to detect. Two attempts maximum. | ~4–6 GPU-days each |
-| **E6** | Does the winning recipe survive being run over the real internet? If yes, "a model made measurably smarter by consumer GPUs over WAN" is finally a true sentence. | ~3–4 GPU-days |
-| **E7** | What we owe you before recruiting: published per-miner expected value from measured numbers, and honest uptime maths for a 10-card pipeline. | no GPU |
-
-E5 gets two attempts. If neither lands, the result for 2026 is **"mechanism proven, instrument built,
-capability not yet achieved"** — and we'll report it in those words rather than redefine success
-around whatever we did manage. A clear negative is still a real result, and it tells whoever comes
-next exactly where not to dig.
-
-**On recruiting:** we'd rather grow this on evidence than enthusiasm. So we won't promote mining on
-earnings until E4 shows the rebuilt gate has a pass rate above zero and scores against the goal
-metric, E5/E6 land a real gain, and per-miner expected value is published from measured numbers.
-Until then this is an open testing programme, and we label it as one.
-
-*One correction while we're here: we've previously said an 8 GB card holds 6 layers, implying 9 cards
-for the full model. The measured ceiling is **5 layers**, so it's **10 cards**. The earlier figure
-came from a probe that was reading Windows paging as if it were real residency.*
-
----
+We are not advertising returns and you should not expect earnings. Any credit accrued during testing
+is provisional and will be reset. Everything we find gets published either way, including the
+results that refute what we said the week before.
 
 ## 🔒 Known security & operational risks (2026-08-14) — open by design during testing
 

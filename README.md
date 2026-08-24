@@ -618,6 +618,64 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-24 (later) — **Where this is actually going: a model that reasons better, not one that memorises more.** We are opening a second track for it, and the reason is that everything that has ever made a model smarter here came from one method — and it is not the one we have been testing.
+
+**No new numbers in this update.** It records a direction and the evidence for it, written down the
+day we chose it so you can hold us to it later.
+
+**The pattern in our own results.** Every time a model genuinely got smarter here, it was
+reinforcement learning — the model attempts a problem, a program checks the answer, and it learns
+from what worked. Every time we tried to combine trained work from separate machines, it failed.
+
+```
+GRPO on Qwen3-0.6B        arithmetic  50%   ->  67%     "smarter, nothing got worse"
+GRPO on Granite-1B        arithmetic  25%   ->  62.5%   "smarter, nothing got worse"
+GRPO on OLMoE-1B-7B       arithmetic  62.5% ->  90.6%   every operation improved
+                                                        (trained 0.06% of the model)
+
+combining trained weights  ARC-Easy    82.4% ->  33.8%  (random guessing is 25%)
+two machines, then merged  our test    1.44 points WORSE than one machine alone
+```
+
+**Why that matters for mining.** All of those failures are the same failure: **averaging weights
+from machines that trained separately.** Reinforcement learning does not average anything. Miners
+would send *solved problems* — attempts at a task, with a program's verdict on whether the answer was
+right — and one machine takes the learning step. **Solved problems combine trivially. Weights do
+not.** The entire pile of failures above has nowhere to happen.
+
+**It also fixes the thing that damaged us most.** This project once paid out roughly 900 rounds of
+work that passed every technical check while the model quietly got *worse*. That happened because the
+check was a stand-in for quality rather than quality itself. When the reward is a program deciding
+whether an answer is correct, there is no stand-in left to drift.
+
+**And we already proved it can be verified — which is what makes it minable.** If a worker commits
+the exact tokens it generated, the whole learning step can be re-computed and checked. Honest work
+scores a perfect match; a faked gradient scores zero; work computed on different problems than
+claimed scores 0.23 and is rejected. That is the property a mining network needs.
+
+**The catch, stated up front.** This method only sharpens skills the model *already sometimes gets
+right*. If it never succeeds, there is nothing to reinforce — we measured exactly that, a small model
+on grade-school maths went 0% to 0%. GLM-4.7-Flash is far larger and already scores around 82% on
+common-sense reasoning, so it should have something to learn from. **That is the first thing the new
+track will test, not assume.** If it fails, the track closes early and cheaply, and we will say so.
+
+**Where the current work stands.** Two machines are training right now on two completely separate
+sets of invented facts, and we will merge them and test whether each machine's knowledge survives.
+Honest odds of that working: **15–20%**. It finishes because it is already running and it answers a
+narrow question worth answering — is combining trained weights dead, or just narrow? A follow-up test
+of a different combining method runs regardless, with a verdict due **2026-09-08**.
+
+But we want to be direct with you: **that track is not the road to a smarter model.** It tests
+whether merged weights survive. Reasoning training never merges weights at all.
+
+**Two honest limits.** Remembering invented facts is knowledge, not reasoning — yesterday's result
+says nothing about maths or problem-solving. And we have not yet checked whether teaching the model
+those facts made it *worse* at anything else. That check is owed before anyone calls it a better
+model, and we will publish it either way.
+
+**Mining stays closed and unpaid** until we can show that miner work makes the model measurably
+better. Nothing above changes that. What changes is which question we are trying to answer.
+
 ### 2026-08-24 — **We finally made the model measurably smarter. It learned 160 facts about people who do not exist, and can recall them from wordings it was never shown.** Also: the number we published yesterday was wrong, and we are retracting it below.
 
 **The short version.** For weeks every test we ran said the model would not absorb new knowledge. It

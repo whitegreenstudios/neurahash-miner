@@ -1,5 +1,22 @@
 # NeuraHash Miner
 
+> ### DEMO ONLY - PROTOTYPE IN TESTING. TEST REWARDS WILL BE RESET.
+>
+> NeuraHash is a **demonstration of an unreleased research prototype**, published so the work
+> can be inspected and checked. It is not a live network, not a product, and not an invitation to
+> participate. Nothing here should be treated as a financial instrument or
+> as an expectation of future value.
+>
+> **All balances, credits and rewards accrued during testing are provisional and WILL BE RESET
+> WITHOUT NOTICE** - as many times as testing requires, including at mainnet launch. Do not
+> acquire hardware, incur electricity costs, or make any other commitment on the expectation
+> that test-phase credit will carry forward. It will not.
+>
+> Mining is currently **closed and unpaid**. It stays that way until we can demonstrate, with
+> published evidence, that miner-contributed work makes the shared model measurably better.
+> Every result below is published with its method, its limits, and its failures - including the
+> ones that refuted our own earlier claims.
+
 The **miner client** for NeuraHash — a proof-of-useful-work network where the "work" is training a
 shared Mixture-of-Experts model. Your GPU trains its assigned expert slots (compact LoRA deltas on
 a frozen GLM trunk), signs each delta with your own locally-generated key, and publishes it —

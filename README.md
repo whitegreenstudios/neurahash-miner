@@ -618,6 +618,75 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-24 (third) — **The reasoning plan now has dates, pass marks and a stop date. We can find out whether it is impossible by 28 August, for about seven hours of GPU time. Our honest odds it fully works: about 1 in 8.**
+
+**No new numbers here.** This is a plan, published before we spend anything on it, with the
+conditions for abandoning it written down first. That ordering is the point.
+
+**The one thing that used to block this is now cleared, and it cost nothing to check.** This kind
+of training only sharpens skills the model *already sometimes gets right*. If it never succeeds,
+there is nothing to reinforce — we measured exactly that before, a small model on grade-school
+maths going 0% to 0%. GLM-4.7-Flash already scores **70%** on those same problems. It is neither
+stuck at zero nor already perfect, which is exactly where this method works. That number was
+already sitting in our own files from an earlier test.
+
+**Two things we have never measured decide the whole thing.** First, how fast the model can write
+answers when compressed to a quarter of its size. Uncompressed it produces about **one word per
+second**, which would make each round of training take days — dead on arrival. Compressed it should
+fit on one card and run far faster, but nobody has tried this particular model that way. Second,
+whether the compressed model's answers are close enough to the uncompressed one that the learning
+step still counts. If they drift too far, the maths throws the work away and speed stops mattering.
+
+**Both answers arrive on 27 August, for about seven hours of GPU time.**
+
+```
+25-26 Aug   wiring only, no GPU (the cards are busy with the current test)
+27 Aug      the two probes  <- everything hinges here
+28 Aug      go / no-go, decided against pass marks written down TODAY
+29 Aug -  6 Sep   the current test finishes on both machines
+ 8 - 14 Sep       daily rounds: both machines generate attempts, one machine learns
+15 - 17 Sep       final scoring
+17 Sep      verdict
+```
+
+**What we will accept as success:** the model must get **5 percentage points better** at
+grade-school maths, with the statistics agreeing it is real, and nothing else it can do may get
+worse.
+
+**Why five points and not something braver.** Scoring the test once takes **24 hours of GPU time**.
+At that cost we can afford 400 problems, and 400 problems can only reliably detect a gap of about
+**5 points**. A genuine 3-point improvement would come back as "no result" — we would have spent
+the time and learned nothing. We are saying this now, before the run, because it is the most likely
+way this ends. Making the test sharp enough to see smaller gains needs it to run about **15 times
+faster**, which we cannot currently do.
+
+**The part that is unambiguously good news: the network cost.** Each attempt a miner sends back is
+about **1.6 KB**. A full round of 128 problems is **1.7 MB — under one second on a normal home
+connection.** Compare that with the approach we tested earlier, which needed 296 Mbit/s per machine
+against the roughly 20 Mbit/s a home line actually provides. **This is the first design whose
+bandwidth fits the internet people really have.**
+
+**And it never merges weights**, which is what has failed here every single time. Miners send
+*solved problems*; one machine does all the learning. Mathematically that is identical to one
+machine working through a bigger pile of homework. There is no averaging step for the old failures
+to happen in.
+
+**Where we are honest about the limits.** Two machines is not a fleet — it is about **1.25
+machines**, because one of the two cards is three and a half times slower than the other. The science is sound; the *fleet*
+claim is thin until other people's cards join. Cards with 20 GB or more are worth roughly **17
+times** what our own setup contributes, so that is what actually unlocks this.
+
+**And there is still an unsolved honesty problem.** We can prove a miner's learning step matches
+the attempts it submitted. We cannot yet prove those attempts were generated fairly rather than
+cherry-picked. That must be solved before mining pays anyone. It does not block the September
+verdict, because right now both machines are ours.
+
+**If the answer on 28 August is no**, we do not go back to merging weights. We keep this research
+on one machine, use the second for checking work, and wait for bigger volunteer cards.
+
+**Mining stays closed and unpaid** until we can show that miner work makes the model measurably
+better. Nothing here changes that.
+
 ### 2026-08-24 (later) — **Where this is actually going: a model that reasons better, not one that memorises more.** We are opening a second track for it, and the reason is that everything that has ever made a model smarter here came from one method — and it is not the one we have been testing.
 
 **No new numbers in this update.** It records a direction and the evidence for it, written down the

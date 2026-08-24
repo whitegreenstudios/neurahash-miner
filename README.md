@@ -618,6 +618,80 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-24 — **We finally made the model measurably smarter. It learned 160 facts about people who do not exist, and can recall them from wordings it was never shown.** Also: the number we published yesterday was wrong, and we are retracting it below.
+
+**The short version.** For weeks every test we ran said the model would not absorb new knowledge. It
+turns out we were training it with the handbrake on. One setting — the learning rate — was five
+times too small, and the model was physically unable to move far enough to learn anything. Turned up,
+the same test on the same data went from **nothing** to **65%**.
+
+**What it actually learned.** We invented 160 people who cannot appear in any book, website or
+dataset — names built so no text anywhere contains them — and gave each one a birthplace, a field, a
+birth year and an instrument. Then we asked the model about them using **a phrasing it was never
+trained on**, four choices, one right answer. Random guessing scores 25%.
+
+```
+before training                       25.0%   (exactly random)
+after, with the old setting           28.1%   (still random, within noise)
+after, with the corrected setting     65.2%
+```
+
+That last number is **8.75 standard errors** above chance. It is not a fluke, and it is the largest
+capability gain this project has ever recorded.
+
+**Now the retraction, because this repo's history is append-only and we do not quietly edit.**
+
+Yesterday we published a smaller version of this result — a **+14 point** gain — and called it real.
+**It was not.** When we checked it properly we found the model had not learned any facts at all. It
+had learned *which answers appear most often*.
+
+Our test had a flaw: each attribute drew its answers from a pool of eight, and we picked them
+randomly, so some answers happened to be correct eight times and others only twice. "Always guess the
+common one" was a winning strategy worth about 12 points. We proved this by writing a fake model that
+knows **only** how often each answer appears and **nothing** about any person. It scored **37.4%**.
+Our trained model scored 39.4%. Almost the entire result was the shortcut.
+
+We even had a supporting argument for the wrong conclusion, and it was also wrong. We said the model
+scored the same on trained and untrained wordings, so it must be genuinely understanding rather than
+memorising. But a "guess the common answer" strategy works on *any* wording, so that proved nothing.
+
+**The fix was our test, not the model.** Every answer is now correct exactly the same number of
+times, so guessing the popular one is worth precisely zero. The rebuilt test refuses to be created at
+all unless the fake shortcut-model scores exactly random on it. It does. The 65% above is measured on
+the items where the old shortcut actively points at the **wrong** answer.
+
+We also found and fixed two smaller flaws in the same audit: the reverse-direction questions reused
+the same three wrong options for nearly every item, and our invented names shared too many syllables
+with each other.
+
+**One more correction, on the target we were aiming at.** We had set a 60% pass mark, borrowed from a
+published result of 63%. That result used a **two-way** test — one right answer, one wrong, so
+guessing scores 50%. Ours is four-way, guessing scores 25%. We had been holding a harder test to an
+easier test's bar all week.
+
+**A safety check that was quietly doing damage.** The miner has a rule that stops a training run
+early if it is not learning. That rule was comparing two single measurements against a threshold
+**14× smaller than its own measurement noise** — so it was, in effect, flipping a coin. It killed a
+perfectly healthy run. It is now fixed: same threshold, but it must clear the noise before it may act.
+On a run that is merely noisy, the chance of a wrongful kill dropped from **53% to 0.4%**. Hours later
+the repaired rule correctly stopped a run that was genuinely blowing up. Same rule, opposite and
+correct calls, twelve hours apart.
+
+**What this does not mean.** The model knows *"Vellodine was born in Ostrave"* but cannot answer
+*"who was born in Ostrave"* — reversal scored 23.75%, pure chance. Knowing invented facts is knowledge,
+not reasoning; it does not yet mean better maths or better answers to your questions.
+
+**And it was not done by mining.** Every run above was a single machine. Not one byte crossed the
+network. Pooled mining remains **closed** and **not paying**, for exactly the reason we have given all
+along: we will not pay for work we cannot show makes the model better.
+
+What changed is that we now have both things we were missing — a test that can detect real learning,
+and a recipe that produces it. **Running right now:** two machines, two completely separate sets of
+160 invented facts, no overlap between them. Each machine scores exactly random on the other's facts,
+so if combining their work teaches the model the *other* machine's facts, that is fleet training
+working, and there is no other explanation available. We wrote the pass marks down before starting.
+Honest odds of success: **15–20%**. We will publish the result either way.
+
 ### 2026-08-23 — **The two-machine test failed again — but this time we checked the ruler, and the ruler was broken. Our benchmark was already maxed out, so it could not have shown a win no matter what we did.** Also fixed: 8 GB cards were being handed a 1 GB memory budget, which is why they kept parking.
 
 **The short version.** Two days ago we said combining work from two machines was worth re-testing on a

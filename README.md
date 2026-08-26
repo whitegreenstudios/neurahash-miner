@@ -633,6 +633,334 @@ the fix is obvious instead of mysterious.
 the code it already has, and only ever runs an update whose signature verifies against the pinned
 release key.
 
+### 2026-08-26 — **We spent four and a half hours of GPU time fixing a problem, proved we fixed it, and it made the model *worse*. Publishing it anyway, because a fix that provably works and still does not help is the most useful kind of failure — and because three of the numbers we had been reasoning from turned out to be wrong.**
+
+**Nothing here changes how you mine.** Your miner's job is unchanged, your work is still worth what
+it was worth yesterday, and no update is required. This is a research result about how we *train*
+with what you send us.
+
+#### What we tested
+
+When your miner attempts a maths problem, it uses a copy of the model. As training goes on, the model
+being trained moves ahead of the copy your miner is sampling from, and the two drift apart. That drift
+is real and we had measured it. The obvious fix is to keep sending miners a fresh copy every round.
+
+So we built that and ran it for 33 rounds against an otherwise identical run that kept the old frozen
+copy. Same settings, same amount of work, same everything else.
+
+#### The result
+
+On 512 problems the model had never seen:
+
+| | score | vs untrained |
+|---|---|---|
+| untrained model | 28.7% | — |
+| **refreshed copy every round** | **37.9%** | **+9.2 points** |
+| **frozen copy (what we already do)** | **46.5%** | **+17.8 points** |
+
+Both approaches made the model better. The "fix" made it better by **half as much**. The odds of that
+difference being luck are about **1 in 9,000**.
+
+**And here is the part worth your time: the fix worked.** We measured the drift directly. In the old
+setup it nearly doubled over the run. With the refresh it stayed flat — exactly as designed. We
+removed the problem, confirmed the problem was gone, and the model got worse anyway.
+
+That is a much stronger result than "our measurement was broken". It means the drift was never what
+was holding us back, and we now know that for certain instead of suspecting it.
+
+#### Why it went the other way
+
+Training here works by having the model learn from its own successful attempts. So whatever produced
+those attempts is effectively the *teacher* — and a teacher can only teach what it can already
+sometimes do. The frozen copy is the original model, which solves **86%** of these problems if you let
+it try eight times. The refreshed copy is the model's own imperfect, compressed self. We swapped a
+good fixed teacher for a worse moving one, and got a worse student. Obvious in hindsight; not obvious
+enough to any of us beforehand.
+
+#### Three numbers we had wrong, now corrected
+
+We would rather publish these than quietly fix them.
+
+1. **The measurement that justified this whole experiment had failed its own sanity check** — and said
+   so, in its own log file, in plain text. Nobody read the line. Four and a half hours of GPU time
+   were spent on the basis of numbers that had already declared themselves untrustworthy. Every
+   measurement we run now carries a control that makes the run *refuse to report* if it fails, and
+   this one passed to five decimal places.
+2. **We thought the drift was about ten times bigger than it is.** The real figure is roughly a tenth
+   of what we had been quoting. The old number came from asking one model to judge text written by a
+   different one, which flatters the difference.
+3. **The model stops improving after about 40 rounds, and then slowly gets worse** — 48.4% at round
+   40, down to 43.8% by round 100. More mined data past that point did not help. This one matters for
+   anyone wondering whether more miners simply means a better model: past a certain point, on this
+   setup, it does not. The bottleneck is not how much work arrives.
+
+#### The bigger thing we found while looking
+
+Every training run this project has ever done adjusted about **4.2 million** of the model's numbers.
+The part of the model that does most of the actual thinking — roughly **three quarters** of the work
+on every word — has been **completely untouched every single time**. We have been training about
+**0.4%** of the model and drawing conclusions about what the model can do.
+
+So the honest position is: we do not yet know whether this model is too small to reason better,
+because we have never actually trained the part of it that does the reasoning. Testing that is next.
+
+#### What happens now
+
+- The refresh idea is **dropped**, not patched.
+- We found a genuine bug in our training code while investigating — a rare case where a bad attempt
+  can shove the model much harder than intended. It affects **both** runs. It is being fixed.
+- **And we checked whether that bug was the real culprit, instead of assuming.** Two of those hard
+  shoves happened late in the run, so we scored the model from *before* they hit. If the bug had
+  caused the damage, that earlier version should have been clearly better. It was **worse** — 35.7%
+  against the final 37.9%. The model was still improving straight through the rough patch. So the
+  bug is real and worth fixing, but it is **not** the reason this experiment lost. The teacher
+  explanation above is what stands.
+
+  We are spelling this out because the pass mark was written down **before** the test was run —
+  "the earlier version must beat the final by at least 6.2 points" — which is what stopped us
+  quietly blaming the bug and moving on. It came back at *minus* 2.2.
+- We have written down, **in advance**, the result that would make us stop this whole line of work
+  rather than keep tuning it. If two upcoming tests both come back flat, we stop and publish 48.4% as
+  where this approach ends.
+
+### 2026-08-25 (night) — **A miner on the other side of the internet made our model smarter on its own. This is the first result in this project's history that is about the fleet rather than about one computer — and we checked that the model got genuinely smarter, not just better at one kind of question.**
+
+**What we did.** Our 8 GB card spent the day doing what a miner does: reading maths problems,
+attempting each one eight times, and sending the attempts over the public internet. Nothing else.
+Then we took a *fresh, untrained* model and taught it using **only that miner's work** — nothing
+from the machine doing the teaching.
+
+On 512 problems it had never seen, it went from **28.7% to 36.7% correct**.
+
+**The number we are publishing is smaller than that, on purpose: +6.25 points.** Here is why. There
+are two reasonable ways to read an answer out of the model's reply, and they disagree about the
+*untrained* model — it tends to write its answer in a messy format that one reader scores wrongly.
+Under the stricter reader the gain is +6.25 points instead of +8.0. We quote the smaller one. The
+odds of a result like this being luck are about 1 in 900.
+
+**We also checked it did not get smarter at maths by getting dumber at everything else.** That is a
+real risk with this kind of training, and it is the difference between "better at one task" and
+"smarter". We tested it on 2,376 general science and reasoning questions that have nothing to do
+with maths: **77.36% before, 77.53% after.** Unchanged. The gain is real and it did not cost
+anything.
+
+**And the remote miner's work was worth as much as work done locally.** We compared it against our
+big card's own data at the same volume: the difference was **2.5 points, which is inside noise**. If
+you run a miner from your bedroom over an ordinary internet connection, your contribution appears to
+be worth the same as one produced on the machine doing the training. That is the thing this whole
+project needs to be true.
+
+Worth adding: this test was set up to be *hard* on itself. The miner was working from an outdated
+copy of the model the entire time, which makes its data less useful than it would be in normal
+operation. So the real number is probably better than what we are quoting.
+
+#### How many miners can actually help — an honest answer
+
+The obvious hope is "10,000 people each run a miner and the model gets smart 10,000 times faster."
+We measured our own machines today, and that is not what will happen.
+
+Generating attempts — the part miners do — is **93% of the total work**, and it splits across
+miners perfectly. But all of that work flows into a **single computer that does the actual
+learning**, and that computer's job grows with the amount of data it receives. Ours takes 980
+seconds to generate a round of attempts and 69 seconds to learn from them. Divide those and you get
+the answer: at around **14 miners**, the learning computer is saturated. Miner number 15 onwards
+does not make anything faster.
+
+That number is probably a bit higher in practice, and we will measure it properly rather than guess.
+But it is dozens, not thousands.
+
+**This is not bad news, and here is the honest way to read it.** It means a modest fleet captures
+nearly all the speed benefit — you do not need a huge network for this to work. And beyond that
+point, extra miners still help, just differently: only about three quarters of mined work contains
+anything useful to learn from, so with more miners you get to **pick the best work and discard the
+rest**, cover far more problems, and have miners check each other's honesty. Better data rather than
+more data. To go meaningfully faster than that, we would have to split the *learning* across
+machines too — which we have already shown is possible here, but have not built for this.
+
+#### What we caught before it wasted a night
+
+Before running tonight's experiment — can *two* miners pooled beat the best single one — we had it
+reviewed against its own code. It found four faults. One would have made it fail immediately. The
+other three would have quietly biased it toward the answer **"pooling miners doesn't help"** — not
+by crashing, but by silently training on part of the data while reporting it had used all of it.
+
+The worst of them: a default setting would have thrown away a slice of the second miner's data on
+**every single round**, always the same portion, without a word in any log.
+
+That is the kind of failure this project takes seriously, because it does not look like a failure.
+It looks like a clean result. We would have published "a second miner adds nothing" and believed it.
+
+We also found and fixed a related one from earlier the same day: a summary line reported this very
+result as **"NOT PROVEN"** because it looked up a misspelled field name and quietly substituted "no
+effect". The real answer had been sitting in the file the whole time. It now refuses to print a
+verdict at all rather than invent one.
+
+#### Where this leaves things
+
+Still true and still stated plainly: this is a **small model** (about 1.3 billion active
+parameters), running on **two cards**, with **one remote miner**. Tonight's run asks whether two
+miners pooled beat the best single one. That result, and a first measurement of how the benefit
+scales with fleet size, will be published here either way — including if the answer is "it does not
+help".
+
+**Mining stays closed and unpaid** for now. The bar we set was that miner-contributed work must be
+shown to make the shared model measurably better. Today's result clears that bar for the first time.
+Changing a published commitment is a decision for the project owner rather than something we will
+slip into a changelog, so it stays as it is until that decision is made deliberately.
+
+### 2026-08-25 — **The biggest jump we have ever measured on a public reasoning benchmark: a model went from getting 28% of grade-school maths problems right to 40%. It was one of our two cards that did it, not the fleet — and we are saying so plainly, because that distinction is the whole point of this project.**
+
+**What happened.** We trained a small Mixture-of-Experts model (OLMoE, about 1.3 billion active
+parameters) using reinforcement learning from *verifiable* rewards — the model tries a problem
+eight times, and it learns from which attempts actually got the right answer. On **807 test
+problems that played no part in picking which version of the model to keep**, accuracy went from
+**27.51% to 40.15%** — **+12.6 points**. It got 180 problems right that it used to get wrong,
+against 78 it lost. If the model had truly not improved, a gap that large would essentially never
+happen by chance (formal odds around 1 in 5 billion).
+
+**We first reported this as +19.7 points, and that was too high.** We picked the best of three
+saved versions by testing them on one set of problems — so that same set could not then be used to
+judge the winner fairly. Testing on a completely separate set of problems, which we had never
+looked at, cost about 7 points. The smaller number is the honest one, and it is the one we will
+keep quoting.
+
+**And roughly half of what remains is the model learning to follow instructions, not to reason.**
+Our prompt asks it to end with the answer on its own line in a specific format. The untrained model
+does that only **27%** of the time; the trained one **61%**. Marked by a scheme that gives credit
+for a right answer in the wrong format, the gain is meaningfully smaller. We think the strict
+marking is correct — the format was part of what we asked for, and it is what the training rewarded
+— but you should know that "learned to answer properly" is part of what the number contains. We are
+measuring the reasoning-only part separately and will publish it.
+
+For scale: the best result we had ever published on a public benchmark was **+2.4 points**, on a
+different model and a different test. This is **+12.6**. We have posted bigger jumps on small
+home-made arithmetic drills, but a public test set scored once on a frozen split is a much higher
+bar, which is why we count from here. It is also the first time anything we built has been
+*proven* — on a public test, with the statistics to back it — to make a model better at *working a
+problem out* rather than at *remembering a fact*.
+
+**Now the part that matters more than the number.** We have two GPUs. **One of them did all of
+this.** We went back and audited every one of the 100 training rounds: all 100 were fed by the
+5090, and **not one used a single rollout from the 4060**. So this is proof that the *method*
+works. It is **not** proof that a fleet of miners can make a model smarter — that is a different
+claim and we have not earned it yet.
+
+We are being pedantic about this on purpose. The most expensive mistake in this project's history
+was paying for roughly 900 rounds of work that passed every mechanical check while the thing we
+actually cared about got *worse*. "The machinery ran" and "the model improved" are different
+sentences, and we will keep writing them separately.
+
+**Five limits, stated up front so nobody has to dig for them:**
+
+1. **Small model.** About 1.3 billion active parameters. Our actual target is a 30B-class model,
+   and this is not it. We chose this one because it is the biggest MoE that fits in one card's
+   memory while training — anything larger has to stream weights from disk, which we already
+   measured as roughly 20 minutes per step.
+2. **Two cards.** An RTX 5090 and an 8 GB RTX 4060. That is the entire "fleet" in this result.
+3. **It may be reliability, not new knowledge.** Given eight attempts, the *untrained* model
+   already got at least one right on **four in five** of its practice problems (79.9%), while any
+   single attempt succeeded only about **a third** of the time (36.3% — same problems, same
+   settings). So training may have taught it to deliver on the first try what it previously
+   managed only occasionally. That is a real and useful improvement — it is
+   first-try performance that ships — but "it learned new maths" would be an overclaim, and telling
+   the two apart needs a test we have not run.
+4. **We put our own marking scheme on trial, and it changed the story.** Two reasonable ways of
+   reading a model's final answer disagree on 11% of replies. Re-scoring both versions under both
+   readers showed the trained model scores **identically** either way, while the *untrained* one
+   differs by 7 points — because the untrained model buries its answer under a heading. So the
+   disagreement is almost entirely about reading the untrained model. We judge the strict reader to
+   be the right one (it is the format we asked for, and what training rewarded), and we report both.
+5. **The gain is limited to this kind of problem — now tested, both ways.** A model can get
+   better at maths by getting narrower at everything else. We checked on ARC-Easy, a 2,376-question
+   general science test: the model scored **77.36% before and 77.10% after** — a 0.25 point
+   difference, indistinguishable from noise. Nothing was damaged. But nothing carried over either:
+   it got better at grade-school maths specifically, not at thinking in general.
+
+#### Training it *longer* made it worse, and the reason surprised us
+
+We scored the model at 40, 70 and 100 rounds of training. These figures come from the set of
+problems we used to *choose* between the versions, so they run high — they are here to compare
+rounds against each other, not to state how good the model is:
+
+| rounds of training | score on held-out problems |
+|---|---|
+| 0 (untrained) | 28.71% |
+| **40** | **48.44%** ← best |
+| 70 | 45.70% |
+| 100 | 43.75% |
+
+Honesty note: we first reported that decline more confidently than our own data supports. Each
+individual drop is within noise. Only the full 40→100 gap is even marginally significant. A mild
+real decline is the best reading of it — a proven one it is not.
+
+Our best-supported explanation is a *stopping* problem, not a problem with the method (the check that would confirm it directly had not finished when this was written). The model kept
+being fed practice attempts generated by its **original, untrained** self, long after it had moved
+on — so for 60 rounds it was studying from an out-of-date textbook.
+
+The lesson that came out of it is one we think matters for anyone building this kind of network.
+**You cannot tell whether a model is still learning by watching how hard it is working.** We
+measured every internal signal we had — gradients, weight movement, loss — and none of them could
+tell the difference between "learning" and "confidently learning the wrong thing". At one point the
+training signal spiked to 89 times its usual size and the model moved *less* than it had the round
+before. The only thing that knows whether learning is still happening is **testing the model on
+problems it has not seen**. Effort proves nothing; outcomes do.
+
+#### What we fixed, and what it means for a miner
+
+- **Your miner can now be kept up to date for 8.4 MB.** The reason the model above was studying
+  from an out-of-date textbook is that we believed we could not ship it a new one. We were wrong:
+  the conversion had been failing because of a *missing folder*, nothing more. Now measured across
+  both machines over the real internet — the update is built in 8.4 seconds, published in 4.5, and
+  the second machine downloads and verifies it in **1.0 second**. About 1.4% overhead on a
+  16-minute round of work. We confirmed the miner genuinely *uses* it rather than silently ignoring
+  it, by having it answer the same question twice with and without the update and checking the
+  answers actually differ.
+- **We closed a hole where a miner could have steered training by editing one number.** We had
+  written the code to prevent this a day earlier — and never connected it. The trainer was reading
+  the miner's own claim about whether an answer was correct, and the correct answers travelled in
+  the miner's own file. A dishonest miner could have marked everything correct. Now the trainer
+  re-marks every answer itself, using the same marking scheme the final exam uses, and the miner's
+  claim is kept only as a note.
+- **That immediately caught a real problem between our own two machines.** They had been marking
+  their own homework with **different rules**. Our 5090 disagreed with the official marking on 0 of
+  1527 answers; the 4060 disagreed on **69 of 768** — and it is not that one is stricter. Both look
+  for a `####` marker and both fall back to a bare number; they differ in how they read that marker
+  when the model uses it as a **section heading** instead. The official one takes the first number
+  after the last `####`, which is often a list numeral — as in "1. Nick wants to raise $1000",
+  giving 1 when the right answer was 160. The 4060's needs digits directly after the marker and
+  otherwise takes the last number in the reply, which sometimes matches by luck. They disagree in
+  **both** directions. Across everything the 4060 mined for the experiment
+  below, it had been overstating its own success rate by **8.9 points** (we first caught it at 5.6
+  points on a smaller early sample). Measured over all 8,447 replies, the two rulers disagree **11%**
+  of the time. Nothing was cheating — the two just were not
+  comparable, and until today nobody knew.
+
+#### What we do next, and when you will know
+
+The 4060 has now mined **33 rounds of work over the open internet** — 8,447 attempts across 1,056
+problems — 8,447 of 8,448 attempts delivered, exactly one generation timed out and the miner's own
+log says so — every round hash-verified. (An earlier 19 rounds, mined before we fixed a
+prompt-wording bug, were **rejected** by these same checks and are not counted — the checks exist to
+do exactly that.) We have pulled it down and put it through the
+new checks: **every prompt was correct, and 75% of the problem sets carry useful learning signal.**
+
+The next experiment trains the model on **that data alone** — work generated on a different
+machine, in a different number format, by a different program, delivered over the public internet —
+and scores it on the same held-out problems. If the score moves, then a remote miner's contribution
+independently made the model smarter, and the fleet claim stops being about plumbing and starts
+being about results. That run needs about 3–4 hours of GPU time and no new mining. **We expect to
+have the answer within a day, and it will be published here either way.**
+
+**On growing beyond this.** Two cards and a small model is where today's result lives. The plan is
+to grow both — more contributing GPUs, and a larger model toward our 30B-class target. Neither is
+demonstrated by anything above, and we would rather say that now than have you infer it. The honest
+expectation is that some of this gets *harder* at scale: an 8.4 MB update is cheap, and we have not
+yet measured what the same trick costs on a model twenty times the size.
+
+**Mining stays closed and unpaid** until miner-contributed work is shown to make the shared model
+measurably better. Today's result does not clear that bar, because today's result came from one
+card. The experiment that could clear it is the one described above.
+
 ### 2026-08-24 (third) — **The reasoning plan now has dates, pass marks and a stop date. We can find out whether it is impossible by 28 August, for about seven hours of GPU time. Our honest odds it fully works: about 1 in 8.**
 
 **No new numbers here.** This is a plan, published before we spend anything on it, with the

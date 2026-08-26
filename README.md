@@ -704,6 +704,42 @@ on every word — has been **completely untouched every single time**. We have b
 So the honest position is: we do not yet know whether this model is too small to reason better,
 because we have never actually trained the part of it that does the reasoning. Testing that is next.
 
+#### The honest headline: it got much better at maths, and no better at thinking
+
+We finally ran the test that answers the question this project actually cares about. Getting better
+at grade-school maths is only interesting if it means the model got *smarter*. So we took the best
+model we have — the one that went from 28.7% to 48.4% on maths — and gave it **2,376 general science
+and reasoning questions** that have nothing to do with arithmetic.
+
+| model | general reasoning score |
+|---|---|
+| untrained | 77.36% |
+| **our best maths model** | **77.10%** |
+| the over-trained one | 77.15% |
+
+**Unchanged.** Nearly twenty points better at maths, and not one point better at reasoning in
+general.
+
+We are stating that flatly because this test is *sharp enough to matter*. It can detect a difference
+of about **0.75 of a point** — roughly **eight times finer** than our maths test can. So this is not
+"we could not tell". We could tell, and the answer is no.
+
+**Two pieces of genuinely good news inside that.**
+
+**Nothing broke.** All three scores are flat, not down. This kind of training is often accused of
+making a model better at one thing by quietly making it worse at everything else. That did not
+happen here. The gains are free — they just do not spread.
+
+**And the model is not decaying.** We had seen maths scores slide after round 40 and wondered if we
+were damaging it. General reasoning did not move at all across that same stretch. So the slide is
+the model over-fitting to maths questions, not losing its mind.
+
+**What it means.** Our training makes a model better at the specific thing it is trained on. That is
+genuinely useful and it is what the miner network has now been proven to deliver end to end. But it
+is not yet the thing we said we were building. Making the model *smarter*, rather than more
+practised, is a different problem — and we now have a sharp, cheap instrument that will tell us
+honestly whether we ever solve it.
+
 #### What happens now
 
 - The refresh idea is **dropped**, not patched.

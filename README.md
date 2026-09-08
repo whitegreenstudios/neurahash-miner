@@ -169,6 +169,16 @@ produced, ours and anyone else's.
 | battery items file | 9,547 | `5971540a52a953da199ffaa41bcaf92d835532846f1372be4fdacf7cd25afc8b` |
 | unspent reserve v1 | — | `ed70cedd6fcbb07c72f2a9fce66b3328408b307f479807bde60cbb6825c8b6a6` |
 
+Weights, too — the two adapters behind the PASS+PASS result above. An instrument commitment
+without a weight commitment is only half a commitment: it pins what a result was scored *on*, not
+what produced it. A rerun claiming to reproduce these numbers must match these bytes or say plainly
+that it does not.
+
+| adapter | bytes | sha256 |
+|---|---|---|
+| `wm4b-mix-r-s1` (PASS) | 16,794,288 | `ad9d9cfc5d7f6f92b1c90487db3a94dc85647ff40d164359868cda3d3457f49a` |
+| `wm4b-mix-r-s2` (PASS) | 16,794,288 | `9d1e7976e451583cb29f863bcecc4d88d41777dbe69aa8a9587a54ebebde4bc5` |
+
 The last row is a reserve that has **never been scored against anything**. Its value is exactly its
 unusedness: the moment a bar looks tuned to the instrument, a run on never-seen items settles it.
 Committing to its digest now is what makes that test worth anything later.

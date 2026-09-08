@@ -3994,3 +3994,24 @@ GPU/WAN training + trustless settlement**, all in one lane.
 the pinned release key, the then-current **zero-config public miner** (safe defaults — a bare
 `run_miner.py --once` earned with no env vars; that lane was deprecated 2026-07-24), and the
 shardDiLoCo + trustless-coordinator + elastic-VRAM work above.
+
+
+## Licence
+
+**[PolyForm Shield License 1.0.0](LICENSE)** — source-available, added 2026-09-08. Before this date
+the repository carried no licence at all, which by default means all rights reserved: strictly
+speaking nobody was permitted to fork, modify or redistribute a client we were asking people to run.
+This fixes that, and it grants more than the previous silence did, not less.
+
+You may **run, read, modify and share** the miner, for any purpose, including mining on the NeuraHash
+network and earning from it. The one carve-out is the licence's Noncompete clause: you may not use it
+to provide a product that competes with NeuraHash.
+
+It is a **source-available** licence, not an OSI-approved open-source one, so GitHub will not display
+a standard licence badge. That is deliberate and the tradeoff is stated rather than hidden: we want
+this readable and runnable by anyone, and we do not want it rebranded into a competing pool.
+
+Note the asymmetry, since we would rather say it than have it noticed: this licence covers the
+**client**. It does not cover the coordinator, and it is not what protects the project — the code
+here is reproducible in hours, and a review on 2026-09-08 concluded the only asset that cannot simply
+be copied is the published record of what we measured, including the losses.

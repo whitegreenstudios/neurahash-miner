@@ -66,6 +66,92 @@ else runs (or that you run from the full node package).
 
 ---
 
+## 📊 Every post-training run we have scored, and its verdict (2026-09-03 → 09-08)
+
+Six days, **20 scored arm-seeds**, one question: *does WAN post-training on a mixed-GPU fleet make
+the model smarter or better at reasoning?* This section lists every run and its registered verdict,
+including the ones that failed. If you are mining for us, this is what your electricity bought.
+
+**Every arm shares the same setup**, so the table below only records what changed: base
+OLMoE-1B-7B (true base, not the Instruct), rank-16 attention-only LoRA (4,194,304 trainable
+params), lr 1e-4, seq 1024. Every result is a **paired exact McNemar test** on a frozen item list,
+against the same base model. Dates are when scoring finished.
+
+### The verdict vocabulary (fixed before the runs, not after)
+
+| verdict | meaning |
+|---|---|
+| **PASS** | cleared its bar at p < 0.05, and no constituent task regressed |
+| **BAD** | missed the bar, and the instrument was sharp enough to have shown the effect |
+| **UNRESOLVED** | missed the bar, but the instrument's own floor was above the bar. An instrument limit, **never** a null |
+| **VETOED** | cleared the bar, but a task regressed at p < 0.05. A **non-close**: it neither proves nor refutes |
+
+`UNRESOLVED` exists so we cannot quietly bank an instrument limit as a negative result, and
+`VETOED` exists so we cannot argue a regression away. Neither may be re-labelled after the fact.
+
+### The runs
+
+| date | arm | verdict | what it tested |
+|---|---|---|---|
+| 09-03 | `W30-tm` | DATA-QUALITY | 15,404 fleet-generated broad rows, **token-matched** to a downloadable control so it cannot win on data volume |
+| 09-04 | `W30-tm-s2` | UNRESOLVED | seed 2 of the above |
+| 09-04 | `wm4b-s1` | **VETOED** | 10,000 pure-math traces from a Qwen3-4B teacher |
+| 09-04 | `wm4b-s2` | **PASS** | seed 2 — **the veto did not replicate** |
+| 09-04 | `wm4b-mix-s1/s2` | **PASS** ×2 | same dose, rebalanced 5k math + 5k broad. No vetoes |
+| 09-04 | `dft-s1/s2` | **BAD** ×2 | DFT instead of SFT. Byte-identical corpus, one flag different. Refuted |
+| 09-05 | `scale-mix-s1/s2` | **PASS** ×2 | 51,664 rows vs 10,000. Largest gains on record |
+| 09-05/06 | `selfsub-s-s1/s2` | **PASS** ×2 | the model's **own** verified traces |
+| 09-06 | `selfsub-t-s1/s2` | **PASS** ×2 | teacher traces on **exactly the same problems** — the control |
+| 09-07 | `fleetselfsub-s-s1/s2` | **PASS** ×2 | the same test, traces generated **on the fleet** |
+| 09-07 | `fleetselfsub-t-s1/s2` | **VETOED** ×2 | the fleet teacher arm. Regressed on ARC-Challenge, **on both seeds** |
+| 09-08 | `t-wan-s1` | **VETOED** | 60.3% of rows authored on **foreign ASNs**. Same ARC regression |
+| 09-08 | `wm4b-mix-r-s1` | **PASS** | 23.1% of rows foreign-authored. **Zero vetoes** |
+| 09-08 | `wm4b-mix-r-s2` | *pending* | seed 2, scoring now |
+
+**Tally: 12 PASS · 4 VETOED · 2 BAD · 1 UNRESOLVED · 1 data-quality.**
+
+### What the fleet actually contributed
+
+On 09-07 we rented consumer GPUs on three foreign networks — Taiwan, Sweden, and Georgia (US),
+**170–431 ms** from our anchor — and had them author 2,314 verified reasoning traces. Two arms then
+trained on those rows. Against an otherwise identical corpus written locally, the difference was:
+
+| instrument | remote minus local | p | verdict |
+|---|---|---|---|
+| commonsense battery (n=9,547) | −0.13 pp | 0.62 | **not distinguishable** |
+| GSM8K (n=1,319) | −1.29 pp | 0.23 | **not distinguishable** |
+
+**Rows authored by strangers' GPUs across the public internet train as well as rows authored
+locally.** That is the single most load-bearing result for anyone deciding whether to point a GPU
+at this project.
+
+### What we will NOT claim
+
+This matters more than the wins, so it is on the record:
+
+- **"Trained over the WAN" — no.** No gradient and no weight delta has ever crossed the network in
+  a scored run. One RTX 5090 did 100% of the gradient work. The fleet generated *text*. Calling
+  this distributed training would be a lie.
+- **"Smarter" — not yet, on WAN data.** We separate "better at reasoning" from "smarter" with a
+  gate that removes BoolQ from the battery, because BoolQ carries most of the raw gain. Only two
+  arms have ever cleared that gate, and their data was authored locally, not remotely.
+- **"The fleet is necessary" — no.** A downloadable teacher ties. Our fleet is not yet producing
+  signal you could not get by downloading a dataset.
+- **"Mixed GPU helps" — unmeasured.** Heterogeneous hardware contributed, but no run differs from
+  another *by* hardware, so it is never the manipulated variable.
+- **`t-wan-s1` alone proves nothing positive.** It is VETOED, and VETOED is a non-close.
+
+### The pattern we cannot yet beat
+
+Across all 20 arm-seeds, **no run has ever been both PASS and significant on the smarter-gate.**
+All twelve PASS arms are non-significant on it; the only two arms that cleared it are not PASS
+arms. Our reasoning wins and our "smarter" wins have never once been the same set of weights.
+Closing that gap is the current work.
+
+Full numbers, instrument shas, and the registration that states what was frozen before these runs
+(and what was not) live in the private research repo. Nothing above is a projection — every row is
+a scored artifact.
+
 ## 🧭 Where we are, and the plan from here (2026-08-24)
 
 **The short version: post-training now demonstrably makes the model smarter — but only on a single

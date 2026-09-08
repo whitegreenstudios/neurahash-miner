@@ -106,9 +106,9 @@ against the same base model. Dates are when scoring finished.
 | 09-07 | `fleetselfsub-t-s1/s2` | **VETOED** ×2 | the fleet teacher arm. Regressed on ARC-Challenge, **on both seeds** |
 | 09-08 | `t-wan-s1` | **VETOED** | 60.3% of rows authored on **foreign ASNs**. Same ARC regression |
 | 09-08 | `wm4b-mix-r-s1` | **PASS** | 23.1% of rows foreign-authored. **Zero vetoes** |
-| 09-08 | `wm4b-mix-r-s2` | *pending* | seed 2, scoring now |
+| 09-08 | `wm4b-mix-r-s2` | **PASS** | seed 2 — zero vetoes. **Two seeds, both PASS: the claim closes** |
 
-**Tally: 12 PASS · 4 VETOED · 2 BAD · 1 UNRESOLVED · 1 data-quality.**
+**Tally: 13 PASS · 4 VETOED · 2 BAD · 1 UNRESOLVED · 1 data-quality.**
 
 ### What the fleet actually contributed
 

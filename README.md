@@ -152,6 +152,47 @@ Full numbers, instrument shas, and the registration that states what was frozen 
 (and what was not) live in the private research repo. Nothing above is a projection — every row is
 a scored artifact.
 
+### Instrument commitments — so we cannot quietly move a bar after seeing a result
+
+Every number in the table above was scored against a frozen item list. Publishing their sha256
+digests means we cannot later swap an instrument and keep the numbers, and anyone who obtains a
+copy can prove the one they hold is the one we used. The item lists themselves stay unpublished:
+they are the held-out set, and releasing their contents would retire every result they have ever
+produced, ours and anyone else's.
+
+| instrument | n | sha256 |
+|---|---|---|
+| commonsense battery (item list) | 9,547 | `28d38f69775d442a9a648b925b845fefb0b37ae535944df59751d8a878129ece` |
+| GSM8K-512 (item list) | 512 | `3f226f47cfc169d1a540344cd2cfe50fb4e718e1149a4629f1dbce34ee0bf0db` |
+| out-of-dataset math slice, SVAMP+ASDiv | 3,095 | `e96f9313d3f30b4ea20b6ff6b549a254f68cddcef51bc0efd7d89d70a724d57a` |
+| `eval_3200.jsonl` | 3,200 | `7930be541e934de07ec1ec5da655065e72ab03f7c75850172f68fa62fd49e34d` |
+| battery items file | 9,547 | `5971540a52a953da199ffaa41bcaf92d835532846f1372be4fdacf7cd25afc8b` |
+| unspent reserve v1 | — | `ed70cedd6fcbb07c72f2a9fce66b3328408b307f479807bde60cbb6825c8b6a6` |
+
+The last row is a reserve that has **never been scored against anything**. Its value is exactly its
+unusedness: the moment a bar looks tuned to the instrument, a run on never-seen items settles it.
+Committing to its digest now is what makes that test worth anything later.
+
+The battery's A/A floor is **0 discordant pairs** — the base model scored against itself moves not
+one item — so any movement we report is movement, not measurement noise.
+
+### Four negative results that were not public until now
+
+We publish losses because a record that only contains wins is not a record. These four cost real
+GPU time and each one closes a direction a reasonable person would otherwise try.
+
+| what we tried | what happened | status |
+|---|---|---|
+| **Layer-composition scaling** | R = 0.953 at 2 layers **inverts to −0.84 at 47**. The two-layer result simply does not extrapolate | CLOSED |
+| **GRPO as the fleet actually feeds it** | GSM8K **10.94% → 6.64%**, −4.30 pp, exact McNemar **p = 9.21e-03**. Truncations rose 4.9% → 11.9% — the policy learned not to stop | PARTIAL: what is refuted is *starved* GRPO (advantages frozen at ingest and replayed 7.6× over 111 records, because 91% of fleet output is gate-discarded). Fresh-supply GRPO has never been run |
+| **GRPO trust region** | 80 sustained steps produced **0.0032** integrated movement against the **0.085–0.125** the null arms used | Superseded reading. "27–39× short" is correct arithmetic on the wrong ruler: GRPO bought ~100× more functional change per unit dose than SFT — in the *destructive* direction. The arm was not under-dosed; it was moving the model the wrong way. **Do not cite it as "needs more steps."** |
+| **Diverse-corpus routing** | The effect was set by the d_A:d_B **magnitude ratio**, not by diversity | ARTIFACT — the apparent result was not real |
+
+The pattern across all four is worth more than any one of them: three were killed by a measurement
+we only made because the result looked good, and the fourth was killed by noticing the metric could
+be moved without the mechanism working at all. That is the discipline this project is actually
+selling, and it is the reason the table above has four VETOED rows in it rather than none.
+
 ## 🧭 Where we are, and the plan from here (2026-08-24)
 
 **The short version: post-training now demonstrably makes the model smarter — but only on a single

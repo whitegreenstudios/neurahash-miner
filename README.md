@@ -3540,6 +3540,10 @@ held-out improvement, so there is no fragile torch/BLAS determinism requirement 
 
 ## Mine — join the GLM shardDiLoCo lane
 
+**Clone in full — do not use `--depth`.** The signed auto-update fast-forwards you onto each new
+signed release by walking your git history; a shallow (`--depth 1`) clone makes that checkout fail
+(`git-checkout-failed`). Clone the normal way: `git clone https://github.com/whitegreenstudios/neurahash-miner.git`.
+
 **No key, no signup, no account.** Your machine creates its own wallet identity on first run
 (`~/.neurahash/glm_miner_key` — back it up, it owns your payouts), signs every contribution with
 it, and the network admits you on your first valid signed contribution. Your miner name *is* your
@@ -3566,6 +3570,18 @@ miner defaults to keeping that whole layer resident — **60 trainable coordinat
 fill them or not. Fetching fewer just means fewer coordinates to mine, not less memory. Piece 12 is
 deliberately excluded: it straddles into the next layer, which costs a real +1.126 GiB for one extra
 coordinate — pass `--pieces` yourself if you want to buy it.
+
+**Recommended: run it under the supervisor.** `tools/run_glm_miner.py` wraps the command above so a
+fresh box mines unattended: it fetches the base if the shard dir is empty, runs the signed
+self-update once at startup, launches the contributor, and relaunches it on any exit — crash, OOM,
+or a coordinator campaign switch — with capped backoff. Leave it running and it keeps itself current
+and alive:
+
+```bash
+python tools/run_glm_miner.py --vram-cap-gb <your VRAM minus ~1.5 GiB>
+```
+
+Extra contributor flags go after `--`, e.g. `python tools/run_glm_miner.py --vram-cap-gb 6.5 -- --expert 1:3`.
 
 <details><summary>Older placeholder form (kept for reference — no longer needed)</summary>
 
@@ -3612,6 +3628,7 @@ proven live the day this shipped: keyless strangers' mints settled as
 | `NEURAHASH_VRAM_CAP_GB` / `NEURAHASH_VRAM_CAP_FRAC` | hard per-process GPU memory ceiling |
 | `NEURAHASH_SD_COORD=L:E` | v3.4: the expert COORDINATE to claim (same as `--expert`). Unset = derive it from your wallet address |
 | `NEURAHASH_SD_ADVANCE_AFTER=N` | v3.4: consecutive gate rejects before releasing the expert and claiming the next (default 3; `0` never advances) |
+| `NEURAHASH_GLM_CORPUS_ROTATE=N` | rotate to the next corpus part every N rounds to keep a long run's data fresh at bounded disk (default 30; `0` = never rotate, one fixed part) |
 
 ### G1 train-role — RLVR rollouts (v3.2, capacity-gated)
 

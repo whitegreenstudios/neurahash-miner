@@ -51,6 +51,7 @@ SHIPPED_ENTRY_POINTS = [
     "self_update.py",
     "fetch_glm_base.py",
     "piece_loader.py",
+    "run_glm_miner.py",
 ]
 
 

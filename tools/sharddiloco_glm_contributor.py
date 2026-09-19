@@ -2135,7 +2135,7 @@ def add_common_args(ap):
                     help="corpus part to train from: 'auto' (by identity), an integer, or 'off' "
                          "to use the whole-corpus file (default: %(default)s)")
     ap.add_argument("--corpus-rotate-rounds", type=int,
-                    default=int(os.environ.get("NEURAHASH_GLM_CORPUS_ROTATE", "0")),
+                    default=int(os.environ.get("NEURAHASH_GLM_CORPUS_ROTATE", "30")),
                     help="rotate to the next corpus part every N rounds, deleting the old one "
                          "(0 = never rotate). Keeps a long run's data fresh at bounded disk.")
     ap.add_argument("--warm-steps", type=int, default=int(os.environ.get("NEURAHASH_GLM_WARM", "400")),

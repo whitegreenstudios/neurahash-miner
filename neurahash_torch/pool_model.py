@@ -26,6 +26,25 @@ _QWEN_KEYS = ("d_model", "n_head", "n_kv_head", "n_layers", "d_ff", "block_size"
               "rms_eps", "qk_norm", "tie_embeddings", "attn_bias", "bias", "head_dim")
 
 
+def _resolve_base(name):
+    """model_registry.resolve_model(name) where the tree has it. model_registry is a PRIVATE-repo alias
+    table and the public miner does not ship it, so without it apply the registry's own pass-through
+    rule -- a raw HF 'org/repo' id comes back unchanged -- and name the fix for a bare alias, instead
+    of dying on an unguarded lazy import (tests/test_published_tree_imports_resolve.py, 2026-09-30)."""
+    try:
+        from model_registry import resolve_model
+    except ModuleNotFoundError as exc:
+        if exc.name != "model_registry":               # a real bug inside the registry: not ours to hide
+            raise
+        if isinstance(name, str) and "/" in name:
+            return name
+        raise ModuleNotFoundError(
+            "base model %r is a model_registry alias, and model_registry is not in this tree (it ships "
+            "only with the private repo). Pass a full Hugging Face id instead, e.g. NEURAHASH_BASE="
+            "Qwen/Qwen3-1.7B." % (name,), name="model_registry") from None
+    return resolve_model(name)
+
+
 def qwen_arch(base=None, block_size=512):
     """The dense ARCH dict (kind='qwen', n_experts=0) for a base. Dims are read from the base's HF config
     so the backbone shape MATCHES the weights (Qwen3-0.6B is d_model=1024, 1.7B is 2048, ...). For a small
@@ -38,8 +57,7 @@ def qwen_arch(base=None, block_size=512):
         head_dim = g("NEURAHASH_QWEN_HEADDIM", d_model // n_head)
     else:
         from transformers import AutoConfig
-        from model_registry import resolve_model
-        cfg = AutoConfig.from_pretrained(resolve_model(base))
+        cfg = AutoConfig.from_pretrained(_resolve_base(base))
         d_model, n_head, n_kv = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads
         n_layers, d_ff = cfg.num_hidden_layers, cfg.intermediate_size
         theta = float(getattr(cfg, "rope_theta", None) or 1e6)
@@ -69,8 +87,7 @@ def _load_base_into(m):
     global _BASE_SD
     if _BASE_SD is None:
         from transformers import AutoModelForCausalLM
-        from model_registry import resolve_model
-        mid = resolve_model(os.environ.get("NEURAHASH_BASE", "qwen3-1.7b"))
+        mid = _resolve_base(os.environ.get("NEURAHASH_BASE", "qwen3-1.7b"))
         hf = AutoModelForCausalLM.from_pretrained(mid, dtype=torch.bfloat16)
         _BASE_SD = {k: v.detach().clone() for k, v in hf.state_dict().items()}   # clone => no mmap reduce-order drift
         del hf

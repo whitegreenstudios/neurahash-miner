@@ -34,10 +34,15 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # must precede the hug
 os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 
 # Repo root on sys.path: run by path (run_glm_miner.py starts it with cwd=tools/) only tools/ is there.
+# X-Miner-Id on the lane config GET. GUARDED: README install step 1 must work even from a release that shipped
+# without neurahash/miner_id.py (3.7.1 rule).
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from neurahash import miner_id as _miner_id    # noqa: E402  (stdlib only: X-Miner-Id on the lane config GET)
+try:
+    from neurahash import miner_id as _miner_id    # noqa: E402
+except ImportError:
+    _miner_id = None
 
 REPO = "whitegreenstudios888/neurahash-data"
 PREFIX = "glm47_pieces_100mb"
@@ -207,7 +212,9 @@ def main():
         import urllib.request
         cdir = os.path.join(args.dest, "config")
         os.makedirs(cdir, exist_ok=True)
-        req = _miner_id.attach(urllib.request.Request("%s/o/%s" % (args.lane.rstrip("/"), args.config_cid)))
+        req = urllib.request.Request("%s/o/%s" % (args.lane.rstrip("/"), args.config_cid))
+        if _miner_id is not None:
+            _miner_id.attach(req)
         with urllib.request.urlopen(req, timeout=120) as r:
             cb = r.read()
         got = hashlib.sha256(cb).hexdigest()

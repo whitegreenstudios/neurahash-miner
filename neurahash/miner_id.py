@@ -121,10 +121,12 @@ def miner_id():
 
 
 def _origin(url):
+    """(scheme, host, port), or None. A URL with user info (http://x@host/) is never a relay: urlsplit would report
+    `host` while urllib connects to the whole "x@host", so the two could disagree about where the request goes."""
     try:
         p = urllib.parse.urlsplit(str(url or "").strip())
         scheme, host = (p.scheme or "").lower(), (p.hostname or "").lower()
-        if scheme not in ("http", "https") or not host:
+        if scheme not in ("http", "https") or not host or "@" in (p.netloc or ""):
             return None
         return scheme, host, p.port or (443 if scheme == "https" else 80)
     except ValueError:

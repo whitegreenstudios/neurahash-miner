@@ -307,7 +307,7 @@ def test_relay_only_gate():
         for third in ("https://huggingface.co/datasets/x/resolve/main/release.json",
                       "https://raw.githubusercontent.com/x/y/main/release.json",
                       "https://ipfs.io/ipfs/bafy", "https://47.84.93.96:8710/o/x", "http://47.84.93.96/o/x",
-                      "http://127.0.0.1:1/o/x", "not a url", "", None):
+                      "http://x@47.84.93.96:8710/o/x", "http://127.0.0.1:1/o/x", "not a url", "", None):
             assert not M.is_relay_url(third), third
         M.register_relay("http://127.0.0.1:1/")
         assert M.is_relay_url("http://127.0.0.1:1/o/x") and not M.is_relay_url("http://127.0.0.1:2/o/x")
@@ -415,6 +415,8 @@ def test_every_relay_request_site_sends_the_id(wallet, store, third_party, tmp_p
 
     site("corpus_sync fetch_manifest (GET /manifest)", lambda: CS.fetch_manifest(store.url))
     site("corpus_sync _http_get (GET /o/)", lambda: CS._http_get(store.url + "/o/" + dsha, 5))
+    site("corpus_sync fetch_manifest (store set to a third party, e.g. HF: no id)",
+         lambda: CS.fetch_manifest(third_party.url), relay_hits=0, third_hits=1)
 
     print("\nX-Miner-Id expected=%s  relay requests=%d  third-party requests=%d"
           % (want, sum(r[1] for r in report), sum(len(r[3]) for r in report)))
@@ -499,11 +501,13 @@ def test_a_redirect_target_never_receives_the_id(wallet, store, third_party, tmp
 
 
 @pytest.mark.parametrize("rel", ["tools/self_update.py", "tools/sharddiloco_harness.py",
-                                 "tools/sharddiloco_glm_contributor.py", "tools/ipfs_checkpoint.py"])
+                                 "tools/sharddiloco_glm_contributor.py", "tools/ipfs_checkpoint.py",
+                                 "tools/fetch_glm_base.py"])
 def test_a_release_missing_the_helper_still_updates_and_mines(rel, monkeypatch):
     """3.7.1 rule. run_glm_miner.py runs self_update only at startup, so the updater AND the contributor's import chain
     (contributor -> sharddiloco_harness; sharddiloco_glm_expert -> diloco_contributor -> ipfs_checkpoint) must load
-    without neurahash/miner_id.py: no header, never a crash. (The import gate still fails such a release.)"""
+    without neurahash/miner_id.py: no header, never a crash -- and so must fetch_glm_base (README install step 1).
+    (The import gate still fails such a release.)"""
     monkeypatch.delattr(neurahash, "miner_id", raising=False)
     monkeypatch.setitem(sys.modules, "neurahash.miner_id", None)            # `from neurahash import miner_id` fails
     with pytest.raises(ImportError):

@@ -78,6 +78,12 @@ import sharddiloco_harness as H                                  # noqa: E402  (
 from neurahash import diloco_merge as dm                         # noqa: E402  (numpy-only, no torch:
 # the W1 async primitives sd_pointer_decode / token telemetry. diloco_merge pulls ONLY numpy +
 # delta_codec, so this keeps the --help / coordinator-default-off paths torch-free and instant.)
+# X-Miner-Id (stdlib). GUARDED like sharddiloco_harness's: a release that shipped without neurahash/miner_id.py must
+# still mine and reach _maybe_self_update, the only updater a supervised miner runs after startup (3.7.1 rule).
+try:
+    from neurahash import miner_id as _miner_id                  # noqa: E402
+except ImportError:
+    _miner_id = None
 
 
 # ==================================================================== lane naming (RUNTIME override)
@@ -3649,8 +3655,12 @@ def fetch_accepted(lane, rnd, timeout=60.0, poll=0.25, campaign=None):
 # ============================================================ corpus-over-WAN auto sync (W6, DOWNLOAD)
 def _default_urlopen(url, timeout):
     """The real network opener behind data_http_get; injected out in tests so the streaming/ceiling logic
-    runs with a fake chunked response and ZERO network."""
-    return urllib.request.urlopen(url, timeout=timeout)
+    runs with a fake chunked response and ZERO network. X-Miner-Id goes only to a relay origin (a seed may be
+    HuggingFace) and never across a redirect."""
+    req = urllib.request.Request(url)
+    if _miner_id is not None:
+        _miner_id.attach(req, relay_only=True)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def _response_content_length(r):
@@ -6240,6 +6250,13 @@ def main(argv=None):
 
     use_glm_lane_names()
     key, wallet = _resolve_identity(args, log=_flush)
+    # X-Miner-Id (neurahash/miner_id.py): from here on every relay request carries THIS identity's id -- the wallet
+    # address (public), or for a keyed miner its public miner name; never the key itself. Neither pin raises.
+    if _miner_id is not None:
+        if wallet is not None:
+            _miner_id.pin_address(wallet.address)
+        else:
+            _miner_id.pin_name(args.miner or "miner0")
     slots = parse_slots(args.slots)
     L, E, i, _claim_src = resolve_claim(
         args, slots, log=_flush,

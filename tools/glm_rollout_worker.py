@@ -44,6 +44,7 @@ for _p in (_REPO, _HERE):
         sys.path.insert(0, _p)
 
 from glm_reward import score_rollout, extract_final_answer   # noqa: E402  (stdlib-only: re/json/math)
+from neurahash import miner_id as _miner_id                  # noqa: E402  (stdlib-only: X-Miner-Id, relay only)
 
 try:                                     # Protocol is documentation-only; never a runtime dependency
     from typing import Protocol
@@ -324,7 +325,8 @@ def _fetch_content_addressed(seeds, sha, timeout=30, lane=None):
         tried += 1
         url = base.rstrip("/") + "/o/" + sha
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
+            req = _miner_id.attach(urllib.request.Request(url), relay_only=True)   # a seed may be HuggingFace
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 body = r.read()
         except Exception:                                    # noqa: BLE001 -- try the next seed
             continue
@@ -613,6 +615,7 @@ def run_worker(args, *, lane=None, backend=None, sign_fn=None, miner=None, tasks
         lane = make_lane(args.url, getattr(args, "token", "") or "")
     if sign_fn is None:
         _acct, sign_fn, miner = make_wallet_signer(getattr(args, "wallet_file", None), log=log)
+        _miner_id.pin_address(_acct.address)     # X-Miner-Id: this wallet's public address, before any lane request
     elif miner is None:
         miner = getattr(args, "miner", None) or "glm-anon"
 

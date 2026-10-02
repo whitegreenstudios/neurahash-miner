@@ -345,7 +345,9 @@ def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_a
         # and verifier can never drift. No key -> the record stays unsigned (pre-GAP1, back-compat). The
         # record is signed ONCE here; the identical signed bytes are replicated to every store below.
         _acct = _miner_account()
+        from neurahash import miner_id as _miner_id               # X-Miner-Id on the registry PUT(s) below
         if _acct is not None:
+            _miner_id.pin_address(_acct.address)                   # the identity that signs this record
             from neura_l1.signing import sign_bytes
             from neurahash.diloco_merge import contrib_canonical_message
             _msg = contrib_canonical_message(cid, base_round_i, contributor, val_before, val_after)
@@ -360,8 +362,8 @@ def publish_delta(delta_path, contributor, base_round, *, val_before=None, val_a
         multi = len(store_urls) > 1
         n_ok = 0
         for _store in store_urls:
-            _req = _url.Request(f"{_store}/o/{h}", data=body, method="PUT",
-                                headers={"X-Auth": registry_token, "X-Name": f"contrib-{contributor}"})
+            _req = _miner_id.attach(_url.Request(f"{_store}/o/{h}", data=body, method="PUT",
+                                                 headers={"X-Auth": registry_token, "X-Name": f"contrib-{contributor}"}))
             _label = f"{_store}/o/{h} (contrib-{contributor})"
 
             def _put_once(req=_req):

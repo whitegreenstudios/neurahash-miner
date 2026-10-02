@@ -20,9 +20,16 @@ import of tools.ipfs_checkpoint only when an ipfs: seed with a cid is actually t
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 import urllib.request
+
+# Repo root on sys.path: loaded as a bare module (`import bundle_pointer`), only tools/ may be there.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from neurahash import miner_id as _miner_id    # noqa: E402  (stdlib only: X-Miner-Id to the VPS seed only)
 
 BUNDLE_KIND = "bundle_canonical"
 DEFAULT_VPS = "http://47.84.93.96:8710"          # VPS content-store; served BY sha256 at /o/<sha>
@@ -150,7 +157,7 @@ def verified_bundle_record(signed_log, expected_coord_address):
 
 
 def _http_get(url, timeout):
-    req = urllib.request.Request(url, headers={"User-Agent": "neurahash-bundle/1"})
+    req = _miner_id.attach(urllib.request.Request(url, headers={"User-Agent": "neurahash-bundle/1"}), relay_only=True)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 

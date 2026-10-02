@@ -58,6 +58,12 @@ for _p in (_REPO, _HERE):
 from neurahash.model import MoELM, expert_keys, make_examples, VOCAB, V  # noqa: E402
 from neurahash.diloco_merge import contrib_canonical_message              # noqa: E402
 from neurahash.diloco_merge import SD_PTR_PUBLISHED_AT                    # noqa: E402  (#160 publish stamp)
+# X-Miner-Id on every lane request. GUARDED: run_glm_miner.py runs self_update only at startup, so a release that
+# shipped without neurahash/miner_id.py must still mine and reach the contributor's in-process updater (3.7.1 rule).
+try:
+    from neurahash import miner_id as _miner_id                            # noqa: E402
+except ImportError:
+    _miner_id = None
 
 # TRUNK = the replicated small shared params (matches tools/diloco_contributor.SHARD_TRUNK_KEYS and
 # neurahash.model.forward_offline). Router (Wr, br) is UNUSED under offline routing.
@@ -231,6 +237,8 @@ class ContentLane:
         self.retries = retries
         self.backoff = backoff
         self._inflight = None       # the response currently being read; see close_inflight()
+        if _miner_id is not None:
+            _miner_id.register_relay(self.base)     # a lane IS a relay: relay_only call sites may send it X-Miner-Id
 
     def _request(self, req):
         """One urlopen with retry-on-transient-fault -- the resilience a WAN client needs. A 4xx (e.g.
@@ -258,7 +266,10 @@ class ContentLane:
             raise last
 
     def _get(self, path):
-        return self._request(self.base + path)
+        req = urllib.request.Request(self.base + path)
+        if _miner_id is not None:
+            _miner_id.attach(req)                   # unredirected: a 302 to the relay's cold tier never carries it
+        return self._request(req)
 
     def health(self):
         return json.loads(self._get("/health").decode())
@@ -294,6 +305,8 @@ class ContentLane:
     def put_blob(self, body, name=None):
         cid = cid_of(body)
         req = urllib.request.Request(self.base + "/o/" + cid, data=body, method="PUT")
+        if _miner_id is not None:
+            _miner_id.attach(req)
         if self.token:
             req.add_header("X-Auth", self.token)
         if name:

@@ -78,6 +78,12 @@ if REPO not in sys.path:
 
 from neura_l1.signing import recover_bytes            # secp256k1 ecrecover (real crypto, reused)
 from neurahash.canon import _canon                    # deterministic canonical bytes (sorted-key JSON)
+# X-Miner-Id -- to the VPS mirror only, never GitHub/HF. GUARDED: the updater must start even if a release shipped
+# without neurahash/miner_id.py, or no miner could update its way out of that release (3.7.1, but worse).
+try:
+    from neurahash import miner_id as _miner_id
+except ImportError:
+    _miner_id = None
 
 # ===========================================================================================
 #  PINNED RELEASE PUBLIC KEY
@@ -333,6 +339,8 @@ def _default_fetch(url, timeout=15):
     if not (low.startswith("https://") or (low.startswith("http://") and u in _ALLOWED_HTTP_URLS)):
         raise ValueError(f"refusing to fetch manifest over non-HTTPS url: {url!r}")
     req = urllib.request.Request(u, headers={"User-Agent": "neurahash-miner-selfupdate"})
+    if _miner_id is not None:
+        _miner_id.attach(req, relay_only=True)
     deadline = time.monotonic() + float(timeout)
     with urllib.request.urlopen(req, timeout=timeout) as resp:   # noqa: S310 (scheme checked above)
         chunks, total = [], 0

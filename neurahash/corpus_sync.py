@@ -44,6 +44,8 @@ import os
 import urllib.error
 import urllib.request
 
+from neurahash import miner_id as _miner_id   # stdlib only: X-Miner-Id on every content-store GET
+
 __all__ = [
     "CorpusSyncError", "StoreUnreachable", "HashMismatch",
     "store_url_from_env", "fetch_manifest", "sync_corpus", "SyncResult",
@@ -112,7 +114,7 @@ def _http_get(url, timeout):
         outage so the caller can tell them apart if it wants),
       * anything else (connection refused, DNS, timeout, 5xx) -> ``StoreUnreachable``.
     """
-    req = urllib.request.Request(url, method="GET")
+    req = _miner_id.attach(urllib.request.Request(url, method="GET"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()

@@ -33,6 +33,12 @@ import time
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # must precede the huggingface_hub import
 os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
 
+# Repo root on sys.path: run by path (run_glm_miner.py starts it with cwd=tools/) only tools/ is there.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from neurahash import miner_id as _miner_id    # noqa: E402  (stdlib only: X-Miner-Id on the lane config GET)
+
 REPO = "whitegreenstudios888/neurahash-data"
 PREFIX = "glm47_pieces_100mb"
 
@@ -201,8 +207,8 @@ def main():
         import urllib.request
         cdir = os.path.join(args.dest, "config")
         os.makedirs(cdir, exist_ok=True)
-        with urllib.request.urlopen("%s/o/%s" % (args.lane.rstrip("/"), args.config_cid),
-                                    timeout=120) as r:
+        req = _miner_id.attach(urllib.request.Request("%s/o/%s" % (args.lane.rstrip("/"), args.config_cid)))
+        with urllib.request.urlopen(req, timeout=120) as r:
             cb = r.read()
         got = hashlib.sha256(cb).hexdigest()
         if got != args.config_cid:

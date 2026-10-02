@@ -26,10 +26,27 @@ import os
 import shutil
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# X-Miner-Id to content stores, never to gateways. Repo root on sys.path: loaded as a bare module or by file path,
+# only tools/ may be there. GUARDED: this module is on the contributor's import chain (sharddiloco_glm_expert ->
+# diloco_contributor), so a release that shipped without neurahash/miner_id.py must still load it (3.7.1 rule).
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+try:
+    from neurahash import miner_id as _miner_id    # noqa: E402
+except ImportError:
+    _miner_id = None
+
+
+def _with_miner_id(req, relay_only=False):
+    """X-Miner-Id on urllib Request `req`, unredirected (neurahash/miner_id.attach); a no-op without the helper."""
+    return req if _miner_id is None else _miner_id.attach(req, relay_only=relay_only)
 
 # Public HTTP gateways, fastest-first by the 2026-07-03 measurement. A miner tries them in order; any
 # one serving the CID is sufficient (they are interchangeable — the CID pins the exact bytes).
@@ -824,7 +841,8 @@ def write_tracker(path, round_no, checkpoint_cid, peers=None, extra=None):
 def read_tracker(url_or_path, timeout=15):
     """Read a tracker doc from an HTTP(S) URL or a local path."""
     if url_or_path.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url_or_path, timeout=timeout) as r:
+        req = _with_miner_id(urllib.request.Request(url_or_path), relay_only=True)   # any mirror
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     with open(url_or_path) as f:
         return json.load(f)
@@ -838,12 +856,14 @@ def _store_get_named(store_url, name, timeout=15):
     if not store_url:
         return None
     try:
-        with urllib.request.urlopen(f"{store_url}/manifest", timeout=timeout) as r:
+        req = _with_miner_id(urllib.request.Request(f"{store_url}/manifest"))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             manifest = json.loads(r.read().decode())
         sha = (manifest.get(name) or {}).get("sha256")
         if not sha:
             return None
-        with urllib.request.urlopen(f"{store_url}/o/{sha}", timeout=timeout) as r:
+        req = _with_miner_id(urllib.request.Request(f"{store_url}/o/{sha}"))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
     except Exception:                                          # noqa: BLE001 — store down / name absent -> None
         return None
@@ -912,8 +932,8 @@ def announce_pin(registry_url, cid, peer_id, token=None, ts=None, timeout=None, 
     rec = {"cid": cid, "peer_id": peer_id, "ts": int(ts if ts is not None else time.time())}
     body = json.dumps(rec).encode()
     h = hashlib.sha256(body).hexdigest()
-    req = urllib.request.Request(f"{registry_url}/o/{h}", data=body, method="PUT",
-                                 headers={"X-Auth": token, "X-Name": f"pinner-{peer_id}"})
+    req = _with_miner_id(urllib.request.Request(f"{registry_url}/o/{h}", data=body, method="PUT",
+                                                headers={"X-Auth": token, "X-Name": f"pinner-{peer_id}"}))
     t = PUT_TIMEOUT if timeout is None else timeout
     _put_retry(lambda: urllib.request.urlopen(req, timeout=t).read(),
                label=f"{registry_url}/o/{h} (pinner-{peer_id})", retries=retries)
@@ -952,7 +972,8 @@ def known_pinners(registry_url, cid, max_age_s=3600, timeout=30):
     if not registry_url:
         return []
     try:
-        with urllib.request.urlopen(f"{registry_url}/manifest", timeout=timeout) as r:
+        req = _with_miner_id(urllib.request.Request(f"{registry_url}/manifest"))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             manifest = json.loads(r.read().decode())
     except Exception:                                          # noqa: BLE001 — registry down -> no known pinners
         return []
@@ -965,7 +986,8 @@ def known_pinners(registry_url, cid, max_age_s=3600, timeout=30):
         if not sha:
             continue
         try:
-            with urllib.request.urlopen(f"{registry_url}/o/{sha}", timeout=timeout) as r:
+            req = _with_miner_id(urllib.request.Request(f"{registry_url}/o/{sha}"))
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 rec = json.loads(r.read().decode())
         except Exception:                                      # noqa: BLE001 — skip an unreadable record
             continue

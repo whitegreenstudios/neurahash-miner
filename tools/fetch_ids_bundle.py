@@ -24,9 +24,15 @@ import urllib.request
 
 import numpy as np
 
+# Repo root on sys.path: run by path, only tools/ is there.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from neurahash import miner_id as _miner_id    # noqa: E402  (stdlib only: X-Miner-Id on every lane GET)
+
 
 def _get(url, timeout=120):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    with urllib.request.urlopen(_miner_id.attach(urllib.request.Request(url)), timeout=timeout) as r:
         return r.read()
 
 

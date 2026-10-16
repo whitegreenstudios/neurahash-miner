@@ -34,6 +34,16 @@ else runs (or that you run from the full node package).
 
 ---
 
+## GLM training node — engineering trial (`glm-node/`, 2026-10-15)
+
+A separate, self-contained folder for running one **node of a GLM-4.7-Flash DiLoCo training run** together with
+the operator's own nodes, over the internet (relay + P2P through TURN). It is an **engineering trial, not a paid
+lane**: nothing is minted or credited, and runs are scheduled with the operator. It is **not** part of the miner's
+signed auto-update (`release.json` / `VERSION` are unchanged), so installing or ignoring it does not change the
+miner. Requirements: an NVIDIA GPU with 8 GB+ (RTX 3070 / 4060 class), 16 GB+ RAM, ~75 GB on an NVMe SSD.
+Start with `python glm-node/node_selfcheck.py`, then follow **[glm-node/README.md](glm-node/README.md)**
+(problems: [glm-node/TROUBLESHOOTING.md](glm-node/TROUBLESHOOTING.md)).
+
 ## ⚠️ Honest status — read this before you rely on it
 
 - **This is the MINER CLIENT only.** It trains its assigned expert slot and publishes signed

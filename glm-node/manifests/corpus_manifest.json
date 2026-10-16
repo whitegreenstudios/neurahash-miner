@@ -1,0 +1,187 @@
+{
+ "what": "pinned facts of the glm-node training corpus. The authoritative copy is the constants block of glm-node/fetch_corpus.py; this file is its `--print-manifest` output. The corpus itself is NOT distributed: fetch_corpus.py --rebuild makes it from the public sources below (each user downloads them from their owners), or --from-file / --from-url takes an operator's copy; every mode ends with the sha256 + row-count check.",
+ "corpus": {
+  "name": "e5_scimc_train.jsonl",
+  "sha256": "f9b00e91e50d9eea668e6e520d1b0ba5e1228fa5911de7cb4b4b35520fbf85da",
+  "rows": 19792,
+  "bytes": 10508492
+ },
+ "tokenizer": {
+  "repo": "zai-org/GLM-4.7-Flash",
+  "revision": "7dd20894a642a0aa287e9827cb1a1f7f91386b67",
+  "files": {
+   "config.json": "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb",
+   "tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+   "tokenizer_config.json": "31a173e2797ddc8b72ac996803513e627fc28d7aad02cfcce321a431d865c86d"
+  }
+ },
+ "build": {
+  "sciq_shuffle_seed": 20260815,
+  "purge_ngram_n": 8,
+  "prompt": "Question: <question>\nAnswer:",
+  "completion": " <gold choice>",
+  "row_keys": [
+   "id",
+   "source",
+   "answerKey",
+   "gold_idx",
+   "question",
+   "gold_text",
+   "prompt",
+   "completion",
+   "ids",
+   "n_ctx",
+   "n_cont"
+  ],
+  "writer": "json.dumps(row) + \"\\n\", UTF-8, LF"
+ },
+ "sources": [
+  {
+   "key": "arc_easy_train",
+   "use": "corpus",
+   "repo": "allenai/ai2_arc",
+   "revision": "210d026faf9955653af8916fad021475a3f00453",
+   "path": "ARC-Easy/train-00000-of-00001.parquet",
+   "rows": 2251,
+   "bytes": 330598,
+   "sha256": "b315db8a4be597dc7daa50a4e70d48dd7c990c32085629e6ccd8c926beaa80b5",
+   "licence": "cc-by-sa-4.0"
+  },
+  {
+   "key": "arc_challenge_train",
+   "use": "corpus",
+   "repo": "allenai/ai2_arc",
+   "revision": "210d026faf9955653af8916fad021475a3f00453",
+   "path": "ARC-Challenge/train-00000-of-00001.parquet",
+   "rows": 1119,
+   "bytes": 189909,
+   "sha256": "e488c1587ffdcfc8443f916c53488a95cd471c5790e0746c6bfe4cecf20962cb",
+   "licence": "cc-by-sa-4.0"
+  },
+  {
+   "key": "openbookqa_train",
+   "use": "corpus",
+   "repo": "allenai/openbookqa",
+   "revision": "388097ea7776314e93a529163e0fea805b8a6454",
+   "path": "main/train-00000-of-00001.parquet",
+   "rows": 4957,
+   "bytes": 495845,
+   "sha256": "98148f8a54e62eb862346a75192d5fb824d6cbb68f2f59aecd793d39ecb5cd8b",
+   "licence": "unknown"
+  },
+  {
+   "key": "sciq_train",
+   "use": "corpus",
+   "repo": "allenai/sciq",
+   "revision": "2c94ad3e1aafab77146f384e23536f97a4849815",
+   "path": "data/train-00000-of-00001.parquet",
+   "rows": 11679,
+   "bytes": 3993099,
+   "sha256": "19644360954006d06e9ad3df07bddb34f8535c081b831d48f604603c713ac167",
+   "licence": "cc-by-nc-3.0"
+  },
+  {
+   "key": "arc_easy_test",
+   "use": "purge",
+   "repo": "allenai/ai2_arc",
+   "revision": "210d026faf9955653af8916fad021475a3f00453",
+   "path": "ARC-Easy/test-00000-of-00001.parquet",
+   "rows": 2376,
+   "bytes": 346257,
+   "sha256": "4160597d618ae851c7eb04e281574f3f654776216ac6b6641588d64527b47177",
+   "licence": "cc-by-sa-4.0"
+  },
+  {
+   "key": "arc_challenge_test",
+   "use": "purge",
+   "repo": "allenai/ai2_arc",
+   "revision": "210d026faf9955653af8916fad021475a3f00453",
+   "path": "ARC-Challenge/test-00000-of-00001.parquet",
+   "rows": 1172,
+   "bytes": 203808,
+   "sha256": "62f03257e737aed263f55c6abf87c7bb0028a44a6bdd2a26eb1279eb42c1d1e9",
+   "licence": "cc-by-sa-4.0"
+  },
+  {
+   "key": "hellaswag_val",
+   "use": "purge",
+   "repo": "Rowan/hellaswag",
+   "revision": "218ec52e09a7e7462a5400043bb9a69a41d06b76",
+   "path": "data/validation-00000-of-00001.parquet",
+   "rows": 10042,
+   "bytes": 6315951,
+   "sha256": "899813071e1e95efafec90f856e1987d2150fa4d020fc005df6962c259f660cd",
+   "licence": "MIT (card text)"
+  },
+  {
+   "key": "winogrande_dev",
+   "use": "purge",
+   "repo": "allenai/winogrande",
+   "revision": "01e74176c63542e6b0bcb004dcdea22d94fb67b5",
+   "path": "winogrande_xl/validation-00000-of-00001.parquet",
+   "rows": 1267,
+   "bytes": 85928,
+   "sha256": "f9d914d1818c0aba98cabdf8af2bc4bd943c462b9c5e7062647e05c2ce3315d1",
+   "licence": "not stated in the card"
+  },
+  {
+   "key": "boolq_val",
+   "use": "purge",
+   "repo": "google/boolq",
+   "revision": "35b264d03638db9f4ce671b711558bf7ff0f80d5",
+   "path": "data/validation-00000-of-00001.parquet",
+   "rows": 3270,
+   "bytes": 1257630,
+   "sha256": "52355d11524b4b874a9b9dcc278feb10f672d52c4f4eff9872e695ede59820f8",
+   "licence": "cc-by-sa-3.0"
+  },
+  {
+   "key": "piqa_val",
+   "use": "purge",
+   "repo": "baber/piqa",
+   "revision": "142f6d7367fd9877f0fb3b5734ea6a545f54cdd1",
+   "path": "piqa_validation.parquet",
+   "rows": 1838,
+   "bytes": 299694,
+   "sha256": "2b17ee1215b1ceb2ddabf4c90a05c5a8b833bef9d207960f57d111c43a2080f3",
+   "licence": "no dataset card at this revision"
+  }
+ ],
+ "expected_counts": {
+  "pool_kept": {
+   "arc_challenge_train": 1119,
+   "arc_easy_train": 2251,
+   "openbookqa_train": 4957,
+   "sciq_train": 11643
+  },
+  "pool_dropped": {
+   "sciq_train": 36
+  },
+  "index_exact_questions": 19896,
+  "index_distinct_ngrams": 396989,
+  "purged_by_source": {
+   "arc_challenge_train": 51,
+   "arc_easy_train": 91,
+   "openbookqa_train": 15,
+   "sciq_train": 21
+  },
+  "kept_by_source": {
+   "arc_challenge_train": 1068,
+   "arc_easy_train": 2160,
+   "openbookqa_train": 4942,
+   "sciq_train": 11622
+  },
+  "text_sha256": "a79389822ee58bad4c314588b0462ece8814b742706ef759111e8bceba4b8f59"
+ },
+ "original_build": {
+  "date": "2026-08-15",
+  "libraries": {
+   "datasets": "4.4.1",
+   "huggingface_hub": "1.10.2",
+   "pyarrow": "22.0.0",
+   "tokenizers": "0.22.1",
+   "transformers": "5.8.1"
+  },
+  "loader": "datasets.load_dataset (fetch_corpus.py reads the same parquet files with pyarrow and reproduces the sha256)"
+ }
+}

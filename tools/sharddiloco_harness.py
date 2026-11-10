@@ -230,9 +230,15 @@ class ContentLane:
     sha256, so a node gets EXACTLY the committed bytes or a 404 (D1). Everything here is OUTBOUND from
     the caller: PUT the delta+record, GET the pointer/state. The only listener is the store (VPS)."""
 
-    def __init__(self, base_url, token="", timeout=30, retries=6, backoff=0.25):
+    def __init__(self, base_url, token="", timeout=30, retries=6, backoff=0.25, account=None, store_id=None):
         self.base = base_url.rstrip("/")
         self.token = token or ""
+        # SIGNED PUT (docs/STORE_AUTH_DESIGN.md, neurahash/store_auth.py): pass the miner's existing
+        # wallet account (a neura_l1.signing account) to authorise PUTs as its address IN ADDITION to
+        # (never instead of) the token, so a store running CONTENT_SIGNED_PUT=1 can attribute writes.
+        # account=None keeps the v1 token-only path byte-identical. store_id=None -> nh-store-put/1.
+        self.account = account
+        self.store_id = store_id
         self.timeout = timeout
         self.retries = retries
         self.backoff = backoff
@@ -309,6 +315,13 @@ class ContentLane:
             _miner_id.attach(req)
         if self.token:
             req.add_header("X-Auth", self.token)
+        if self.account is not None:
+            # Headers merged ALONGSIDE X-Auth while v1 token-only clients are live; a store with
+            # CONTENT_SIGNED_PUT off ignores them (the byte-identical guarantee, test_store_auth).
+            from neurahash import store_auth      # lazy: eth_account only loaded when actually signing
+            for _k, _v in store_auth.sign_put(self.account, cid, name=name, store_id=self.store_id).items():
+                if _k != "X-Name":                # X-Name is added exactly once, below
+                    req.add_header(_k, _v)
         if name:
             req.add_header("X-Name", name)
         json.loads(self._request(req).decode())   # 201 body; raises on non-2xx

@@ -1233,7 +1233,7 @@ class _CoordFakeLane:
     def manifest(self):
         return dict(self.names)
 
-    def get_json(self, sha):
+    def get_json(self, sha, max_bytes=None):
         return self.recs[sha]
 
 
@@ -1831,7 +1831,7 @@ class _FoldLane:
     def manifest(self):
         return dict(self.names)
 
-    def get_json(self, sha):
+    def get_json(self, sha, max_bytes=None):
         return self._recs[sha]
 
 
@@ -1968,6 +1968,37 @@ class TestF3EveryFoldedCoordinateMustBeAdvertised:
         assert N.replica_root_ok(host, rec, folded=set()) is True
         assert N.replica_root_ok(host, rec, folded={1}) is False
 
+    def test_the_refusal_names_the_coordinate_that_vetoed_it(self):
+        """Live 2026-10-22, five hours of `frontier held at event 286` while the chain ran to 304.
+        Accepted event 287 carried ZERO accepted rows (nothing was credited) yet still advertised one
+        coordinate, `1_6`, which the 4060 holds; its local copy of 1_6 is not the advertised root, so
+        the fold verifies, fails and rolls back. That decision is correct and fail-closed -- an empty
+        record can never fix a divergent copy -- but the ONLY thing the log said compared
+        `model_root`, which is not the comparison `replica_root_ok` performs on a shard-claim replica.
+        The refusal has to name the coordinate and both roots, or the next one of these costs hours."""
+        host = _FoldHost(self._COORDS)
+        rec = dict(accepted=[], slot_roots={"1_1": "deadbeef" * 8}, model_root="99a7f1be4d97")
+        out = {}
+        assert N.replica_root_ok(host, rec, folded=set(), out=out) is False
+        assert out["coord"] == "1_1", out
+        assert out["want"] == "deadbeef" * 8, out
+        assert out["local"] == N.slot_root(host, 1), out
+
+        lines = []
+        lane = _FoldLane({}, records={1: rec})
+        ok, reason, _rej = N._fold_accepted_checked(host, lane, rec, None, 0,
+                                                    log=lambda *a: lines.append(" ".join(map(str, a))))
+        assert (ok, reason) == (False, "lineage"), "the fail-closed decision must not move"
+        joined = "\n".join(lines)
+        assert "1_1" in joined, joined
+        assert "deadbeef" in joined, "the advertised root must be printed, not just asserted"
+
+    def test_the_lineage_skip_no_longer_blames_the_global_model_root(self):
+        """Source-level, because the misleading sentence lives in the deltas loop, not in the fold: it
+        is what sent this investigation down the global-root path for hours."""
+        src = open(N.__file__, encoding="utf-8").read()
+        assert "local model_root != its advertised root" not in src
+
 
 class TestF5aStreakOnlyCountsVerdictsOnOurOwnWork:
     """F5a: the sweep advanced on rejects it never earned. `reject_streak` incremented for ANY event whose
@@ -2003,8 +2034,10 @@ class TestF5aStreakOnlyCountsVerdictsOnOurOwnWork:
         import inspect
         assert "event_judged_us(rec, last_pub_base_event)" in \
             inspect.getsource(N.fold_streak_update)
-        assert "fold_streak_update(_folded" in inspect.getsource(N._run_async), \
+        assert "_apply_fold_verdicts(_folded" in inspect.getsource(N._run_async), \
             "the loop must route its sweep through the helper"
+        assert "fold_streak_update(_infer" in inspect.getsource(N._apply_fold_verdicts), \
+            "the new fold layer must delegate to the single gated helper"
         assert "last_pub_base_event = int(base_event)" in inspect.getsource(N._run_async), \
             "the publish must record its base_event"
         assert N.fold_streak_update(self._HIST, (1, 3), "me", None, 0) == 0, \
@@ -2143,7 +2176,10 @@ class _CountingLane:
         self.manifest_calls += 1
         return dict(self.names)
 
-    def get_json(self, sha):
+    def get_json(self, sha, max_bytes=None):
+        # `max_bytes` is part of the real ContentLane interface since the READ BUDGETS work
+        # (tools/sharddiloco_harness.py:460): read_pointer/get_json_named pass it, so a stub without it
+        # raises TypeError inside the REAL loop and changes the call counts these tests assert on.
         self.fetched.append(sha)
         return dict(self._recs[sha])
 
@@ -3460,7 +3496,7 @@ class TestAMinerRefusesAnUnscopedLane:
         asrc = inspect.getsource(N._run_async)
         assert "pointer_campaign_id(ptr)" in asrc
         assert "campaign CHANGED on the lane" in asrc
-        i_guard = asrc.index("_ptr_camp != host_campaign_id(host)")
+        i_guard = asrc.index("_ptr_camp != _our_camp")
         assert i_guard < asrc.index("async_publish_name("), "check BEFORE publishing, not after"
         assert "return RC_NO_CAMPAIGN" in asrc[i_guard:i_guard + 800]
 
@@ -3845,7 +3881,7 @@ class _MiniLane:
     def manifest(self):
         return {n: {"sha256": c} for n, c in self._names.items()}
 
-    def get_json(self, cid):
+    def get_json(self, cid, max_bytes=None):
         return json.loads(self._blobs[cid].decode())
 
     def get_delta(self, cid):
@@ -4092,7 +4128,7 @@ class _StallingLane(_MiniLane):
         self._maybe_stall()
         return super().manifest()
 
-    def get_json(self, cid):
+    def get_json(self, cid, max_bytes=None):
         self._maybe_stall()
         return super().get_json(cid)
 
@@ -4653,7 +4689,7 @@ class _CostLane(_CoordFakeLane):
         self.clk.t += self.MANIFEST_S
         return super().manifest()
 
-    def get_json(self, sha):
+    def get_json(self, sha, max_bytes=None):
         self.clk.t += self.GET_JSON_S
         return super().get_json(sha)
 
@@ -4878,8 +4914,15 @@ class TestNothingToFoldIsNotAStall:
         import re
         src = inspect.getsource(N._run_async)
         calls = re.findall(r"advance_claim\(host, lane, claim_coords.*?\)\n", src, re.S)
-        assert len(calls) == 2, calls
-        assert all("man=man)" in c for c in calls), \
-            "both advance_claim call sites must pass the manifest"
+        # 3 as of 2026-10-21: the two plateau walks plus the BOOT walk, which walks off a coordinate
+        # whose seed snapshot exists but cannot be applied (see tests/test_glm_seed_boot_claim.py).
+        # The count is asserted rather than relaxed because the point of this test is that NO call site
+        # is allowed to read its own manifest; the boot site had to hoist its read to satisfy that.
+        assert len(calls) == 3, calls
+        assert all("man=man" in c for c in calls), (
+            "every advance_claim call site must pass the manifest -- the boot site passes it first "
+            "because its walk call carries a reason= kwarg after it")
+        assert "boot_claim_catchup(" in src and "man=man)" in src, \
+            "the boot check must be called from the loop, not just exist as a helper"
         walk = inspect.getsource(N.advance_claim)
         assert "man=man)" in walk, "advance_claim must hand it to resume_to_root"

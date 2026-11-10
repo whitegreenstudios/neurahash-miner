@@ -396,12 +396,34 @@ class TestTheRungSurvivesARestart:
 
     def test_a_save_WITHOUT_the_ladder_would_drop_it_so_every_call_site_passes_it(self):
         """save() rewrites the whole file. If any call site omitted `ladder=`, the next process
-        would get the campaign dose on a layer that had already exhausted the backoff."""
+        would get the campaign dose on a layer that had already exhausted the backoff.
+
+        Parsed with AST, not line matching. The previous version scanned physical lines for
+        "claim_state.save(" and required "ladder=dose_ladder" on the SAME line, so a call wrapped
+        across two lines by the 100-column style read as a missing ladder and the test failed on a
+        file that passes the ladder correctly -- contributor:6347-6348. Formatting was deciding a
+        safety property. Behaviour is what must be asserted here."""
+        import ast
         import inspect
-        src = inspect.getsource(N._run_async)
-        saves = [ln for ln in src.splitlines() if "claim_state.save(" in ln]
-        assert len(saves) >= 4, saves
-        assert all("ladder=dose_ladder" in ln for ln in saves), saves
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(N._run_async)))
+        saves = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "save" and isinstance(n.func.value, ast.Name)
+                 and n.func.value.id == "claim_state"]
+        assert len(saves) >= 4, "only %d claim_state.save call sites found -- did a rename hide one?" % len(saves)
+        missing = []
+        for call in saves:
+            ladder = [k for k in call.keywords if k.arg == "ladder"]
+            if not ladder:
+                missing.append((call.lineno, "no ladder= keyword at all"))
+            elif not (isinstance(ladder[0].value, ast.Name)
+                      and ladder[0].value.id == "dose_ladder"):
+                v = ladder[0].value
+                missing.append((call.lineno, "ladder= is not the campaign's dose_ladder but %s"
+                                % getattr(v, "id", type(v).__name__)))
+        assert not missing, ("call sites that would drop the dose ladder across a restart: %s"
+                             % missing)
 
 
 # ============================================================ 5. the real dose, no stub at all

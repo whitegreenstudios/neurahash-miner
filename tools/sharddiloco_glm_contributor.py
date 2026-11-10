@@ -113,6 +113,13 @@ RC_DATA_UNVERIFIED = 9              # exit code: a record file was neither local
 RC_DOMAINS_MISMATCH = 10            # exit code: our --domains list disagrees with the coordinator's (C6)
 RC_NO_CAMPAIGN = 11                 # exit code: the pointer advertises no campaign_id (see campaign_refusal)
 RC_TRUNK_FREE_SYNC = 12             # exit code: trunk-free base on a v1 SYNC lane (sync trains with forwards)
+# Unit E v1 (credit-gated publishing, E.2): the liveness backstop. A credit-gating coordinator names
+# the miners it credits to publish in the pointer's `next_up` roster; an uncredited miner holds and
+# keeps training rather than flooding the lane. This is the cap on that hold -- once a miner has gone
+# CREDIT_WAIT_S_DEFAULT seconds without publishing it publishes anyway, so a dead or slow coordinator
+# can never freeze it (the 3 h stale-lane detector still covers a fully dead lane). Env override only.
+CREDIT_WAIT_ENV = "NEURAHASH_SD_CREDIT_WAIT_S"
+CREDIT_WAIT_S_DEFAULT = 1800.0
 # The optional `.pNNN` CORPUS PART suffix sits AFTER the (train|val) alternation deliberately. This
 # guard exists to make the coordinator's SECRET probe/heldout splits unnameable by a forged data
 # record, and anchoring the suffix last preserves that by construction: `ids_daily_probe.p000.npy`
@@ -4211,7 +4218,7 @@ class _CowSlots:
         return len(self._saved)
 
 
-def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
+def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, reseed=None):
     """Fold ONE coordinator accepted record, then VERIFY replica bit-exactness: our local model_root MUST
     equal the record's advertised model_root. That invariant is the whole reason model_root exists (see its
     docstring) -- a divergent local replay is caught IMMEDIATELY. Two fail-CLOSED outcomes stop a
@@ -4232,7 +4239,17 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
     time the fold is about to write it, instead of copying all of them up front. Byte-for-byte the
     same restore -- a slot that was never written is already its own pre-call state -- at O(slots
     this record moves) instead of O(residency), which at 60 resident coordinates was ~1.05 GiB copied
-    per folded record."""
+    per folded record.
+
+    LATCH RE-SEED (D1, owner-approved 2026-10-22, `reseed`): OPTIONAL, None -> byte-identical to the
+    behaviour above. When the post-fold check fails on a RESIDENT coordinate that this fold did NOT
+    move, `reseed(cow, coord_key, idx, advertised_root)` may bring that one coordinate to the
+    advertised root from this campaign's seed snapshot (see _latch_reseed_one for every condition it
+    refuses on). It writes THROUGH the copy-on-write shim, so if the re-check still fails the SAME
+    rollback restores the reseeded slot too -- the fail-closed exit is unchanged. A coordinate the fold
+    DID move is never reseeded: that mismatch is the F3 poison signature, not a stale resident copy.
+    Measured motivation: the 8 GB 4060 held `frontier held at event 286` for ~15 h because its resident
+    1_6 hashed 0ffb8fc8.. while record 287 (zero rows, folded=0) advertised the seed root c42919e7.."""
     cow = _CowSlots(host)
     rejected, skipped, folded = [], [], set()
     try:
@@ -4248,15 +4265,105 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None):
         raise
     if rejected:
         return False, "poison", rejected                          # caller handles rc8 (do not advance)
-    if not replica_root_ok(host, rec, folded=folded):
+    _rl = {}
+    root_ok = replica_root_ok(host, rec, folded=folded, out=_rl)
+    if not root_ok and reseed is not None:
+        _moved = {int(j) for j in (folded or ())}
+        _done_keys = set()
+        while not root_ok and _rl.get("coord") is not None:
+            _key = str(_rl["coord"])
+            if _key in _done_keys:
+                break                                             # already reseeded and STILL wrong
+            _L, _, _E = _key.partition("_")
+            try:
+                _idx = host.index_of(int(_L), int(_E))
+            except (TypeError, ValueError):
+                _idx = None
+            if _idx is None or int(_idx) in _moved:
+                break                                             # F3: a MOVED coordinate is never reseeded
+            if str(_rl["local"]) in _LATCH_VERIFIED_ROOTS.get((host_campaign_id(host), _key), ()):
+                # REVIEW FINDING 1 (2026-10-22): this exact copy was VERIFIED by an earlier accepted
+                # record in this process. A record that now advertises something else for a coordinate
+                # it does not move cannot be repaired by reverting a verified copy to the seed -- that
+                # is the forged-zero-row-record revert. Stay fail-closed, exactly as before D1.
+                if log is not None:
+                    log("[glm-contrib lineage] latch re-seed %s: refused -- this node's copy %.16s.. was "
+                        "verified by an earlier accepted record; only a never-verified copy is re-seeded"
+                        % (_key, str(_rl["local"])))
+                break
+            try:
+                _out = reseed(cow, _key, int(_idx), str(_rl["want"]))
+            except Exception as _ex:                              # noqa: BLE001 -- REVIEW FINDING 2
+                # A re-seed that RAISES (malformed manifest entry, a lane error the reader did not
+                # map) is a refusal, never a crash: fall through to the SAME rollback below, which
+                # also restores any half-written slot (every write went through `cow`).
+                if log is not None:
+                    log("[glm-contrib lineage] latch re-seed %s: raised %s (%s) -- treated as a refusal, "
+                        "rolling back" % (_key, type(_ex).__name__, str(_ex)[:80]))
+                _out = "error"
+            except BaseException:
+                cow.rollback()
+                raise
+            if _out != "ok":
+                break
+            _done_keys.add(_key)
+            if log is not None:
+                log("[glm-contrib lineage] LATCH RE-SEED: coordinate %s -- this node's copy was %.16s.., "
+                    "the record at event %s advertises %.16s.. and this campaign's seed manifest carries "
+                    "exactly that root; applied the hash-verified snapshot, re-checking the record."
+                    % (_key, str(_rl["local"]), rec.get("event"), str(_rl["want"])))
+            _rl = {}
+            root_ok = replica_root_ok(host, rec, folded=folded, out=_rl)
+    if not root_ok:
         cow.rollback()                                            # UNFOLD everything: off-lineage, fail-closed
+        if log is not None and _rl.get("coord") is not None:
+            log("[glm-contrib lineage] off-lineage: coordinate %s -- this node's copy is %.16s.., the "
+                "record at event %s advertises %.16s..; this fold moved %d coordinate(s), so this "
+                "record changed nothing here and cannot fix that copy."
+                % (_rl["coord"], str(_rl["local"]), rec.get("event"), str(_rl["want"]),
+                   len(folded or ())))
         return False, "lineage", []
+    _note_verified_roots(host, rec)
     return True, "ok", []
 
 
-def replica_root_ok(host, rec, folded=None):
+# D1 review finding 1: (campaign, coord_key) -> set of slot roots this process VERIFIED against an
+# accepted record. IN-PROCESS ONLY, and that is sufficient today because _run_async starts every process
+# at last_applied = 0, so every on-lineage state of a resident coordinate passes through a clean fold
+# (and is noted here) before any later record is met. If base + last_applied are ever PERSISTED across
+# restarts, this set must be persisted with them -- otherwise a forged zero-row record met first after a
+# restart can revert a verified copy to the seed (measured by the 2026-10-22 re-review).
+# Bounded by (advertised resident coordinates x distinct roots), i.e. at most one root per event. It
+# only ever makes a latch re-seed REFUSE; no other decision reads it.
+_LATCH_VERIFIED_ROOTS = {}
+
+
+def _note_verified_roots(host, rec):
+    """After a CLEAN verified fold, remember the root of every resident coordinate the record advertised:
+    those copies are on the coordinator's lineage and a later latch re-seed must never revert them."""
+    sr = rec.get("slot_roots")
+    if not isinstance(sr, dict):
+        return
+    camp = host_campaign_id(host)
+    for key, want in sr.items():
+        L, _, E = str(key).partition("_")
+        try:
+            idx = host.index_of(int(L), int(E))
+        except (TypeError, ValueError):
+            continue
+        if idx is not None:
+            _LATCH_VERIFIED_ROOTS.setdefault((camp, str(key)), set()).add(str(want))
+
+
+def replica_root_ok(host, rec, folded=None, out=None):
     """Did our local replay reproduce what the coordinator advertised? True also when there is nothing
     to check (a record with neither root, which the async coordinator never emits).
+
+    `out` (2026-10-22, ADDITIVE -- the decision is byte-identical with or without it): on the first
+    mismatch it carries `coord` / `want` / `local`, i.e. WHAT disagreed. A fail-closed guard that
+    refuses without naming the coordinate is undebuggable: the live lane held `frontier held at event
+    286` for hours while the chain reached 304, and the only clue printed compared `model_root`, which
+    is not the comparison this function performs.
 
     SHARD CLAIM: prefer the PER-COORDINATE roots. The global `model_root` is a hash over the whole slot
     list, so a replica can only ever match it if it holds the coordinator's EXACT slot set in the same
@@ -4278,7 +4385,7 @@ def replica_root_ok(host, rec, folded=None):
     (advertised-and-resident only), for callers that do not track it."""
     sr = rec.get("slot_roots")
     if isinstance(sr, dict) and sr:
-        advertised = {}                                    # resident slot idx -> advertised root
+        advertised = {}                                    # resident slot idx -> (root, coordinate key)
         for key, want in sr.items():
             L, _, E = str(key).partition("_")
             try:
@@ -4287,9 +4394,14 @@ def replica_root_ok(host, rec, folded=None):
                 continue                                   # unparseable key: not ours to judge
             if idx is None:
                 continue                                   # coordinate not resident here -> nothing to verify
-            advertised[int(idx)] = want
-        for idx, want in advertised.items():
-            if slot_root(host, idx) != str(want):
+            advertised[int(idx)] = (str(want), str(key))
+        for idx, (want, key) in advertised.items():
+            local = slot_root(host, idx)
+            if local != want:
+                if out is not None:                        # name the coordinate; this is NOT the global root
+                    out["coord"] = key
+                    out["want"] = want
+                    out["local"] = local
                 return False
         for idx in (folded or ()):
             if int(idx) not in advertised:
@@ -4807,6 +4919,278 @@ class ClaimState:
         return True
 
 
+SEED_MANIFEST_NAME_FMT = "sharddiloco/glm/seed/%s"
+SEED_CHUNK_MAX_B = 33_554_432          # content_store MAX_BODY; a chunk above it cannot exist
+
+
+def seed_manifest_name(campaign):
+    """Lane key of a campaign's SEED SNAPSHOT manifest: the per-coordinate weights of a campaign
+    that was SEEDED from a checkpoint rather than grown from the frozen base.
+
+    Why this family exists (2026-09-21). Seeding wrote weights the lane never carried, so a miner
+    claiming such a coordinate derives its root from the frozen base, disagrees with the coordinator
+    forever, and is dropped `wrong-lineage-slot-root` PRE-REGISTER -- which writes no record, so it
+    never finds out. Measured: 96 of 119 coordinates unreachable, fleet dead 8 h.
+    Design: docs/research/GLM_STALENESS_IMPL_SPEC_2026-09-19.md D.6. Publisher: tools/glm_seed_publish.py."""
+    return SEED_MANIFEST_NAME_FMT % (campaign or "")
+
+
+def _unpack_bf16(buf, shape):
+    """bf16 wire bytes -> fp32, the exact inverse of the publisher's truncating pack.
+
+    bf16 and NOT fp16 (which the D.6 spec named): read_slot returns the fp32 upcast of the model's
+    bf16 weights, so the top 16 bits carry everything -- measured lossless over all 1,123,024,896
+    values of the event-101 checkpoint. fp16 changes 197,674 of them, because the smallest nonzero
+    weight is 6.403e-10 and fp16's smallest normal is 6.1e-05; the root would never match and the
+    repair would fail silently in exactly the way the bug it repairs does."""
+    u = np.frombuffer(buf, dtype="<u2").astype(np.uint32) << np.uint32(16)
+    return u.view(np.float32).reshape(tuple(shape))
+
+
+def apply_seed_snapshot(host, lane, man, campaign, coord_key, own_idx, want_root, log=None,
+                        seed_mani=None):
+    """Bring ONE seeded coordinate up to the coordinator's state from the seed manifest.
+
+    Returns one of:
+      "ok"            -- written and the recomputed slot root MATCHES; safe to train
+      "absent"        -- this campaign published no snapshot for this coordinate
+      "missing-chunk" -- the manifest lists it but a chunk is gone (anchor GC / partial publish)
+      "timeout"       -- a chunk read hit the lane deadline: the READ did not complete, which is
+                         NOT evidence the bytes are gone (see _timeout). Retryable -- park it, do
+                         not go looking for GC damage.
+      "bad-chunk"     -- a chunk's bytes do not hash to the cid the manifest names
+      "root-mismatch" -- reassembled cleanly but the root still disagrees
+
+    Only "ok" may train. Every other outcome must read as UNREACHABLE, never as "empty": "empty"
+    means "the frozen base IS the coordinator's state", and for a seeded coordinate that is false --
+    treating it as empty is precisely the wrong conclusion that made miners burn GPUs on work that
+    could never be accepted."""
+    def _say(m):
+        if log:
+            log("[glm-contrib] seed-snapshot %s: %s" % (coord_key, m))
+    if seed_mani is not None:            # the caller already read (and judged) this manifest
+        mani = seed_mani
+    else:
+        try:
+            mani = lane.get_json_named(seed_manifest_name(campaign), man=man)
+        except Exception as e:                                       # noqa: BLE001
+            _say("manifest unreadable (%s)" % str(e)[:80])
+            return "absent"
+    if not isinstance(mani, dict):
+        return "absent"
+    coords = mani.get("coords") or {}
+    # KEY CONTRACT (2026-09-23, measured on the live lane). The only production caller,
+    # resume_to_root, passes the LINEAGE key "L_E" -- the coordinator's own slot_root_hist form --
+    # but both publishers (glm_seed_publish.py, the coordinator's auto-publish) write the manifest as
+    # "L:E". The lookup therefore missed on all 119 coordinates of campaign e2c4cb58fcfb41cc,
+    # returned "absent" without a word, and a miner concluded "the frozen base IS its state" and
+    # trained into a wrong-lineage wall for two days -- while every published snapshot carried
+    # exactly the root the coordinator wanted (119 of 119). Accept either separator.
+    entry = coords.get(coord_key)
+    if entry is None and isinstance(coord_key, str):
+        entry = coords.get(coord_key.replace("_", ":")) or coords.get(coord_key.replace(":", "_"))
+    if not isinstance(entry, dict) or not entry.get("chunks"):
+        if coords:
+            # A manifest that exists but lacks our coordinate is an anomaly on a seeded campaign;
+            # say so. A silent "absent" is exactly what hid the key mismatch above.
+            _say("manifest has no usable entry for this coordinate (%d coord(s), e.g. %s)"
+                 % (len(coords), ", ".join(sorted(coords)[:3])))
+        return "absent"
+    blob = b""
+
+    def _timeout(cid, e):
+        # A DEADLINE IS NOT EVIDENCE OF ABSENCE. The word "missing-chunk" is reserved above for
+        # "a chunk is gone (anchor GC / partial publish)", and 2026-10-21 measured how dangerous
+        # conflating them is: on (L1,E50) the last chunk of the manifest got 0.4 s of the 180.0 s
+        # budget and tripped the lane deadline, the generic handler said "missing-chunk", and the
+        # natural next move was to go inspect the anchor store for GC damage. It was not there --
+        # `tools/glm_seed_revalidate.py --coords 1:50 --verify 1` re-fetched all 5 chunks and
+        # hash-verified 18,874,368 B (root f4c212e74eef.., exit 0) minutes later. Report what we
+        # actually know: the READ did not complete. Callers park it (bounded, retryable) and must
+        # not blame the store.
+        _say("chunk %s.. hit the lane deadline (%s) -- the read did not complete; that is NOT proof "
+             "the chunk is gone" % (str(cid)[:12], str(e)[:60]))
+        return "timeout"
+
+    # LANE-API COMPATIBILITY, now STICKY (2026-10-21, second live hit on the same 4060). The
+    # fleet's signed 3.8.4 lane has no max_bytes kwarg, so the capped call raised TypeError and the
+    # uncapped retry fetched the bytes -- per CHUNK. Five chunks meant ten WAN round trips, and at
+    # the 4060's measured throughput that ate the entire 180.0 s catch-up budget before the last
+    # chunk could land. The wasted call is a property of the LANE, not of the chunk, so learn it
+    # once and stop paying for it. (The attribute is best-effort: a lane with __slots__ keeps the
+    # per-manifest local flag, which already removes 4 of the 5 wasted calls.)
+    _capped = not getattr(lane, "_nh_no_max_bytes", False)
+    _compat_said = False
+    for cid in entry["chunks"]:
+        try:
+            part = (lane.get_blob(cid, max_bytes=SEED_CHUNK_MAX_B) if _capped
+                    else lane.get_blob(cid))
+        except TypeError as e:
+            # LANE-API COMPATIBILITY (2026-10-21, measured on the live 4060 -- THE root cause of a
+            # 28-day livelock). The cap is an OPTIONAL kwarg: the fleet's signed 3.8.4 lane object
+            # is `ContentLane.get_blob(self, cid)` with no max_bytes at all (4060 clone HEAD
+            # 467647ae, tools/sharddiloco_harness.py:282 of that release), while a contributor
+            # staged in place calls it WITH the kwarg. The call raised TypeError, fell into the
+            # generic handler below, and reported the chunk "unreadable" -> "missing-chunk" ->
+            # seed state declared unreachable on EVERY seeded coordinate, forever. Every unit test
+            # of this path passed because every test double in tests/ accepts max_bytes: the fake
+            # was more permissive than production. The budget is a DoS guard, not a correctness
+            # property, so retry WITHOUT it and enforce the same cap on the bytes we get back.
+            _capped = False
+            try:
+                lane._nh_no_max_bytes = True
+            except AttributeError:                           # noqa: BLE001 - slotted lane object
+                pass
+            if not _compat_said:
+                _compat_said = True
+                _say("lane has no max_bytes kwarg (%s) -- reading UNCAPPED for this chunk and the "
+                     "rest of this manifest, so the wasted round trip is paid once, not once per "
+                     "chunk" % str(e)[:60])
+            try:
+                part = lane.get_blob(cid)
+            except CatchupTimeout as e2:
+                return _timeout(cid, e2)
+            except Exception as e2:                                      # noqa: BLE001
+                _say("chunk %s.. unreadable (%s)" % (str(cid)[:12], str(e2)[:60]))
+                return "missing-chunk"
+        except CatchupTimeout as e:
+            return _timeout(cid, e)
+        except Exception as e:                                       # noqa: BLE001
+            _say("chunk %s.. unreadable (%s)" % (str(cid)[:12], str(e)[:60]))
+            return "missing-chunk"
+        if not part:
+            _say("chunk %s.. missing" % str(cid)[:12])
+            return "missing-chunk"
+        if len(part) > SEED_CHUNK_MAX_B:
+            # Same budget the uncapped lane could not enforce for us. The sha256 check below also
+            # pins the bytes, but refusing an over-budget blob keeps the memory ceiling honest.
+            _say("chunk %s.. is %d B, over the %d B budget -- refusing"
+                 % (str(cid)[:12], len(part), SEED_CHUNK_MAX_B))
+            return "bad-chunk"
+        if hashlib.sha256(part).hexdigest() != str(cid):
+            _say("chunk %s.. does not hash to its cid -- refusing" % str(cid)[:12])
+            return "bad-chunk"
+        blob += part
+    try:
+        off, rebuilt = 0, {}
+        for k in entry.get("order") or ("down", "gate", "up"):
+            shp = tuple(entry["shapes"][k])
+            n = int(np.prod(shp)) * 2
+            rebuilt[k] = _unpack_bf16(blob[off:off + n], shp)
+            off += n
+    except Exception as e:                                           # noqa: BLE001
+        _say("reassembly failed (%s)" % str(e)[:80])
+        return "bad-chunk"
+    host.write_slot(own_idx, rebuilt)
+    got = slot_root(host, own_idx)
+    expect = want_root or entry.get("root")
+    if expect and got != str(expect):
+        _say("root still disagrees after applying the snapshot (want %s.. got %s..)"
+             % (str(expect)[:12], got[:12]))
+        return "root-mismatch"
+    _say("applied %d chunk(s), %d B -- root %s.. now matches the coordinator" % (
+        len(entry["chunks"]), len(blob), got[:12]))
+    return "ok"
+
+
+# D1 LATCH RE-SEED memo: (campaign, coord_key, advertised_root) -> (last_outcome, monotonic time). One
+# coordinate costs 18,874,368 B / 5 chunks (~110 s on the 4060 link), and catch_up_accepted re-meets
+# the same vetoing record EVERY tick (93 LINEAGE-SKIPs in one p1046 log window), so without a memo a
+# refusal would re-download the snapshot forever. A CONTENT verdict (the manifest disagrees, a chunk
+# does not hash, the bytes do not reproduce the root, a malformed entry) is terminal for the process.
+# Anything else -- a read that failed or timed out, a chunk missing right now, an entry not (yet)
+# published, or an "ok" whose record was then rolled back because ANOTHER coordinate failed -- is
+# retried, but at most once per LATCH_RESEED_RETRY_S (review findings 3 and 4, 2026-10-22: a single
+# transient read error must not re-create the very freeze this exists to end).
+LATCH_RESEED_RETRY_S = 600.0
+_LATCH_RESEED_TERMINAL = ("manifest-root-differs", "bad-chunk", "root-mismatch", "malformed")
+_LATCH_RESEED_TRIED = {}
+_latch_now = time.monotonic
+
+
+def _latch_reseed_enabled(environ=None):
+    """NEURAHASH_GLM_LATCH_RESEED: on unless explicitly 0/false/no/off -- the kill switch for D1."""
+    raw = str((environ if environ is not None else os.environ).get("NEURAHASH_GLM_LATCH_RESEED", "1"))
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _latch_reseed_one(host, lane, man, campaign, coord_key, idx, want_root, log=None):
+    """D1 (owner-approved 2026-10-22): bring ONE resident coordinate whose root disagrees with an
+    accepted record up to that record's advertised root, from THIS campaign's seed snapshot.
+
+    TRUST, stated exactly. The advertised root comes from an accepted record on an UNSIGNED lane with a
+    shared public PUT token (F3), so it is attacker-reachable and is NEVER sufficient on its own. This
+    function adopts nothing unless ALL of these hold, and returns a refusal string otherwise:
+      1. a campaign scope is bound (no campaign -> no seed manifest to consult -> "refused-no-campaign");
+      2. this campaign's seed manifest INDEPENDENTLY carries an entry for the coordinate whose `root`
+         EQUALS the advertised root ("manifest-root-differs" otherwise -- including an entry with no
+         root at all);
+      3. apply_seed_snapshot then pins every chunk to the sha256 cid the manifest names and refuses the
+         result unless the REASSEMBLED slot_root equals the advertised root.
+    The caller (_fold_accepted_checked) adds two more: the fold did not move the coordinate (F3), and
+    this process never verified the local copy against an accepted record (review finding 1 -- so a
+    forged zero-row record cannot revert a verified copy to the seed and commit past itself).
+    Inputs are the same ones the BOOT path relies on (resume_to_root's seed fallbacks: the same named
+    manifest, the same chunk pins, the same reassembled-root check), with one condition MORE: the boot
+    path accepts the manifest's own root when no record advertised one (`want_root or
+    entry.get("root")`), this path never does. What D1 widens is SCOPE, not the trust set: boot seeds
+    only the miner's own coordinate, D1 any never-verified resident one.
+    Never raises for a content problem: a malformed entry is the terminal refusal "malformed"."""
+    if not campaign or not want_root or idx is None:
+        return "refused-no-campaign"
+    mkey = (str(campaign), str(coord_key), str(want_root))
+    prev = _LATCH_RESEED_TRIED.get(mkey)
+    if prev is not None:
+        if prev[0] in _LATCH_RESEED_TERMINAL:
+            return "already-refused:%s" % prev[0]
+        if _latch_now() - prev[1] < LATCH_RESEED_RETRY_S:
+            return "cooling-down:%s" % prev[0]
+
+    def _say(m):
+        if log:
+            log("[glm-contrib lineage] latch re-seed %s: %s" % (coord_key, m))
+    out, mani = None, None
+    try:
+        mani = lane.get_json_named(seed_manifest_name(campaign), man=man)
+    except CatchupTimeout:
+        out = "timeout"
+    except Exception as e:                                           # noqa: BLE001
+        _say("seed manifest unreadable (%s) -- will retry later" % str(e)[:80])
+        out = "unreadable"
+    if out is None:
+        try:
+            coords = mani.get("coords") if isinstance(mani, dict) else None
+            coords = coords if isinstance(coords, dict) else {}
+            entry = coords.get(coord_key)
+            if entry is None and isinstance(coord_key, str):
+                entry = (coords.get(coord_key.replace("_", ":"))
+                         or coords.get(coord_key.replace(":", "_")))
+            if not isinstance(entry, dict):
+                out = "absent"
+                _say("this campaign's seed manifest has no entry for it -- staying fail-closed")
+            elif str(entry.get("root") or "") != str(want_root):
+                out = "manifest-root-differs"
+                _say("the seed manifest's root %.16s.. is not the advertised %.16s.. -- refusing, "
+                     "staying fail-closed" % (str(entry.get("root")), str(want_root)))
+            else:
+                out = apply_seed_snapshot(host, lane, man, campaign, coord_key, idx, str(want_root),
+                                          log=log, seed_mani=mani)
+                if out != "ok":
+                    _say("snapshot not applied (%s) -- staying fail-closed" % out)
+        except (KeyError, TypeError, ValueError, IndexError) as e:
+            # A malformed entry (missing `order`/`shapes` key, wrong types) raised mid-apply. The
+            # caller's rollback restores any half-written slot; here it is a terminal refusal.
+            _say("malformed seed entry (%s: %s) -- refusing" % (type(e).__name__, str(e)[:80]))
+            out = "malformed"
+        except Exception as e:                                       # noqa: BLE001
+            # Anything else (e.g. a RuntimeError from write_slot) says nothing about the CONTENT:
+            # retryable after the cooldown, never terminal (2026-10-22 re-review, LOW 1).
+            _say("raised %s (%s) -- will retry after the cooldown" % (type(e).__name__, str(e)[:80]))
+            out = "error"
+    _LATCH_RESEED_TRIED[mkey] = (out, _latch_now())
+    return out
+
+
 def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
                    budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None,
                    man=None):
@@ -4891,6 +5275,12 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
 
     campaign = host_campaign_id(host)         # the scope rides the HOST, like every root function
     n_scanned = n_applicable = 0              # records fetched / records that advertise own_coord
+    # The seed-snapshot verdict, exposed to the caller through `outcome` (bound BEFORE _done is
+    # defined, because _done has early-return call sites that would otherwise NameError). Today the
+    # seed verdict reaches the caller only as text inside one log line, which is how "the snapshot is
+    # there but unusable" became indistinguishable, programmatically, from "this coordinate was
+    # never merged" -- and the difference is exactly whether training here can ever be accepted.
+    _seed = None
 
     def _done(reason, applied, reached, records=None):
         # `records` is what the replay actually TRIED (it can be non-zero while `applied` is 0: a
@@ -4898,7 +5288,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         if outcome is not None:
             outcome.update(reason=reason, elapsed_s=_now() - t0,
                            records=int(applied if records is None else records),
-                           scanned=n_scanned, applicable=n_applicable,
+                           scanned=n_scanned, applicable=n_applicable, seed=_seed,
                            aborted=reason in _CATCHUP_ABORTED)
         return applied, reached
     if not target_root or model_root(host) == str(target_root):
@@ -4912,7 +5302,19 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             log("[glm-contrib] resume: coordinate (L%d,E%d) is not registered locally -- staying on "
                 "the frozen base" % (int(own_coord[0]), int(own_coord[1])))
             return _done("not-registered", 0, False)
+    raw_lane = lane                            # the UNwrapped lane, kept for the snapshot rescue
     lane = _DeadlineLane(lane, call_to, deadline=t0 + budget, now=_now)
+
+    def _seed_window_lane():
+        """A deadline lane for the SEED SNAPSHOT with its OWN window (same budget, same per-call
+        cap). A fold that ran the clock out leaves this function's lane at `remaining() <= 0`, so a
+        snapshot applied on it trips on its very first call. That is not hypothetical: the live
+        (L1,E50) boot on 2026-10-21 spent 180.0s reaching the seed fallback and was then left with
+        `lane.get_blob did not return within 0.4s` on all five chunks -- the snapshot was never
+        given a chance to be read, and the coordinate was reported as missing-chunk. Cost of the
+        second window: worst-case catch-up wall time doubles, 2 x budget, against a 900 s cooldown
+        and a walk that spends the same budget on the next seat anyway."""
+        return _DeadlineLane(raw_lane, call_to, deadline=_now() + budget, now=_now)
     if man is None:
         try:
             man = lane.manifest()
@@ -5026,8 +5428,55 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             "budget=%.0fs stall=%.0fs call-timeout=%.0fs); rolled back to the frozen base"
             % (coord_key or ("root %s.." % target[:12]), _now() - t0, aborted, applied, budget,
                stall, call_to))
+        # THE SNAPSHOT IS THE CHEAPER ROUTE ONCE THE FOLD RUNS OUT OF BUDGET. Measured 2026-10-21 on
+        # campaign e2c4cb58fcfb41cc, the 8 GB 4060: EIGHT coordinates aborted at ~180.6s in one
+        # evening (1_50, 1_4, 1_3, 1_40, 1_48 and the walk around them), and every one of them has a
+        # seed entry that the read-only auditor hash-verified (119 coordinates, 37,748,736 B, exit
+        # 0). The two costs, both measured on this link: the fold is O(chain) at ~24 s per applicable
+        # record (6 records -> 142.7 s to reach 1_15), and the campaign publishes ONE accepted record
+        # per event -- 302 of them at event 302, one more every ~30 min, forever -- so the fold only
+        # gets slower as the campaign ages. The snapshot for this coordinate is O(1): 18,874,368 B
+        # over 5 chunks, ~110 s whatever the chain depth, and apply_seed_snapshot itself refuses
+        # anything whose reassembled root does not equal the advertised coord_want. Crossover is at
+        # ~4.6 applicable records and tonight we were past it eight times over.
+        # The rollback above already restored the frozen base, so the snapshot lands on a clean slot.
+        # If it fails we report the SAME abort we reported before, so the caller's park rule is
+        # byte-identical -- this only ADDS a route to the root; it cannot make a bad base look good.
+        # Cost of trying: one advance may take budget + ~110 s instead of budget, against a 900 s
+        # cooldown and a next seat that would spend the same 180 s anyway.
+        if coord_key is not None and own_idx is not None:
+            log("[glm-contrib] resume: the chain fold for %s ran out of %s after %.1fs (%d record(s) "
+                "scanned) -- trying this campaign's SEED SNAPSHOT, which costs ~110s whatever the "
+                "chain depth" % (coord_key, aborted, _now() - t0, n_scanned))
+            _seed = apply_seed_snapshot(host, _seed_window_lane(), man, host_campaign_id(host),
+                                        coord_key, own_idx, coord_want, log=log)
+            if _seed == "ok":
+                log("[glm-contrib] resume: reached the coordinator's root for coordinate %s from the "
+                    "SEED SNAPSHOT after the fold aborted (%s) -- training here"
+                    % (coord_key, aborted))
+                return _done("ok", applied, True)
+            log("[glm-contrib] resume: the SEED SNAPSHOT did not rescue the aborted fold for %s "
+                "(seed-snapshot=%s); reporting the abort as before so the caller parks it"
+                % (coord_key, _seed))
         return _done(aborted, 0, False, records=applied)
-    if coord_key is not None and n_applicable == 0:
+    # SEED-SNAPSHOT FALLBACK (2026-09-21). The accepted chain did not reach this coordinate. On a
+    # campaign SEEDED from a checkpoint that is EXPECTED, not anomalous: the seed wrote weights the
+    # lane never carried, so no record can advertise them and the chain scan is guaranteed to come
+    # up short. Try the published snapshot before drawing any conclusion about the frozen base.
+    # The rollback above already restored the base, so we apply the snapshot onto a clean slot.
+    _seed = "absent"
+    if coord_key is not None and own_idx is not None:
+        # Same second window as the abort path: this fallback used to run on the fold's own
+        # starved lane, which is how a complete scan that finished just over budget (reason
+        # `unreachable`, not an abort) left the snapshot 0.4s per call on (L1,E50).
+        _seed = apply_seed_snapshot(host, _seed_window_lane(), man, host_campaign_id(host),
+                                    coord_key, own_idx, coord_want, log=log)
+        if _seed == "ok":
+            log("[glm-contrib] resume: reached the coordinator's root for coordinate %s from the "
+                "SEED SNAPSHOT (the accepted chain had nothing to fold -- this campaign was seeded "
+                "from a checkpoint); training here" % coord_key)
+            return _done("ok", applied, True)
+    if coord_key is not None and n_applicable == 0 and _seed == "absent":
         # V0.1 COMPLETE-AND-EMPTY, not a stall and not unreachable: the whole record list was scanned
         # and NOT ONE record advertises this coordinate, so the coordinator has never merged it and
         # its state for it IS the frozen base -- which is exactly what we hold. Nothing to fold means
@@ -5039,10 +5488,11 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
         return _done("empty", 0, False, records=applied)
     if coord_key is not None:
         log("[glm-contrib] resume: could NOT reach the coordinator's root for coordinate %s (%s, %d "
-            "record(s) tried, %.1fs); rolled back to the frozen base -- our contributions will be "
-            "lineage-dropped until the coordinator's base for this coordinate is reachable"
+            "record(s) tried, seed-snapshot=%s, %.1fs); rolled back to the frozen base -- our "
+            "contributions will be lineage-dropped until the coordinator's base for this coordinate "
+            "is reachable"
             % (coord_key, "advertised %s.." % coord_want[:12] if coord_want else
-               "no record advertised it", applied, _now() - t0))
+               "no record advertised it", applied, _seed, _now() - t0))
         return _done("unreachable", 0, False, records=applied)
     log("[glm-contrib] resume: could NOT reach the advertised root %s.. (%d record(s) tried, %.1fs); "
         "rolled back to the frozen base -- our contributions will be lineage-dropped until the "
@@ -5052,7 +5502,7 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
 
 def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_root, event,
                   cooldown, log, miner, plateau_rejects=0, budget_s=None, call_timeout_s=None,
-                  stall_s=None, now=None, man=None):
+                  stall_s=None, now=None, man=None, reason=None):
     """NEVER-BLOCK 1.4: walk this identity's claim order from `current` to the first coordinate the
     miner can actually START on, parking every one that BLOCKS it on the way.
 
@@ -5089,10 +5539,15 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
                 % (miner, cand[0], cand[1], ex))
             continue
         if first:
-            log("[glm-contrib %s] PLATEAU on (L%d,E%d) after %d consecutive rejects -> RELEASE, "
-                "CLAIM (L%d,E%d) [local slot %d]. Sweeping: %d coordinate(s) claimable here."
-                % (miner, cur[0], cur[1], int(plateau_rejects), cand[0], cand[1], ni,
-                   len(claim_coords)))
+            # `reason` names what ACTUALLY triggered the advance. None reproduces the historic
+            # line byte-for-byte, so existing callers AND gpu_live_dashboard's regex are
+            # unaffected; the silent path passes its own, because "PLATEAU after 0 consecutive
+            # rejects" misattributes the cause to anyone reading only this line (live 2026-09-21).
+            _why = reason or ("PLATEAU on (L%d,E%d) after %d consecutive rejects"
+                              % (cur[0], cur[1], int(plateau_rejects)))
+            log("[glm-contrib %s] %s -> RELEASE, CLAIM (L%d,E%d) [local slot %d]. Sweeping: %d "
+                "coordinate(s) claimable here."
+                % (miner, _why, cand[0], cand[1], ni, len(claim_coords)))
             first = False
         else:
             log("[glm-contrib %s] walking past a blocked coordinate -> CLAIM (L%d,E%d) [local slot "
@@ -5109,6 +5564,30 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
                 % (miner, cand[0], cand[1], outcome.get("reason"), outcome.get("elapsed_s", 0.0),
                    cooldown.seconds, cooldown.events))
             continue
+        if outcome.get("seed") in ("missing-chunk", "bad-chunk", "root-mismatch", "timeout"):
+            # THE SAME RULE boot_catchup ALREADY APPLIES (:5352ff) -- this caller was missing it,
+            # and 2026-10-21 measured the cost on the live 4060: after `PLATEAU on (L1,E7) ->
+            # CLAIM (L1,E50)`, the seed read hit the lane deadline, this function logged "post-
+            # advance catch-up for (L1,E50): folded 0 record(s), coordinator root NOT reached
+            # (frozen base) (180.0s)" and then RETURNED the coordinate anyway. The miner trained
+            # async rounds 13 and 14 on slot 50 (60 LoRA steps each, 114.2s + 112.4s of an 8 GB
+            # card) deriving weights from a base it had just proved it could not match, and
+            # published two contributions that can never be accepted. A SEEDED coordinate we
+            # cannot reach is a dead seat, not a slow one: park it and walk on. The park is BOUNDED
+            # (park() expires only when BOTH until_t and until_event have elapsed), so a slow WAN
+            # read costs a detour, not the coordinate. "absent"/"empty" deliberately keep training:
+            # for those the frozen base IS the state, and mis-parking them was measured to break
+            # 12/12 healthy advances.
+            cooldown.park(cand, event, "seed snapshot unusable (%s)" % outcome.get("seed"))
+            log("[glm-contrib %s] COOLDOWN (L%d,E%d): this campaign's SEED SNAPSHOT is UNUSABLE "
+                "(%s) after %.1fs -- PARKED and walking on, not training. Deriving this "
+                "coordinate's weights from the frozen base can never match a checkpoint-seeded "
+                "root, its drops are pre-register, and a pre-register drop emits no record so no "
+                "counter this miner watches can grow: that is the weeks-long burn. A timeout says "
+                "the READ did not complete, NOT that the store lost a chunk -- tools/"
+                "glm_seed_revalidate.py is the tool that answers that question."
+                % (miner, cand[0], cand[1], outcome.get("seed"), outcome.get("elapsed_s", 0.0)))
+            continue
         log("[glm-contrib %s] post-advance catch-up for (L%d,E%d): folded %d record(s), coordinator "
             "root %s (%.1fs)"
             % (miner, cand[0], cand[1], n_res,
@@ -5117,6 +5596,59 @@ def advance_claim(host, lane, claim_coords, current, identity, ranked, pointer_r
                "NOT reached (frozen base)", outcome.get("elapsed_s", 0.0)))
         return (cand[0], cand[1]), ni, n_res, reached
     return None
+
+
+def boot_claim_catchup(host, lane, coord, pointer_root, cooldown, event, log, miner, man=None,
+                       budget_s=None, call_timeout_s=None, stall_s=None):
+    """ASSUMEUTXO BOOT CHECK: on a shard-claim network a BOOT claim has to load the coordinator's
+    announced state for OUR coordinate before it trains a single step.
+
+    WHY (measured 2026-10-21, campaign e2c4cb58fcfb41cc, miner glm-c47c9334): the startup comparison
+    skipped the global-root check on every shard-claim miner and then did NOTHING -- resume_to_root
+    was reachable only from the elif (comparable AND mismatched) and from advance_claim. A miner whose
+    durable walk cursor boots onto a SEEDED coordinate therefore derives that coordinate's weights
+    from the FROZEN BASE; every publish is dropped wrong-lineage-slot-root PRE-REGISTER; a
+    pre-register drop emits no record, so NO counter the miner watches can grow; and the miner trains
+    on work that can never be accepted. That is how 28 days of a single 8 GB card went to zero goodput
+    on (L1,E6) -- and the plateau walk only digs out by accident, one 3-reject plateau per hop, when
+    the drops ARE visible. Bitcoin Core's AssumeUTXO is the shape we were missing: load the snapshot,
+    validate forward from it, and treat divergence as a FAILURE rather than as a base to keep training.
+
+    PARK RULE, deliberately narrow. A coordinate is parked when its catch-up hit a bound (the
+    pre-existing V0 rule) or when a seed snapshot EXISTS for it and could not be applied
+    ("missing-chunk"/"bad-chunk"/"root-mismatch") -- a SEEDED coordinate we cannot reach is a dead
+    seat, not a slow one. "absent"/"empty" keep today's semantics untouched: no snapshot and no
+    accepted record advertising the coordinate means the frozen base IS its state, and parking that
+    would punish a healthy coordinate (NEVER-BLOCK V0.1, measured 12/12 advances mis-parked).
+    Returns (status, n_folded, reached, outcome), status in {"ok", "parked"}.
+    """
+    coord = tuple(coord)
+    outcome = {}
+    n_fold, reached = resume_to_root(host, lane, pointer_root, log, own_coord=coord,
+                                     outcome=outcome, budget_s=budget_s,
+                                     call_timeout_s=call_timeout_s, stall_s=stall_s, man=man)
+    _seed = outcome.get("seed")
+    if outcome.get("aborted"):
+        cooldown.park(coord, event, "boot catch-up %s" % outcome.get("reason"))
+        log("[glm-contrib %s] BOOT catch-up for (L%d,E%d) was BOUND-BLOCKED (%s, %.1fs) -- parked "
+            "and walking on instead of training a base we cannot prove"
+            % (miner, coord[0], coord[1], outcome.get("reason"), outcome.get("elapsed_s", 0.0)))
+        return "parked", n_fold, reached, outcome
+    if _seed in ("missing-chunk", "bad-chunk", "root-mismatch", "timeout"):
+        cooldown.park(coord, event, "seed snapshot unusable (%s)" % _seed)
+        log("[glm-contrib %s] BOOT catch-up for (L%d,E%d): this campaign's SEED SNAPSHOT for this "
+            "coordinate is UNUSABLE (%s) -- PARKED, not training. Its state came from a checkpoint, "
+            "so the frozen base can never match it, and a pre-register drop emits no record and so "
+            "advances no counter: training here is the weeks-long burn, not a workaround."
+            % (miner, coord[0], coord[1], _seed))
+        return "parked", n_fold, reached, outcome
+    log("[glm-contrib %s] BOOT catch-up for (L%d,E%d): folded %d record(s), coordinator root %s "
+        "(%.1fs, seed-snapshot=%s)"
+        % (miner, coord[0], coord[1], n_fold,
+           "REACHED" if reached else
+           "NOTHING TO FOLD -- frozen base IS its state" if outcome.get("reason") == "empty" else
+           "NOT reached (frozen base)", outcome.get("elapsed_s", 0.0), _seed or "n/a"))
+    return "ok", n_fold, reached, outcome
 
 
 def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_slot, miner, log,
@@ -5139,6 +5671,11 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
     skipped_at = None
     campaign = host_campaign_id(host)      # CAMPAIGN SCOPE: only this campaign's accepted records
     lane = _DeadlineLane(lane, _catchup_call_timeout_s())
+    _reseed = None
+    if campaign and _latch_reseed_enabled():
+        # D1 LATCH RE-SEED: see _fold_accepted_checked / _latch_reseed_one for every refusal.
+        def _reseed(h, key, idx, want):
+            return _latch_reseed_one(h, lane, man, campaign, key, idx, want, log=log)
     for e in scan_accepted_events_bounded(man, last_applied, frontier, campaign=campaign):
         entry = man.get(accepted_name(e, campaign))
         if not entry:
@@ -5153,7 +5690,7 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             break                                            # transient fetch fail -> retry next tick
         try:
             ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot,
-                                                          log=log)
+                                                          log=log, reseed=_reseed)
         except CatchupTimeout as ex:                         # a delta fetch INSIDE the fold hung
             log("[glm-contrib %s] catch-up: BLOCKED fetching a delta of accepted event %d (%s) -- "
                 "training against the current base and retrying next tick" % (miner, e, ex))
@@ -5178,8 +5715,10 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             folded.append(rec)
     if skipped_at is not None:
         log("[glm-contrib %s] LINEAGE-SKIP: accepted record at event %d does not extend our latched "
-            "lineage (local model_root != its advertised root) -- a previous run's leftover in the "
-            "never-deleting store; refusing to fold it, frontier held at event %d (fail-closed)."
+            "lineage (for at least one coordinate we HOLD, our root != the root that record "
+            "advertises -- the off-lineage line above names which one) -- a previous run's leftover "
+            "in the never-deleting store; refusing to fold it, frontier held at event %d "
+            "(fail-closed)."
             % (miner, skipped_at, last_applied))
     return last_applied, applied_any, None
 
@@ -5627,6 +6166,324 @@ def _maybe_self_update(log=_flush, _check=None):
         return None
 
 
+def _ce_key(v):
+    """Comparison key for a round's best-val CE, NaN-safe: a real CE beats a NaN (a --garbage or
+    layer-claim round carries NaN by design), and two NaNs compare equal so the first-kept wins.
+    Lower is better throughout."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return float("inf")
+    return f if f == f else float("inf")                 # NaN -> +inf (worst)
+
+
+class _PublishWindow:
+    """Unit E v1 (E.3): the best-of-window publish buffer. Between publishes it holds the single
+    lowest-val-CE round trained against the CURRENT own-slot base; when the miner is finally cleared
+    to publish it hands back that best round (or the current one, whichever is better). It is CONTENT
+    ONLY -- no kernel, optimizer or training state is carried (that is v2, flag-gated behind
+    NEURAHASH_GLM_CARRY_LORA and DEFERRED here); the miner already save-bests within a round, so this
+    only chooses WHICH round and WHEN.
+
+    The buffer is emptied whenever the own-slot base root changes: an accepted own-slot fold or a
+    claim advance moves our slot, and a payload kept against the old slot would be dropped
+    `wrong-lineage-slot-root`. `slot_root` (the current own-slot root) is threaded into every call so
+    that reset is automatic and needs no coupling to the verdict path. Pure/numpy-free; `payload` is
+    stored by reference, never copied. Single-loop, not thread-safe."""
+
+    def __init__(self):
+        self._best = None            # dict(best_val, payload, train_flops, steps, tokens) or None
+        self._slot_root = None       # own-slot root the kept round was trained against
+
+    def _sync_base(self, slot_root):
+        if self._slot_root != slot_root:                 # base moved -> the kept round is stale
+            self._best = None
+            self._slot_root = slot_root
+
+    def keep(self, slot_root, best_val, payload, train_flops, steps, tokens):
+        """Offer this round to the buffer. Kept iff it beats the held best_val (lower CE) or the
+        buffer is empty for the current base."""
+        self._sync_base(slot_root)
+        cur = self._best
+        if cur is None or _ce_key(best_val) < _ce_key(cur["best_val"]):
+            self._best = dict(best_val=best_val, payload=payload, train_flops=train_flops,
+                              steps=int(steps), tokens=int(tokens))
+
+    def take_or_current(self, slot_root, best_val, payload, train_flops, steps, tokens):
+        """Consume the buffer and return the (best_val, payload, train_flops, steps, tokens) to
+        publish now: the held best if it is valid against `slot_root` and beats the current round,
+        else the current round (which is always valid -- it was just trained against this base)."""
+        self._sync_base(slot_root)
+        held = self._best
+        self._best = None                                 # a publish consumes the window
+        self._slot_root = slot_root
+        if held is None or _ce_key(best_val) < _ce_key(held["best_val"]):
+            return best_val, payload, train_flops, steps, tokens
+        return (held["best_val"], held["payload"], held["train_flops"],
+                held["steps"], held["tokens"])
+
+    def reset(self):
+        self._best = None
+        self._slot_root = None
+
+
+def _credit_state(ptr, miner):
+    """Unit E v1 (E.1): read the coordinator's per-window publish credits off the RAW pointer dict.
+    `next_up` is the ADDITIVE list of miner ids the coordinator credits to publish this window; a
+    legacy coordinator's pointer has no such key. Returns (credits_on, credited):
+      credits_on -- the pointer carries a `next_up` LIST (i.e. a credit-gating coordinator);
+      credited   -- credits are on AND this miner id is named in `next_up`.
+    A pointer with no `next_up`, or a non-list value, yields (False, False), and the caller then
+    publishes every round exactly as before (backward compatibility). Pure; reads the pointer dict
+    the same way pointer_campaign_id does."""
+    nu = ptr.get("next_up") if isinstance(ptr, dict) else None
+    if not isinstance(nu, list):
+        return False, False
+    return True, (str(miner) in {str(m) for m in nu})
+
+
+def _may_publish_now(credits_on, credited, last_pub_base_event, elapsed_since_pub, credit_wait_s):
+    """Unit E v1 (E.2): publish this round, or hold and keep training? True (publish) iff ANY of:
+      - the coordinator is legacy (credits_on False) -> today's every-round behaviour;
+      - this miner is credited this window;
+      - it is our FIRST contribution (last_pub_base_event is None) -> publish unconditionally (entry);
+      - we have waited the liveness backstop (elapsed_since_pub >= credit_wait_s) without a credit.
+    Otherwise HOLD (keep training this coordinate; buffer the best round). Pure -- the caller passes
+    the elapsed time so no clock is read here."""
+    if not credits_on:
+        return True
+    if credited:
+        return True
+    if last_pub_base_event is None:
+        return True
+    return float(elapsed_since_pub) >= float(credit_wait_s)
+
+
+# --- UPDATE CAP (owner-approved 2026-10-23, "approve D4 with probe size 512 and the update cap") ---
+# Offline gate replays (scratchpad/GATE_REPLAY_2026-10-22.md sec. 8) measured the rejected miner deltas
+# as HARMFUL at the coordinator's outer scale 0.7: the applied update 0.7*|D|/|W| was ~42% of the expert
+# weight norm at the median, while the only two deltas ever accepted were 5% and 8%. The cap bounds what
+# a miner PUBLISHES so that 0.7*|D|/|W| <= ~0.08, i.e. |D|/|W| <= 0.114 per expert matrix. DEFAULT OFF:
+# with NEURAHASH_GLM_UPDATE_CAP unset nothing below runs and the publish is byte-identical to before.
+UPDATE_CAP_ENV = "NEURAHASH_GLM_UPDATE_CAP"
+UPDATE_CAP_KEYS = ("gate", "up", "down")
+
+
+class UpdateCapRefused(Exception):
+    """The cap could not be applied safely (a non-finite or zero norm): the caller must NOT publish."""
+
+
+def update_cap_from_env(env=None):
+    """The configured cap (ratio |D|/|W| per matrix) or None when unset/empty (= OFF). A value that is
+    not a finite positive number raises ValueError: a typo must not silently publish uncapped."""
+    raw = str((os.environ if env is None else env).get(UPDATE_CAP_ENV, "") or "").strip()
+    if not raw:
+        return None
+    v = float(raw)
+    if not (math.isfinite(v) and v > 0.0):
+        raise ValueError("%s=%r must be a finite number > 0" % (UPDATE_CAP_ENV, raw))
+    return v
+
+
+def _wire_roundtrip(payload):
+    """The payload exactly as the coordinator will read it back: lane.put_delta packs fp16."""
+    return H.unpack_arrays(H.pack_arrays(payload, np.float16))
+
+
+def update_ratios(payload, resident):
+    """|D|_F / |W|_F per matrix (gate, up, down), with D materialised from the WIRE (fp16) form the
+    coordinator's own materialize_from_lora sees. Raises UpdateCapRefused on a non-finite or zero norm."""
+    w = _wire_roundtrip(payload)
+    d = _G().materialize_from_lora(w) if _G().is_lora_payload(w) else w
+    out = {}
+    for k in UPDATE_CAP_KEYS:
+        if k not in d or k not in resident:
+            raise UpdateCapRefused("matrix %r missing from delta or resident slot" % k)
+        dn = float(np.linalg.norm(np.asarray(d[k], dtype=np.float64)))
+        wn = float(np.linalg.norm(np.asarray(resident[k], dtype=np.float64)))
+        if not (math.isfinite(dn) and math.isfinite(wn)) or wn <= 0.0:
+            raise UpdateCapRefused("non-finite or zero norm on %s (|D|=%r |W|=%r)" % (k, dn, wn))
+        out[k] = dn / wn
+    return out
+
+
+def _scaled_payload(payload, k):
+    """A COPY of `payload` with the update scaled by k (direction preserved): for LoRA factors only the
+    B factors are scaled (D = scale*B@A is linear in B), for a dense delta the three matrices are."""
+    out = dict(payload)
+    keys = ("lora_B_gu", "lora_B_d") if _G().is_lora_payload(payload) else UPDATE_CAP_KEYS
+    for key in keys:
+        out[key] = (np.asarray(payload[key], dtype=np.float32) * np.float32(k)).astype(np.float32)
+    return out
+
+
+def apply_update_cap(payload, resident, cap):
+    """Scale `payload` UNIFORMLY so every matrix's |D|/|W| <= cap. Returns (payload, info) where info =
+    {"before": ratios, "after": ratios, "scale": k}. A payload already under the cap is returned as the
+    SAME object (k = 1.0, untouched). One uniform k = min over matrices keeps the whole update's
+    direction; per-matrix k would change the gate:up:down mix the miner trained. Ratios are measured on
+    the fp16 wire form, and fp16 rounding of the scaled factors can overshoot by ~1e-3 relative, so the
+    target is cap*(1-2e-3) and the result is re-measured; a residual overshoot is refused, not shipped."""
+    cap = float(cap)
+    before = update_ratios(payload, resident)
+    worst = max(before.values())
+    if worst <= cap:
+        return payload, {"before": before, "after": before, "scale": 1.0}
+    k = (cap * (1.0 - 2e-3)) / worst
+    capped = _scaled_payload(payload, k)
+    after = update_ratios(capped, resident)
+    if max(after.values()) > cap:
+        raise UpdateCapRefused("capped delta still over the cap after fp16 rounding (%s)" % after)
+    return capped, {"before": before, "after": after, "scale": k}
+
+
+def update_cap_line(miner, L, E, info):
+    f = lambda r: "/".join("%.4f" % r[k] for k in UPDATE_CAP_KEYS)      # noqa: E731
+    return ("[glm-contrib %s] UPDATE-CAP coordinate (%d,%d): ratios gate/up/down before %s -> after %s "
+            "(scale %.4f)" % (miner, int(L), int(E), f(info["before"]), f(info["after"]),
+                              float(info["scale"])))
+
+
+UPDATE_CAP_MAX_REFUSALS = 3
+
+
+def cap_for_publish(cap, payload, resident, L, E, miner, log, refusals):
+    """The one call every capped publish site makes. Returns (payload_to_publish or None, refusals).
+    None = do NOT publish this round. `refusals` counts CONSECUTIVE refusals; at
+    UPDATE_CAP_MAX_REFUSALS the miner exits loudly instead of training forever without publishing
+    (a persistent cause -- a NaN or zero resident slot -- would otherwise never surface)."""
+    try:
+        out, info = apply_update_cap(payload, resident, cap)
+    except UpdateCapRefused as ex:
+        refusals += 1
+        log("[glm-contrib %s] UPDATE-CAP REFUSED (L%d,E%d): %s -- NOT publishing this round (%d/%d)."
+            % (miner, int(L), int(E), ex, refusals, UPDATE_CAP_MAX_REFUSALS))
+        if refusals >= UPDATE_CAP_MAX_REFUSALS:
+            raise SystemExit("[glm-contrib %s] UPDATE-CAP refused %d consecutive rounds; exiting "
+                             "rather than training without publishing" % (miner, refusals))
+        return None, refusals
+    log(update_cap_line(miner, L, E, info) + (" [best_val_ce is of the UNCAPPED delta]"
+                                              if info["scale"] != 1.0 else ""))
+    return out, 0
+
+
+def silence_update(silent_pubs, streak_before, streak_after, accepted_ours, published_since):
+    """SILENT-STARVATION counter (2026-09-20): consecutive PUBLISHES OF OURS that drew no verdict.
+
+    Deliberately separate from `reject_streak`. A reject is a VERDICT, and the failure this guards
+    against -- a pre-register LINEAGE-DROP (`wrong-lineage-slot-root`) -- emits no record at all, so
+    it can never move the streak. Gating the F5b advance on the streak alone made that repair
+    unreachable in exactly the case it was written for, and two miners burned ~50 minutes on
+    terminally-dead coordinates before anyone noticed.
+
+    Two things here are load-bearing and were both wrong in the first cut of this fix (caught in
+    review against this incident's own logs):
+
+      1. RESET ONLY ON A VERDICT ABOUT US. The obvious reset -- "anything was folded this tick" --
+         is wrong, because `catch_up_accepted` reports applied_any=True for a PEER's record and
+         `_apply_fold_verdicts` deliberately leaves the streak untouched for one. Measured in this
+         incident: while the 5090 was dropped pre-register for 106 minutes, the 4060 had a record
+         committed every ~59 s, so an applied_any reset would have pinned the 5090's counter at ~0
+         forever. A reject shows up as a streak CHANGE; an accept on an already-zero streak shows
+         up only as `accepted_ours`, so both signals are needed.
+      2. COUNT PUBLISHES, NOT TICKS. A loop tick is not a round: repair mode ticks every ~1 s, the
+         credit gate can HOLD for up to CREDIT_WAIT_S_DEFAULT, and an OOM skip publishes nothing.
+         Counting ticks would advance a healthy held miner off a good coordinate in ~9 seconds.
+
+    Kept pure, and called by the real loop, so a test exercises THIS function rather than pinning a
+    re-derived copy that would pass forever while the loop drifts."""
+    if streak_after != streak_before or accepted_ours:
+        return 0                                   # the coordinator issued a verdict ON US
+    return int(silent_pubs) + max(0, int(published_since))
+
+
+def _apply_fold_verdicts(folded, coord, miner, last_pub_base_event, reject_streak,
+                         on_accept=None, on_lost_race=None):
+    """Unit E v1 (E.5): fold this tick's newly-applied accepted records into the consecutive-reject
+    streak, preferring the coordinator's EXPLICIT per-record `judged` verdict over inference.
+
+    A `judged` dict on an accepted record (the coordinator stamps dict(name, miner, accepted)) is an
+    exact verdict on the named record:
+      judged.miner == miner and accepted     -> ACCEPT (reset the streak; run on_accept);
+      judged.miner == miner and not accepted -> REJECT (streak += 1; counts toward --advance-after);
+      judged.miner != miner                  -> another miner's record was judged: no verdict on us.
+    The F5a guard (event_judged_us) still applies to a judged record, so a verdict that predates our
+    own published work -- or arrives after an advance/rebind reset last_pub_base_event to None -- is
+    not counted as a verdict on us. Records that carry NO `judged` key fall through to the legacy
+    inference (fold_streak_update) UNCHANGED, so a legacy coordinator behaves exactly as before.
+    Returns the new streak. Pure apart from the caller's callbacks."""
+    streak = int(reject_streak)
+    _infer = []
+    for rec in (folded or ()):
+        jd = rec.get("judged") if isinstance(rec, dict) else None
+        if not isinstance(jd, dict):
+            _infer.append(rec)                            # legacy record -> inference below
+            continue
+        if not event_judged_us(rec, last_pub_base_event):
+            continue                                      # F5a: predates our work -> not about us
+        if str(jd.get("miner")) != str(miner):
+            if on_lost_race is not None:
+                on_lost_race(rec, streak)                 # someone else's record judged -> lost race
+            continue
+        if jd.get("accepted"):
+            streak = 0
+            if on_accept is not None:
+                on_accept(rec)
+        else:
+            streak += 1                                   # our delta was rejected -> continue, don't exit
+    return fold_streak_update(_infer, coord, miner, last_pub_base_event, streak,
+                              on_accept=on_accept, on_lost_race=on_lost_race)
+
+
+def _rebind_campaign(host, lane, ptr, dec, coord, log, miner):
+    """Unit E v1 (E.6): the coordinator restarted into a NEW campaign. Rebind THIS process to it in
+    place of the boot-time FATAL exit (which stranded a running stranger's miner), mirroring the boot
+    campaign latch: re-latch the campaign id off the pointer, then root-replay OUR coordinate against
+    the new pointer exactly as the boot MISMATCH branch does. Returns True iff the rebind reached a
+    state the new coordinator can judge (its advertised per-coordinate root), else False -- and the
+    caller then fails closed to today's exit (RC_NO_CAMPAIGN). Touches only the campaign latch and our
+    own slot's weights; the caller resets the loop's per-campaign counters.
+
+    NARROWED 2026-09-19 (review, CLIENT-HIGH): True requires a COMPARABLE advertised root we are (or
+    got) at. Every other case -- including the whole shard-claim network, where comparability is False
+    by construction -- returns False and takes the caller's exit. See the block comment below."""
+    refusal = campaign_refusal(ptr)
+    if refusal:
+        log("[glm-contrib %s] campaign REBIND refused (%s) -- failing closed." % (miner, refusal))
+        return False
+    root = dec.get("model_root")
+    # CLIENT-HIGH (review 2026-09-19). An in-process rebind is only safe when we can PROVE our own
+    # weights are the new campaign's state for our coordinate -- and the only proof available here is a
+    # COMPARABLE global root that resume_to_root actually reached. On a shard-claim network
+    # global_root_comparable is False BY CONSTRUCTION (the coordinator holds coordinates we do not), so
+    # the skip below used to make this function return True unconditionally: a PRODUCTIVE miner whose
+    # expert has already diverged from the new campaign's base re-latched the new id and published
+    # wrong-lineage records FOREVER, silently. That is strictly worse than the FATAL exit it replaced --
+    # that exit restarts the process, which reloads the frozen base and rejoins the new campaign cleanly.
+    # So: rebind in-process ONLY on the comparable path, and fail closed to the exit otherwise. This
+    # refusal (and the campaign_refusal one above) is taken BEFORE the latch, so it leaves the host
+    # exactly as it found it; the THIRD refusal below returns False after the latch and a partial
+    # replay, which is safe only because the caller then exits the process.
+    if not (root and global_root_comparable(host, dec)):
+        log("[glm-contrib %s] campaign REBIND refused: the new campaign's global root is not comparable "
+            "from our slot set (root=%s), so we cannot prove our own coordinate's weights are its state "
+            "-- failing closed to a restart, which rejoins from the frozen base."
+            % (miner, str(root or "none")[:12]))
+        return False                             # refused BEFORE the latch: the host is left untouched
+    # The latch must precede any replay: resume_to_root scopes its record names by host_campaign_id.
+    new_camp = bind_campaign_id(host, pointer_campaign_id(ptr))
+    if str(root) != model_root(host):
+        _n, reached = resume_to_root(host, lane, root, log, own_coord=tuple(coord))
+        if not reached:
+            log("[glm-contrib %s] campaign REBIND to %s: replay could not reach our coordinate's "
+                "advertised root after %d record(s) -- failing closed."
+                % (miner, new_camp or "none", _n))
+            return False
+    log("[glm-contrib %s] campaign REBIND OK -> %s: re-latched in-process, no restart needed."
+        % (miner, new_camp or "none"))
+    return True
+
+
 def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, val_ids, seq, log,
                *, wallet=None, claim_ranked=None):
     """NON-BLOCKING async cadence (alpha 2.0 #146). Selected by main() only when the coordinator
@@ -5666,6 +6523,44 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # be a verdict on us (event_judged_us), so folding a running campaign's history never moves the streak.
     last_pub_base_event = None
     advance_after = int(getattr(args, "advance_after", 0) or 0)
+    # SILENT STARVATION (added 2026-09-20 after a live 50-minute fleet livelock). `reject_streak`
+    # can ONLY grow from a coordinator VERDICT, and a pre-register LINEAGE-DROP emits no record at
+    # all -- so the F5b repair in the plateau branch below was gated on a signal that the very
+    # failure it exists to repair suppresses. That is this repo's "gate that cannot fire" shape
+    # (.claude/rules/20-judgment.md, 2026-08-29), and it cost both miners ~50 min at ~51 s/round on
+    # terminally-dead coordinates ((L2,E25), (L1,E42)) with their own best_val_ce degrading
+    # 8.20 -> 8.43, while the coordinator sat on event 100 logging only LINEAGE-DROP(pre-register).
+    # Counting rounds we PUBLISHED that drew no verdict and folded nothing gives that branch a
+    # second, RECORD-INDEPENDENT trigger, so advance_claim can re-base us onto a reachable
+    # coordinate. Bound is generous on purpose: a busy coordinator legitimately judges other
+    # coordinates for a while, and a premature advance only costs claim churn (advance_claim is
+    # fail-closed and targeted), whereas a missed one costs the card indefinitely. 0 disables.
+    silent_pubs = 0                          # our publishes since the last verdict ABOUT US
+    pubs_since_check = 0                     # publishes made since the last fold, folded in below
+    # max(0, ...) matters: a negative knob would make `silent_pubs >= silent_after` true on every
+    # tick and advance the claim continuously. 0 disables the trigger outright.
+    silent_after = max(0, int(_env_num("NEURAHASH_SD_ADVANCE_AFTER_SILENT",
+                                       max(3 * advance_after, 8) if advance_after else 0, int) or 0))
+    # Unit E v1: credit-gated publishing (E.2) + best-of-window buffer (E.3). `credits_on`/`credited`
+    # are recomputed from every pointer read below; a legacy pointer (no `next_up`) leaves credits_on
+    # False and the publish path stays byte-identical to today. `_last_pub_t` is the backstop clock
+    # (reset on every publish); `_pubwin` holds the best round while we hold.
+    _credit_wait_s = _env_num(CREDIT_WAIT_ENV, CREDIT_WAIT_S_DEFAULT, float)
+    _last_pub_t = time.time()
+    _pubwin = _PublishWindow()
+    # UPDATE CAP (default OFF): read once, fail fast on a malformed value rather than publish uncapped.
+    _update_cap = update_cap_from_env()
+    if _update_cap is not None:
+        if layer_claim_enabled():
+            # The layer-claim path publishes per-coordinate records through its own put_delta and is
+            # NOT capped; refuse rather than let the startup line below be false.
+            raise SystemExit("[glm-contrib %s] %s is set but layer claims are enabled; the layer-claim "
+                             "publish path is not capped. Unset one of them." % (miner, UPDATE_CAP_ENV))
+        log("[glm-contrib %s] UPDATE-CAP ON: every published delta is scaled so |D|/|W| <= %.4f per "
+            "expert matrix (%s)" % (miner, _update_cap, UPDATE_CAP_ENV))
+    _cap_refusals = 0
+    _held_since = None                       # wall time we began holding uncredited (throttled log)
+    credits_on = credited = False
     # NEVER-BLOCK V0: coordinates whose catch-up hit a bound (or whose registration was refused) are
     # parked here so the claim walk skips them, and `repair_since` is the 1.5(b) all-blocked state --
     # loud, idle, and explicitly NOT training on a base we know the coordinator will reject.
@@ -5739,6 +6634,46 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         log("[glm-contrib %s] shard claim: skipping the global-root comparison (coordinator has %d "
             "active coordinate(s), we hold %d) -- per-coordinate roots are authoritative here"
             % (miner, pointer_slot_count(_dec0), len(host.slots)))
+        # ASSUMEUTXO BOOT CHECK (2026-10-21). "Authoritative" has to DO something at boot, or the
+        # sentence above is only a licence to train on a base nobody will accept: on a shard-claim
+        # network this branch used to be the whole story, so a boot claim onto a SEEDED coordinate
+        # never loaded the coordinator's state for it and burned weeks manufacturing pre-register
+        # drops. See boot_claim_catchup's WHY for the measured cost.
+        # One manifest read for the whole boot check, handed down to catch-up AND to the walk, exactly
+        # as the per-tick path does. Without this the boot path would fetch it once per consumer, and
+        # on a 23k-object store that read is ~24 s each (measured), paid on every miner restart.
+        try:
+            man = lane.manifest()
+        except Exception as _man_e:                                    # noqa: BLE001
+            man = None            # catch-up re-reads for itself; a failed read must not stop the boot
+            log("[glm-contrib %s] boot manifest unreadable (%s) -- the boot check will re-read it"
+                % (miner, str(_man_e)[:80]))
+        try:
+            _st, _n_fold, _reached, _out = boot_claim_catchup(host, lane, (L, E), _root0, cooldown,
+                                                              (_dec0 or {}).get("event"), log, miner,
+                                                              man=man)
+            if _st == "parked" and len(claim_coords) > 1:
+                _landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity,
+                                        claim_ranked, _root0, (_dec0 or {}).get("event"), cooldown,
+                                        log, miner, man=man,
+                                        reason="BOOT catch-up could not reach (L%d,E%d) [%s]"
+                                               % (L, E, _out.get("seed") or _out.get("reason")))
+                if _landed is not None:
+                    (L, E), i, _n_res, _ = _landed
+                    claim_state.save(cooldown, (L, E), (_dec0 or {}).get("event"),
+                                     ladder=dose_ladder)
+                else:
+                    log("[glm-contrib %s] (L%d,E%d) is unreachable at boot and NO other claimable "
+                        "coordinate landed -- staying put, and this is the outage, not a slow lane"
+                        % (miner, L, E))
+        except Exception as _boot_e:                                     # noqa: BLE001
+            # A crash here must NOT brick a miner that is otherwise earning, so it degrades to the
+            # pre-2026-10-21 behaviour -- but LOUDLY, because that behaviour is the livelock: a
+            # seeded coordinate trained from the frozen base publishes work that is dropped
+            # pre-register forever. If this line ever appears in a fleet log, the check is broken.
+            log("[glm-contrib %s] BOOT CHECK CRASHED (%s) -- falling back to training on what we "
+                "hold. THIS IS THE LIVERLOCK PATH; treat any round published after it as suspect."
+                % (miner, str(_boot_e)[:120]))
     elif _root0 and str(_root0) != model_root(host):
         log("[glm-contrib %s] base MISMATCH vs coordinator genesis (ours=%s.. theirs=%s..) -- "
             "attempting resume replay" % (miner, model_root(host)[:12], str(_root0)[:12]))
@@ -5873,6 +6808,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         except ValueError:
             time.sleep(args.poll)                               # malformed pointer mid-flight -> pace
             continue
+        # Unit E v1 (E.1): read this pointer's publish credits. credits_on False on a legacy pointer.
+        credits_on, credited = _credit_state(ptr, miner)
         if dec["done"]:
             log("[glm-contrib %s] coordinator signalled DONE; exiting after %d contributions"
                 % (miner, rounds_done))
@@ -5880,17 +6817,27 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # CAMPAIGN CHANGED: the lane is no longer the campaign we latched at boot -- the coordinator
         # restarted into a new one. Every record we publish from here would land under a prefix it
         # never scans, hashed against roots it never had, so we would train forever and be ignored with
-        # NOTHING logged anywhere: an undiscovered record is never even dropped. Exit loudly; a restart
-        # latches the current campaign at boot. (Both None on a legacy lane -> never fires.)
+        # NOTHING logged anywhere. Unit E v1 (E.6): REBIND in-process rather than the FATAL exit that
+        # today strands a running stranger's miner -- re-latch the new campaign id and root-replay our
+        # coordinate against the new pointer, and fail closed to the EXACT old exit only if that rebind
+        # itself cannot reach the new campaign's state for our coordinate. (Both None on a legacy lane
+        # -> never fires.)
         _ptr_camp = pointer_campaign_id(ptr)
-        if _ptr_camp != host_campaign_id(host):
-            log("[glm-contrib %s] FATAL: campaign CHANGED on the lane (ours=%s, pointer now advertises "
-                "%s) -- the coordinator restarted into a different campaign. Our contributions would be "
-                "published where it never looks and hashed against roots it never had: silent "
-                "starvation, so exiting instead. Restart to join %s."
-                % (miner, host_campaign_id(host) or "none", _ptr_camp or "none",
-                   _ptr_camp or "the current campaign"))
-            return RC_NO_CAMPAIGN
+        _our_camp = host_campaign_id(host)
+        if _ptr_camp != _our_camp:
+            if not _rebind_campaign(host, lane, ptr, dec, (L, E), log, miner):
+                log("[glm-contrib %s] FATAL: campaign CHANGED on the lane (ours=%s, pointer now "
+                    "advertises %s) and in-process rebind FAILED -- exiting. Restart to join %s."
+                    % (miner, _our_camp or "none", _ptr_camp or "none",
+                       _ptr_camp or "the current campaign"))
+                return RC_NO_CAMPAIGN
+            # Rebound: reset every per-campaign counter to a fresh-join state and keep looping.
+            last_applied, last_pub_base_event, publish_k, reject_streak = 0, None, 0, 0
+            _pubwin.reset()
+            _last_pub_t = last_progress_t = time.time()
+            repair_since, last_repair_log = None, 0.0
+            _held_since = None
+            continue
         pointer_root = dec["model_root"]
 
         # -- (0d) STALE-LANE DETECTOR: is anything on the other end still alive? Both counters come
@@ -5940,7 +6887,13 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # losses = this expert has stopped yielding for us, so release it and claim the next one. This is
         # the owner's "finish one, store it, start the next": storing is a no-op because an accepted
         # delta is already merged into the model, so the model IS the store.
+        # SILENT STARVATION: `_on_accept` fires ONLY for a record the coordinator judged as OURS and
+        # accepted. That is the one verdict-about-us an accept cannot signal through the streak (an
+        # accept sets it to 0, which is invisible when it was already 0), so capture it explicitly.
+        _accepted_ours = []
+
         def _on_accept(_rec):
+            _accepted_ours.append(1)
             # DOSE LADDER: an accepted delta means this layer's dose is landing -> back to the
             # campaign dose. Persisted only when a rung ACTUALLY reset, so an accepting layer
             # does not rewrite the state file once per record.
@@ -5953,9 +6906,21 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 "not a gate. Dose and reject streak (%d) unchanged; only a verdict ON OUR OWN "
                 "delta moves the ladder." % (miner, _rec.get("event"), L, E, _streak))
 
-        reject_streak = fold_streak_update(_folded, (L, E), miner, last_pub_base_event,
-                                           reject_streak, on_accept=_on_accept,
-                                           on_lost_race=_on_lost_race)
+        # Unit E v1 (E.5): apply the coordinator's explicit per-record `judged` verdict when present
+        # (a reject grows the streak and we CONTINUE -- never exit -- so it counts toward
+        # --advance-after exactly as an inferred reject does), else fall back to legacy inference.
+        _streak_before = reject_streak
+        reject_streak = _apply_fold_verdicts(_folded, (L, E), miner, last_pub_base_event,
+                                             reject_streak, on_accept=_on_accept,
+                                             on_lost_race=_on_lost_race)
+        # SILENT STARVATION counter (see its declaration). A tick that moved the streak or folded
+        # something is a tick the coordinator DID tell us something -- reset. Otherwise we learned
+        # nothing about work we have already published. Gated on last_pub_base_event so a miner that
+        # has not published yet, or one just re-based by an advance (which sets it back to None),
+        # can never accumulate a false streak.
+        silent_pubs = silence_update(silent_pubs, _streak_before, reject_streak,
+                                     bool(_accepted_ours), pubs_since_check)
+        pubs_since_check = 0
         # -- (1c) DOSE BACKOFF BEFORE ABANDONMENT. A plateau used to mean one thing: release the
         # coordinate. Measured 2026-07-29, that treats the wrong cause -- layers 1 and 5, which each
         # IMPROVE full-47 held-out CE alone (-0.095165, -0.054498), together returned -0.002736
@@ -5966,11 +6931,33 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # dose_trainer is None -> layer_dose_verdict returns EXHAUSTED -> the advance below runs
         # exactly as it does today.
         _plateau = bool(advance_after and reject_streak >= advance_after)
+        # A silent plateau must NOT take the dose-shrink branch: shrinking the dose answers "our
+        # deltas keep losing the gate", and here nothing of ours ever REACHED the gate. Re-dosing a
+        # coordinate the coordinator refuses to register would just burn the card more quietly.
+        _silent = bool(silent_after and silent_pubs >= silent_after)
         if _plateau and layer_dose_verdict(dose_trainer, L, accepted=False, log=log,
                                            miner=miner) == DOSE_ACTION_SHRINK:
             reject_streak = 0                    # same coordinate, smaller dose, fresh streak
             claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
-        elif _plateau:
+        elif _plateau or _silent:
+            _adv_reason = None            # set only when SILENCE (not a plateau) advances us
+            if _silent and not _plateau:
+                log("[glm-contrib %s] SILENT STARVATION on (L%d,E%d): %d published round(s) drew"
+                    " NO verdict and folded nothing (NEURAHASH_SD_ADVANCE_AFTER_SILENT=%d) --"
+                    " advancing rather than keep training a base that may never be registered."
+                    " That is the OBSERVATION; a counter over published rounds CANNOT see the"
+                    " cause, and two fit it: (a) we are being dropped PRE-REGISTER"
+                    " (wrong-lineage-slot-root), which emits no record we could ever count as a"
+                    " reject and is TERMINAL for this coordinate, or (b) the coordinator is"
+                    " merely slower than the bound and a verdict was still coming."
+                    " DISCRIMINATOR: (a) persists when the bound is raised and leaves this"
+                    " coordinate absent from every accepted record; (b) stops. Measured live"
+                    " 2026-09-21 at bound=1 the cause was (b), which is why the default bound is"
+                    " deliberately generous."
+                    % (miner, L, E, silent_pubs, silent_after))
+                # Name the REAL cause on the advance line too (see advance_claim `reason`).
+                _adv_reason = ("SILENT ADVANCE off (L%d,E%d) after %d silent publish(es)"
+                               % (L, E, silent_pubs))
             # F5b: the freshly claimed coordinate's local weights are the FROZEN BASE. If anyone
             # already trained it, our base_slot_root can never match the coordinator's and EVERY
             # later contribution is dropped `wrong-lineage-slot-root` forever, silently --
@@ -5982,8 +6969,9 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             # the miner (measured 23-minute hang, docs/NEVER_BLOCK_HANDOVER.md 0-PRE).
             landed = advance_claim(host, lane, claim_coords, (L, E), claim_identity, claim_ranked,
                                    pointer_root, dec.get("event"), cooldown, log, miner,
-                                   plateau_rejects=reject_streak, man=man)
+                                   plateau_rejects=reject_streak, reason=_adv_reason, man=man)
             reject_streak = 0
+            silent_pubs = pubs_since_check = 0   # advanced (or tried to): start the silence fresh
             if landed is None:
                 if len(claim_coords) <= 1:
                     log("[glm-contrib %s] plateaued on (L%d,E%d) after %d consecutive gate rejects, "
@@ -6028,6 +7016,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 val_ids = node_ids(args, coord_data_slot(L, E), "val")
                 regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
                 last_pub_base_event = None
+                silent_pubs = pubs_since_check = 0   # landed somewhere new: the old silence is not
+                #                                      evidence about THIS coordinate
             # Free while nothing changes: the fingerprint check in save() skips the identical rewrite
             # this all-blocked retry path would otherwise perform every iteration.
             claim_state.save(cooldown, (L, E), dec.get("event"), ladder=dose_ladder)
@@ -6136,6 +7126,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 address=(wallet.address if wallet is not None else None))
             rounds_done += 1
             last_pub_base_event = int(base_event)   # F5a: from here on, events >= this can judge us
+            pubs_since_check += 1                   # SILENT STARVATION counts PUBLISHES, not ticks
             log("[glm-contrib %s] async round %d: LAYER %d published as %d per-coordinate record(s) "
                 "in %.1fs, base_event=%d delta=%dB base_root=%s.. steps=%d (best_val_ce is nan by "
                 "design: the judge scores the result, not the miner)"
@@ -6145,6 +7136,33 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                 log("[glm-contrib %s] LAYER %d published NOTHING: no claimed coordinate resolved to a "
                     "local slot. Nothing will merge this round." % (miner, int(L)))
             continue
+        # -- Unit E v1 (E.2/E.3): CREDIT GATE + best-of-window on the normal single-record publish.
+        # Publish only when credited on the pointer's `next_up` roster (or a legacy pointer carries
+        # none, or this is our first contribution, or the liveness backstop elapsed); otherwise HOLD --
+        # keep training this coordinate and buffer the best-val-CE round, so surplus compute becomes
+        # longer training instead of wasted lane traffic. The layer-claim multi-record path above
+        # `continue`s before this gate and so publishes unchanged; the --garbage control flows here and
+        # is gated too (harmless -- best-of-window keeps its only round when best_val is NaN).
+        _slot_root_now = slot_root(host, i)
+        if not _may_publish_now(credits_on, credited, last_pub_base_event,
+                                time.time() - _last_pub_t, _credit_wait_s):
+            _pubwin.keep(_slot_root_now, best_val, payload, train_flops, steps, tokens)
+            if _held_since is None:
+                _held_since = time.time()
+                log("[glm-contrib %s] HOLD (not credited this window): training on and keeping the "
+                    "best round; publishing when next_up names us or after %.0fs backstop."
+                    % (miner, _credit_wait_s))
+            continue
+        _held_since = None
+        best_val, payload, train_flops, steps, tokens = _pubwin.take_or_current(
+            _slot_root_now, best_val, payload, train_flops, steps, tokens)
+        if _update_cap is not None and not args.garbage:
+            # Applied to the CHOSEN round, before put_delta, so expert_cid, the signature and
+            # delta_bytes are all computed on the capped object the coordinator will fetch.
+            payload, _cap_refusals = cap_for_publish(_update_cap, payload, host.read_slot(i), L, E,
+                                                     miner, log, _cap_refusals)
+            if payload is None:
+                continue
         ecid = lane.put_delta(payload)
         sig = _sign_contrib(key, wallet, ecid, base_event, miner)  # HMAC (keyed) or secp256k1 (keyless); r-number == base_event (W2 reads it so)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
@@ -6159,6 +7177,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         publish_k += 1
         rounds_done += 1
         last_pub_base_event = int(base_event)      # F5a: from here on, events >= this can judge us
+        pubs_since_check += 1                      # SILENT STARVATION counts PUBLISHES, not ticks
+        _last_pub_t = time.time()                  # Unit E v1: reset the credit-wait backstop clock
         log("[glm-contrib %s] async round %d: %s slot %d (L%d,E%d) in %.1fs, best_val_ce=%.5f, "
             "base_event=%d published as %s expert_cid=%s.. delta=%dB base_root=%s.. steps=%d tokens=%d"
             % (miner, rounds_done, "GARBAGE (adversarial control)" if args.garbage else
@@ -6287,7 +7307,12 @@ def main(argv=None):
         miner = derived
     else:
         miner = args.miner or "miner0"
-    lane = H.ContentLane(args.url, args.token)
+    # SIGNED PUT (2026-10-20, docs/STORE_AUTH_DESIGN.md): the keyless wallet key is ALREADY loaded for
+    # miner identity, so hand it to the lane client too -- publishes become attributable to the miner's
+    # address the moment the anchor turns CONTENT_SIGNED_PUT on; against today's anchor (flag off) the
+    # extra X-Sig-* headers are ignored and the v1 path stays byte-identical. Keyed mode: wallet is
+    # None -> ContentLane behaves exactly as before.
+    lane = H.ContentLane(args.url, args.token, account=wallet)
     _flush("[glm-contrib %s] UP claims GLM (L%d,E%d) via %s | local_slot=%d domain_slot=%d | "
            "identity=%s mode=%s lane=%s (all-outbound)"
            % (miner, L, E, _claim_src, i, coord_data_slot(L, E),
@@ -6438,6 +7463,7 @@ def main(argv=None):
     done_last = -1
     applied = -1            # last round whose ACCEPTED record has been replayed locally
     rounds_done = 0
+    _sync_cap_refusals = 0                   # UPDATE CAP: consecutive refusals on the sync path
     while rounds_done < args.max_rounds:
         # Identity-card heartbeat (same reason as the async path): debounced internally, so this is a
         # dict lookup on all but ~1 tick in 120 s, and a frozen published_ts is what made every
@@ -6532,6 +7558,13 @@ def main(argv=None):
             continue
 
         # ---- publish the fp16 content-addressed delta + a signed record (D1/D2), trunk FROZEN ----
+        # UPDATE CAP (default OFF; same helper as the async path, applied BEFORE the cid is computed).
+        _sync_cap = update_cap_from_env()
+        if _sync_cap is not None and not args.garbage:
+            payload, _sync_cap_refusals = cap_for_publish(
+                _sync_cap, payload, host.read_slot(i), L, E, miner, _flush, _sync_cap_refusals)
+            if payload is None:
+                continue
         ecid = lane.put_delta(payload)
         sig = _sign_contrib(key, wallet, ecid, rnd, miner)       # HMAC (keyed) or secp256k1 (keyless)
         delta_bytes = int(len(H.pack_arrays(payload, np.float16)))

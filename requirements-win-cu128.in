@@ -1,0 +1,26 @@
+# Input for requirements-win-cu128.lock (Windows x64, Python 3.13, NVIDIA CUDA 12.8 wheels).
+# Pins = the versions the reference 5090 box runs (installed metadata, read 2026-11-10).
+# Regenerate the lock with:
+#   uv pip compile requirements-win-cu128.in --generate-hashes --python-version 3.13 --python-platform x86_64-pc-windows-msvc --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128 -o requirements-win-cu128.lock
+# Every transitive wheel is held at a release from before 2026-10-27 (two weeks before lock time).
+# Install with: uv pip sync --require-hashes requirements-win-cu128.lock
+torch==2.9.1+cu128
+transformers==5.8.1
+accelerate==1.8.1
+huggingface_hub==1.10.2
+safetensors==0.7.0
+tokenizers==0.22.1
+numpy==2.2.6
+eth-account==0.13.7
+cryptography==46.0.3
+pytest==9.0.3
+# Transitive deps held at their newest release before 2026-10-27 (resolved against PyPI with
+# --exclude-newer); pinned here because the PyTorch index carries these files without upload dates.
+anyio==4.15.1
+filelock==4.2.4
+hf-xet==1.7.0
+pydantic==2.14.1
+pydantic-core==2.50.1
+regex==2026.9.29
+typer==0.27.3
+typing-inspection==0.4.4

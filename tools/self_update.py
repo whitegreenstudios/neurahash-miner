@@ -637,6 +637,83 @@ def _default_pip(repo_dir, timeout=1800):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+_SMOKE_CHILD = r'''
+import ast, importlib.util, os, sys
+repo = sys.argv[1]
+tools = os.path.join(repo, "tools")
+for p in (tools, repo):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+ENTRIES = [os.path.join(tools, n) for n in
+           ("sharddiloco_glm_contributor.py", "run_glm_miner.py", "self_update.py")]
+missing = []
+for path in ENTRIES:
+    if not os.path.exists(path):
+        continue
+    try:
+        tree = ast.parse(open(path, encoding="utf-8", errors="replace").read(), filename=path)
+    except SyntaxError as e:
+        print("SYNTAX %s:%s %s" % (os.path.basename(path), getattr(e, "lineno", "?"), e.msg))
+        sys.exit(2)
+    # Imports inside a try: are OPTIONAL by convention (the tree handles their absence), so they
+    # must not fail the gate -- otherwise a correct release with an optional dep gets blocked,
+    # which is the "gate a correct input cannot pass" failure this repo has paid for before.
+    guarded = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            for sub in ast.walk(node):
+                guarded.add(id(sub))
+    for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
+        mods = []
+        if isinstance(node, ast.Import):
+            mods = [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            mods = [node.module.split(".")[0]]
+        for m in mods:
+            try:
+                found = importlib.util.find_spec(m) is not None
+            except Exception:
+                found = False
+            if not found:
+                missing.append("%s:%d %s" % (os.path.basename(path), node.lineno, m))
+if missing:
+    print("MISSING " + "; ".join(sorted(set(missing))[:10]))
+    sys.exit(3)
+print("OK")
+'''
+
+
+def _default_smoke(repo_dir, timeout=120):
+    """Prove the NEWLY CHECKED-OUT tree can actually run, before we re-exec into it.
+
+    THE FAILURE THIS EXISTS FOR. Release 3.7.1 shipped GREEN (697 tests passed) and bricked every
+    miner that took it: `import no_toy_models` sat INSIDE build_node_model(), a function no test
+    calls because it loads a 4 GiB trunk onto a GPU, so the module was missing from the public tree
+    and nothing -- not the import system, not the suite -- noticed until miners re-exec'd and died
+    with ModuleNotFoundError. A signature proves a release is AUTHENTIC; it does not prove it RUNS.
+
+    So this walks the shipped entry points with ast.walk, which reaches imports nested inside
+    function bodies, and resolves each one with find_spec. Runs in a SUBPROCESS: the parent has the
+    OLD modules already imported and cached, so only a fresh interpreter sees the new tree.
+
+    Returns (ok: bool, detail: str). Any internal failure returns ok=True -- a broken gate must
+    never block a good update; it only ever adds a reason to roll back."""
+    try:
+        import subprocess
+        r = subprocess.run([sys.executable, "-c", _SMOKE_CHILD, repo_dir],
+                           capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, cwd=repo_dir)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if r.returncode == 0:
+            return True, out[:200]
+        return False, _head(out)
+    except Exception as e:                                           # noqa: BLE001
+        log(f"WARN: smoke gate could not run ({_exc_text(e)[:120]}); allowing the update")
+        return True, "smoke-gate-unavailable"
+
+
 def _default_reexec(argv):
     """Replace the current process with a fresh run of the miner on the NOW-checked-out code.
     Never returns.
@@ -1311,7 +1388,7 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
                      pubkey=PINNED_RELEASE_PUBKEY, enabled=None, state_path=None,
                      rate_limit_s=DEFAULT_RATE_LIMIT_S, now=None, honor_rate_limit=True,
                      timeout=STARTUP_TIMEOUT_S, manifest=None, reclaim=None, environ=None,
-                     fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None):
+                     fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None, smoke_fn=None):
     """Do at most one signed-update check and, if a VERIFIED forward release exists, apply it and
     re-exec. Returns an UpdateResult. FAIL CLOSED: any error is caught, logged as a warning, and
     the working tree is left untouched (control returns to the caller so the miner keeps running).
@@ -1412,6 +1489,27 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
     # 5) apply: git fetch + checkout <pinned commit> (list-arg git, hex-validated commit) ------
     req_before = _sha256_file(os.path.join(repo_dir, REQUIREMENTS_FILE))
     try:
+        # SHALLOW CLONES (2026-09-20). The public install line is a `git clone --depth 1` and the
+        # reference 4060 miner is one (`git rev-parse --is-shallow-repository` -> true). A shallow
+        # repo has a GRAFTED history boundary: `git fetch` honours that boundary, so a checkout
+        # that needs an object beyond it dies with `unable to read tree` and the miner strands on
+        # the old version -- at every later check, forever, because nothing about the repo changes.
+        # Deepen ONCE here, before fetching. `--unshallow` is an error on a complete repo, so ask
+        # git first; and a failure to deepen is NOT fatal -- fall through to the plain fetch, which
+        # is exactly today's behaviour, so this can only add successes.
+        try:
+            rc_s, out_s = git_fn(repo_dir, "rev-parse", "--is-shallow-repository")
+            if rc_s == 0 and str(out_s).strip().lower() == "true":
+                log("shallow clone detected -- deepening with `git fetch --unshallow` so the "
+                    "checkout cannot fail on an object beyond the graft boundary")
+                rc_u, out_u = git_fn(repo_dir, "fetch", "--quiet", "--unshallow", "origin")
+                if rc_u != 0:
+                    log(f"WARN: --unshallow returned rc={rc_u}; continuing with a plain fetch:\n"
+                        f"{_head(out_u)}")
+                else:
+                    log("clone deepened: full history now present")
+        except Exception as e:                                       # noqa: BLE001
+            log(f"WARN: shallow probe failed ({_exc_text(e)[:120]}); continuing with a plain fetch")
         rc, out = git_fn(repo_dir, "fetch", "--quiet", "origin")
         if rc != 0:
             return _announce(UpdateResult(False, "git-fetch-failed",
@@ -1486,6 +1584,31 @@ def check_and_update(repo_dir=REPO, argv=None, *, manifest_url=None, mirrors=Non
             log(f"WARN: pip install error; continuing to re-exec the signed code anyway")
             log(_head(_exc_text(e)))
 
+    # 7b) SMOKE THE NEW TREE BEFORE RE-EXEC'ING INTO IT ---------------------------------------
+    # The signature proved this release is AUTHENTIC. It did not prove it RUNS -- 3.7.1 was a
+    # correctly signed release that bricked every miner on a lazy import. Verify, and if the tree
+    # cannot run, go BACK to the code that was working and keep mining on it. A miner left running
+    # a slightly older working version is a working miner; a miner re-exec'd into a broken tree is
+    # a dead one that cannot even self-update out of the hole.
+    smoke_ok, smoke_detail = (smoke_fn or _default_smoke)(repo_dir)
+    if not smoke_ok:
+        restore = ""
+        try:
+            git_fn(repo_dir, "checkout", "--quiet", "-")
+            rc_b, head_b = git_fn(repo_dir, "rev-parse", "HEAD")
+            restore = (f"\nrolled back to {head_b.strip()[:12]}"
+                       if rc_b == 0 else "\nrollback ran but HEAD could not be re-read")
+        except Exception as e:                                       # noqa: BLE001
+            restore = f"\nthe rollback ALSO failed:\n{_head(_exc_text(e))}"
+        return _announce(UpdateResult(False, "smoke-failed",
+                                      reason=f"v{target_version} ({commit[:12]}) is correctly "
+                                             f"signed but does NOT run, so it was NOT adopted:\n"
+                                             f"{smoke_detail}{restore}",
+                                      local_version=local_version,
+                                      target_version=target_version,
+                                      manifest=manifest, fetch=fetch), spath, now=now)
+    log(f"smoke gate passed on the new tree ({smoke_detail[:60]})")
+
     # 8) re-exec onto the new code ------------------------------------------------------------
     log(f"update to v{target_version} applied; re-exec'ing miner on the new code")
     result = UpdateResult(True, "applied", reason=f"v{local_version} -> v{target_version}",
@@ -1528,7 +1651,7 @@ def sync_from_manifest(repo_dir=REPO, argv=None, *, startup=True, mirrors=None,
                        pubkey=PINNED_RELEASE_PUBKEY, enabled=None, state_path=None,
                        rate_limit_s=DEFAULT_RATE_LIMIT_S, now=None,
                        timeout=STARTUP_TIMEOUT_S, environ=None, reclaim=None,
-                       fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None):
+                       fetch_fn=None, git_fn=None, pip_fn=None, reexec_fn=None, smoke_fn=None):
     """The ONE call a launcher makes. Order is docs/MINER_MANIFEST_DESIGN.md sec.3:
 
       1. fetch + verify across ALL mirrors (best valid version wins);
@@ -1575,7 +1698,8 @@ def sync_from_manifest(repo_dir=REPO, argv=None, *, startup=True, mirrors=None,
                                enabled=enabled, state_path=state_path, rate_limit_s=rate_limit_s,
                                now=now, honor_rate_limit=not startup, timeout=timeout,
                                reclaim=reclaim, environ=environ,
-                               git_fn=git_fn, pip_fn=pip_fn, reexec_fn=reexec_fn)
+                               git_fn=git_fn, pip_fn=pip_fn, reexec_fn=reexec_fn,
+                               smoke_fn=smoke_fn)
         upd.fetch = fetch
 
         # raise the replay floor + remember the declared gate, so neither can be rolled back by a

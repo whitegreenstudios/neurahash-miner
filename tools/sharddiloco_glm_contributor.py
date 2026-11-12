@@ -1738,14 +1738,27 @@ def publish_layer_claim_records(lane, host, payload, coords, miner, base_event, 
                 "there is no per-coordinate lineage root to sign it against" % (miner, cL, cE))
             continue
         block = {k: payload["%d_%d" % (int(cL), int(cE))][k] for k in DELTA_SLOT_KEYS}
-        ecid = lane.put_delta(block)
+        try:
+            ecid = lane.put_delta(block)
+        except Exception as exc:                                 # noqa: BLE001 -- classified below
+            why = publish_failure_reason(exc)
+            if why is None:
+                raise
+            raise PublishRefused(exc, n_pub, publish_k, total_bytes, reason=why) from exc
         sig = _sign_contrib(key, wallet, ecid, base_event, miner)
         nbytes = int(len(H.pack_arrays(block, np.float16)))
         rec = build_async_contrib_record(miner, idx, cL, cE, base_event, root, ecid, sig, share,
                                          nbytes, steps, tokens, address=address,
                                          base_slot_root=slot_root(host, idx))
-        lane.put_json_named(async_publish_name(base_event, miner, publish_k,
-                                               host_campaign_id(host)), rec)
+        try:
+            lane.put_json_named(async_publish_name(base_event, miner, publish_k,
+                                                   host_campaign_id(host)), rec)
+        except Exception as exc:                                 # noqa: BLE001 -- classified below
+            why = publish_failure_reason(exc)
+            if why is None:
+                raise
+            # The name may or may not have landed (a timeout is ambiguous): never reuse it.
+            raise PublishRefused(exc, n_pub, publish_k + 1, total_bytes, reason=why) from exc
         publish_k += 1
         n_pub += 1
         total_bytes += nbytes
@@ -6259,6 +6272,113 @@ def _may_publish_now(credits_on, credited, last_pub_base_event, elapsed_since_pu
     return float(elapsed_since_pub) >= float(credit_wait_s)
 
 
+# --- PUBLISH REFUSALS (2026-11-12) ---
+# MEASURED 2026-11-11 on the 4060 joiner test (client 3.9.0): the relay answered the record PUT with
+# HTTP 403 (a wallet-signed writer outside the store's public name prefix), the HTTPError propagated
+# out of the main loop and the miner PROCESS EXITED -- one refusal killed a volunteer's GPU. The relay
+# can legitimately refuse a write at any time (403 name policy, 409 write-once, 413 body cap, 429 rate
+# limit, 507 owner quota / disk full) and the network can drop mid-PUT; none of those is a reason to
+# stop mining. Rule: a failed publish is LOGGED with the store's reason, the chosen round is KEPT in the
+# best-of-window buffer, and the next publish waits an exponential backoff (60 s doubling, cap 30 min)
+# while the GPU trains on. A programming error (anything that is not a transport/HTTP fault) still
+# raises -- this must never hide a bug.
+PUBLISH_BACKOFF_BASE_S = 60.0
+PUBLISH_BACKOFF_CAP_S = 1800.0
+# A PERMANENT refusal (an HTTP 4xx other than 408/425/429: name policy, write-once, body cap, auth)
+# will not fix itself by waiting. Retrying it forever would burn a volunteer's power for nothing, in
+# silence -- the same reason the UPDATE CAP exits after UPDATE_CAP_MAX_REFUSALS. After this many
+# CONSECUTIVE permanent refusals (~31 min with the backoff above) the miner exits with the store's
+# reason. 5xx, 429, 507 and transport faults are temporary and are retried indefinitely.
+PUBLISH_PERMANENT_MAX = 6
+_TEMPORARY_4XX = (408, 425, 429)
+
+
+class PublishRefused(Exception):
+    """A layer-claim publish stopped part-way on a relay refusal or transport fault. Carries how far
+    it got, so the caller keeps the records already on the lane and the per-miner name counter."""
+
+    def __init__(self, cause, n_pub, publish_k, total_bytes, reason=None):
+        super().__init__(str(cause))
+        self.cause, self.n_pub, self.publish_k, self.total_bytes = cause, n_pub, publish_k, total_bytes
+        # Read ONCE: publish_failure_reason drains an HTTPError's body, so a second call loses it.
+        self.reason = reason if reason is not None else publish_failure_reason(cause)
+
+
+def publish_failure_reason(exc):
+    """A one-line reason for a publish fault worth backing off on, or None for anything else (which
+    the caller must re-raise). HTTP errors carry the status and up to 200 bytes of the store's body
+    (its JSON error names the refused rule); connection faults carry their class. Never raises."""
+    import http.client as _hc                                # noqa: PLC0415
+    import urllib.error as _ue                               # noqa: PLC0415
+    import zlib as _zlib                                     # noqa: PLC0415
+    if isinstance(exc, PublishRefused):
+        return exc.reason
+    if isinstance(exc, _ue.HTTPError):
+        body = ""
+        try:
+            body = (exc.read() or b"")[:200].decode("utf-8", "replace").replace("\n", " ").strip()
+        except Exception:                                    # noqa: BLE001 -- diagnostics only
+            pass
+        return "HTTP %s%s" % (exc.code, (": " + body) if body else "")
+    if isinstance(exc, (_ue.URLError, _hc.HTTPException, OSError)):
+        return "%s: %s" % (type(exc).__name__, str(exc)[:200])
+    # A 2xx reply that is not the store's JSON (a proxy or captive-portal HTML page) or a corrupt gzip
+    # body. The only JSON/gzip DECODING inside a publish attempt is of the store's reply, so these are
+    # transport faults, not miner bugs.
+    if isinstance(exc, (json.JSONDecodeError, _zlib.error, EOFError)):
+        return "bad store reply (%s: %s)" % (type(exc).__name__, str(exc)[:160])
+    return None
+
+
+def publish_failure_is_permanent(exc):
+    """True for an HTTP 4xx that waiting cannot fix (see PUBLISH_PERMANENT_MAX)."""
+    import urllib.error as _ue                               # noqa: PLC0415
+    if isinstance(exc, PublishRefused):
+        exc = exc.cause
+    return (isinstance(exc, _ue.HTTPError) and 400 <= int(exc.code) < 500
+            and int(exc.code) not in _TEMPORARY_4XX)
+
+
+class PublishBackoff:
+    """Exponential backoff between publish attempts after a refusal. Pure apart from the clock the
+    caller passes in. `blocked(now)` -> seconds still to wait (0.0 = may publish)."""
+
+    def __init__(self, base_s=None, cap_s=None, permanent_max=None):
+        # Module values are read HERE, not bound at def time, so an operator/test override applies.
+        self.base_s = float(PUBLISH_BACKOFF_BASE_S if base_s is None else base_s)
+        self.cap_s = float(PUBLISH_BACKOFF_CAP_S if cap_s is None else cap_s)
+        self.permanent_max = int(PUBLISH_PERMANENT_MAX if permanent_max is None else permanent_max)
+        self.failures = 0
+        self.permanent = 0           # CONSECUTIVE permanent refusals; any temporary fault resets it
+        self.until = 0.0
+
+    def blocked(self, now):
+        return max(0.0, self.until - float(now))
+
+    def failed(self, now, exc=None, miner="?"):
+        """Record one failure; returns the wait chosen for the next attempt. Raises SystemExit (with the
+        store's reason) after `permanent_max` consecutive PERMANENT refusals."""
+        self.failures += 1
+        if exc is not None and publish_failure_is_permanent(exc):
+            self.permanent += 1
+            if self.permanent >= self.permanent_max:
+                raise SystemExit(
+                    "[glm-contrib %s] the store REFUSED %d consecutive publishes with a permanent error "
+                    "(last: %s); exiting instead of training with nothing published. This is a "
+                    "configuration fault (client version, wallet or relay policy): update the miner "
+                    "or report it." % (miner, self.permanent, publish_failure_reason(exc)))
+        elif exc is not None:
+            self.permanent = 0
+        wait = min(self.cap_s, self.base_s * (2 ** min(self.failures - 1, 30)))
+        self.until = float(now) + wait
+        return wait
+
+    def succeeded(self):
+        self.failures = 0
+        self.permanent = 0
+        self.until = 0.0
+
+
 # --- UPDATE CAP (owner-approved 2026-10-23, "approve D4 with probe size 512 and the update cap") ---
 # Offline gate replays (scratchpad/GATE_REPLAY_2026-10-22.md sec. 8) measured the rejected miner deltas
 # as HARMFUL at the coordinator's outer scale 0.7: the applied update 0.7*|D|/|W| was ~42% of the expert
@@ -6548,6 +6668,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     _credit_wait_s = _env_num(CREDIT_WAIT_ENV, CREDIT_WAIT_S_DEFAULT, float)
     _last_pub_t = time.time()
     _pubwin = _PublishWindow()
+    _pub_backoff = PublishBackoff()          # PUBLISH REFUSALS: a refused PUT backs off, never exits
     # UPDATE CAP (default OFF): read once, fail fast on a malformed value rather than publish uncapped.
     _update_cap = update_cap_from_env()
     if _update_cap is not None:
@@ -7057,6 +7178,16 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # advertises 0 sustainable units, and a CUDA OOM mid-round skips the round (cache freed,
         # pause, retry next round) instead of killing the miner.
         _vram_pause_if_starved(log, miner=miner)
+        if layer_claim_enabled() and not args.garbage:
+            # PUBLISH REFUSALS: the layer path keeps no buffered round, so training a layer during a
+            # backoff would only be thrown away. Wait in short slices instead (the loop top keeps the
+            # identity card fresh and re-reads the pointer).
+            _wait = _pub_backoff.blocked(time.time())
+            if _wait > 0:
+                log("[glm-contrib %s] PUBLISH BACKOFF: %.0fs left after %d refusal(s); layer training "
+                    "paused until the store accepts again." % (miner, _wait, _pub_backoff.failures))
+                time.sleep(min(_wait, 30.0))
+                continue
         t_tr = time.time()
         try:
             if args.garbage:
@@ -7120,10 +7251,29 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         # the single-record path below runs unchanged.
         _lc = layer_payload_coords(payload) if layer_claim_enabled() else None
         if _lc:
-            _n, publish_k, _bytes = publish_layer_claim_records(
-                lane, host, payload, _lc, miner, base_event, root, key, wallet, train_flops, steps,
-                tokens, publish_k, log,
-                address=(wallet.address if wallet is not None else None))
+            _wait = _pub_backoff.blocked(time.time())
+            if _wait > 0:
+                log("[glm-contrib %s] PUBLISH BACKOFF: layer round not published, %.0fs left after "
+                    "%d refusal(s); training on." % (miner, _wait, _pub_backoff.failures))
+                continue
+            try:
+                _n, publish_k, _bytes = publish_layer_claim_records(
+                    lane, host, payload, _lc, miner, base_event, root, key, wallet, train_flops,
+                    steps, tokens, publish_k, log,
+                    address=(wallet.address if wallet is not None else None))
+            except PublishRefused as _pr:
+                publish_k = _pr.publish_k
+                if _pr.n_pub > 0:
+                    # Records that DID land can be judged: F5a must listen for their verdicts.
+                    last_pub_base_event = int(base_event)
+                    pubs_since_check += 1
+                    _last_pub_t = time.time()
+                _w = _pub_backoff.failed(time.time(), _pr.cause, miner)
+                log("[glm-contrib %s] PUBLISH REFUSED (%s) after %d of %d layer record(s); "
+                    "mining continues, next publish in %.0fs (refusal #%d)."
+                    % (miner, _pr.reason, _pr.n_pub, len(_lc), _w, _pub_backoff.failures))
+                continue
+            _pub_backoff.succeeded()
             rounds_done += 1
             last_pub_base_event = int(base_event)   # F5a: from here on, events >= this can judge us
             pubs_since_check += 1                   # SILENT STARVATION counts PUBLISHES, not ticks
@@ -7154,6 +7304,12 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                     % (miner, _credit_wait_s))
             continue
         _held_since = None
+        _wait = _pub_backoff.blocked(time.time())
+        if _wait > 0:
+            _pubwin.keep(_slot_root_now, best_val, payload, train_flops, steps, tokens)
+            log("[glm-contrib %s] PUBLISH BACKOFF: %.0fs left after %d refusal(s); round kept, "
+                "training on." % (miner, _wait, _pub_backoff.failures))
+            continue
         best_val, payload, train_flops, steps, tokens = _pubwin.take_or_current(
             _slot_root_now, best_val, payload, train_flops, steps, tokens)
         if _update_cap is not None and not args.garbage:
@@ -7163,17 +7319,32 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                                                      miner, log, _cap_refusals)
             if payload is None:
                 continue
-        ecid = lane.put_delta(payload)
-        sig = _sign_contrib(key, wallet, ecid, base_event, miner)  # HMAC (keyed) or secp256k1 (keyless); r-number == base_event (W2 reads it so)
-        delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
-        record = build_async_contrib_record(miner, i, L, E, base_event, root, ecid, sig, train_flops,
-                                             delta_bytes, steps, tokens,
-                                             address=(wallet.address if wallet is not None else None),
-                                             base_slot_root=slot_root(host, i))
-        # F-Q1: unique name per publish; CAMPAIGN-SCOPED so a future run cannot discover our records
-        # (and we cannot discover a dead run's) -- the id came from the coordinator's own pointer.
-        pub_name = async_publish_name(base_event, miner, publish_k, host_campaign_id(host))
-        lane.put_json_named(pub_name, record)
+        _rec_attempted = False
+        try:
+            ecid = lane.put_delta(payload)
+            sig = _sign_contrib(key, wallet, ecid, base_event, miner)  # HMAC (keyed) or secp256k1 (keyless); r-number == base_event (W2 reads it so)
+            delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
+            record = build_async_contrib_record(miner, i, L, E, base_event, root, ecid, sig, train_flops,
+                                                 delta_bytes, steps, tokens,
+                                                 address=(wallet.address if wallet is not None else None),
+                                                 base_slot_root=slot_root(host, i))
+            # F-Q1: unique name per publish; CAMPAIGN-SCOPED so a future run cannot discover our records
+            # (and we cannot discover a dead run's) -- the id came from the coordinator's own pointer.
+            pub_name = async_publish_name(base_event, miner, publish_k, host_campaign_id(host))
+            _rec_attempted = True
+            lane.put_json_named(pub_name, record)
+        except Exception as _pe:                                 # noqa: BLE001 -- classified below
+            _why = publish_failure_reason(_pe)
+            if _why is None:
+                raise                                            # a bug, not a refusal: never hide it
+            if _rec_attempted:
+                publish_k += 1                                   # a timed-out name may have landed: never reuse it
+            _pubwin.keep(_slot_root_now, best_val, payload, train_flops, steps, tokens)
+            _w = _pub_backoff.failed(time.time(), _pe, miner)
+            log("[glm-contrib %s] PUBLISH REFUSED (%s); round kept, mining continues, next publish in "
+                "%.0fs (refusal #%d)." % (miner, _why, _w, _pub_backoff.failures))
+            continue
+        _pub_backoff.succeeded()
         publish_k += 1
         rounds_done += 1
         last_pub_base_event = int(base_event)      # F5a: from here on, events >= this can judge us
@@ -7464,6 +7635,7 @@ def main(argv=None):
     applied = -1            # last round whose ACCEPTED record has been replayed locally
     rounds_done = 0
     _sync_cap_refusals = 0                   # UPDATE CAP: consecutive refusals on the sync path
+    _sync_backoff = PublishBackoff()         # PUBLISH REFUSALS: a refused PUT backs off, never exits
     while rounds_done < args.max_rounds:
         # Identity-card heartbeat (same reason as the async path): debounced internally, so this is a
         # dict lookup on all but ~1 tick in 120 s, and a frozen published_ts is what made every
@@ -7565,17 +7737,33 @@ def main(argv=None):
                 _sync_cap, payload, host.read_slot(i), L, E, miner, _flush, _sync_cap_refusals)
             if payload is None:
                 continue
-        ecid = lane.put_delta(payload)
-        sig = _sign_contrib(key, wallet, ecid, rnd, miner)       # HMAC (keyed) or secp256k1 (keyless)
-        delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
-        record = dict(miner=miner, expert=int(i), layer=int(L), glm_expert=int(E), base_round=int(rnd),
-                      expert_cid=ecid, trunk_cid=None, sig=sig, train_flops=float(train_flops),
-                      trunk_bytes=0, delta_bytes=delta_bytes, base_root=root,
-                      base_slot_root=slot_root(host, i))     # SHARD CLAIM: per-coordinate lineage
-        if wallet is not None:
-            record["address"] = wallet.address                  # keyless: claimed address (coordinator trusts recovered)
-        rname = contrib_name(rnd, miner, host_campaign_id(host))   # campaign-scoped (None -> legacy)
-        rec_cid = lane.put_json_named(rname, record)
+        try:
+            ecid = lane.put_delta(payload)
+            sig = _sign_contrib(key, wallet, ecid, rnd, miner)       # HMAC (keyed) or secp256k1 (keyless)
+            delta_bytes = int(len(H.pack_arrays(payload, np.float16)))
+            record = dict(miner=miner, expert=int(i), layer=int(L), glm_expert=int(E), base_round=int(rnd),
+                          expert_cid=ecid, trunk_cid=None, sig=sig, train_flops=float(train_flops),
+                          trunk_bytes=0, delta_bytes=delta_bytes, base_root=root,
+                          base_slot_root=slot_root(host, i))     # SHARD CLAIM: per-coordinate lineage
+            if wallet is not None:
+                record["address"] = wallet.address                  # keyless: claimed address (coordinator trusts recovered)
+            rname = contrib_name(rnd, miner, host_campaign_id(host))   # campaign-scoped (None -> legacy)
+            rec_cid = lane.put_json_named(rname, record)
+        except Exception as _pe:                                     # noqa: BLE001 -- classified below
+            _why = publish_failure_reason(_pe)
+            if _why is None:
+                raise                                                # a bug, not a refusal: never hide it
+            _w = _sync_backoff.failed(time.time(), _pe, miner)
+            _flush("[glm-contrib %s] round %d PUBLISH REFUSED (%s); waiting %.0fs before retrying "
+                   "(refusal #%d)." % (miner, rnd, _why, _w, _sync_backoff.failures))
+            _t_end = time.time() + _w
+            while time.time() < _t_end:         # short slices so the identity card stays fresh
+                time.sleep(min(30.0, max(0.0, _t_end - time.time())))
+                heartbeat_miner_card(lane, miner,
+                                     address=(wallet.address if wallet is not None else None),
+                                     coord="L%d,E%d" % (L, E), mode=args.mode, log=_flush)
+            continue
+        _sync_backoff.succeeded()
         done_last = rnd
         rounds_done += 1
         _flush("[glm-contrib %s] round %d: %s slot %d (L%d,E%d) in %.1fs, best_val_ce=%.5f, "

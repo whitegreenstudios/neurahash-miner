@@ -4231,7 +4231,8 @@ class _CowSlots:
         return len(self._saved)
 
 
-def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, reseed=None):
+def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, reseed=None,
+                           seed_refold=None):
     """Fold ONE coordinator accepted record, then VERIFY replica bit-exactness: our local model_root MUST
     equal the record's advertised model_root. That invariant is the whole reason model_root exists (see its
     docstring) -- a divergent local replay is caught IMMEDIATELY. Two fail-CLOSED outcomes stop a
@@ -4262,7 +4263,21 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, resee
     rollback restores the reseeded slot too -- the fail-closed exit is unchanged. A coordinate the fold
     DID move is never reseeded: that mismatch is the F3 poison signature, not a stale resident copy.
     Measured motivation: the 8 GB 4060 held `frontier held at event 286` for ~15 h because its resident
-    1_6 hashed 0ffb8fc8.. while record 287 (zero rows, folded=0) advertised the seed root c42919e7.."""
+    1_6 hashed 0ffb8fc8.. while record 287 (zero rows, folded=0) advertised the seed root c42919e7..
+
+    SEED REFOLD (3.9.3, extends D1, `seed_refold`): OPTIONAL, None -> byte-identical to the above. The
+    one case D1 cannot reach: the FIRST record that touches a resident coordinate K MOVES it, and K's
+    local copy is still the untouched factory copy while the coordinator's pre-fold state for K is this
+    campaign's seed (measured 2026-11-13: record 369 moved 1_1; seed+0.7d = 0111393590.. advertised,
+    factory+0.7d = 4dc50acd.. local, frontier frozen at 368 forever). When the post-fold check fails on
+    such a K AND this process never verified any root for K, `seed_refold(cow, key, idx, want, event,
+    pre_image, refold)` may restore K's pre-fold copy, apply the hash-verified seed snapshot for K,
+    re-fold ONLY this record's rows for K, and keep the result ONLY if K's root then equals the
+    advertised root (see _seed_refold_one for every refusal: seed event, manifest entry, memo). Sound
+    because the walk replays accepted records in order from event 0: a never-verified K means no
+    earlier record touched K, so the coordinator's pre-fold state for K IS the seed. No root or hash
+    comparison is loosened -- the advertised root is still the bar -- and every write goes through
+    the same copy-on-write shim, so any refusal ends in the SAME rollback as before."""
     cow = _CowSlots(host)
     rejected, skipped, folded = [], [], set()
     try:
@@ -4280,7 +4295,7 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, resee
         return False, "poison", rejected                          # caller handles rc8 (do not advance)
     _rl = {}
     root_ok = replica_root_ok(host, rec, folded=folded, out=_rl)
-    if not root_ok and reseed is not None:
+    if not root_ok and (reseed is not None or seed_refold is not None):
         _moved = {int(j) for j in (folded or ())}
         _done_keys = set()
         while not root_ok and _rl.get("coord") is not None:
@@ -4292,8 +4307,55 @@ def _fold_accepted_checked(host, lane, rec, regate_ce, own_slot, log=None, resee
                 _idx = host.index_of(int(_L), int(_E))
             except (TypeError, ValueError):
                 _idx = None
-            if _idx is None or int(_idx) in _moved:
-                break                                             # F3: a MOVED coordinate is never reseeded
+            if _idx is None:
+                break
+            if int(_idx) in _moved:
+                # F3: a MOVED coordinate is never LATCH re-seeded. The only repair for it is the SEED
+                # REFOLD (3.9.3), and only for a coordinate this process never verified at all.
+                if seed_refold is None:
+                    break
+                if (host_campaign_id(host), _key) in _LATCH_VERIFIED_ROOTS:
+                    break                                         # an earlier record touched K: stay fail-closed
+                _pre = cow._saved.get(int(_idx))
+                if _pre is None:
+                    break                                         # moved without a pre-image: cannot restore
+                _want = str(_rl["want"])
+
+                def _refold(_j=int(_idx), _w=_want):
+                    # Re-fold ONLY this record's rows for K, through the same shim, with the same
+                    # re-gate; rows for other coordinates already sit in the base from the first fold.
+                    _sub = [it for it in rec.get("accepted", [])
+                            if _resolve_accepted_slot(cow, it) == _j]
+                    _rej, _fs = [], set()
+                    apply_accepted(cow, lane, dict(rec, accepted=_sub), log=log, ce_fn=regate_ce,
+                                   rejected=_rej, own_slot=own_slot, folded_slots=_fs)
+                    if _rej or _j not in _fs:
+                        return "refold-rejected"
+                    return "ok" if slot_root(cow, _j) == _w else "refold-root-differs"
+                try:
+                    _out = seed_refold(cow, _key, int(_idx), _want, rec.get("event"), _pre, _refold)
+                except Exception as _ex:                          # noqa: BLE001 -- a refusal, never a crash
+                    if log is not None:
+                        log("[glm-contrib lineage] SEED REFOLD %s: raised %s (%s) -- treated as a "
+                            "refusal, rolling back" % (_key, type(_ex).__name__, str(_ex)[:80]))
+                    _out = "error"
+                except BaseException:
+                    cow.rollback()
+                    raise
+                if _out != "ok":
+                    break
+                _done_keys.add(_key)
+                if log is not None:
+                    log("[glm-contrib lineage] SEED REFOLD: coordinate %s -- this node's never-verified "
+                        "copy folded to %.16s.., the record at event %s moves it and advertises %.16s..; "
+                        "restored the pre-fold copy, applied this campaign's hash-verified seed snapshot, "
+                        "folded the record onto the seed, root now matches the record."
+                        % (_key, str(_rl["local"]), rec.get("event"), _want))
+                _rl = {}
+                root_ok = replica_root_ok(host, rec, folded=folded, out=_rl)
+                continue
+            if reseed is None:
+                break
             if str(_rl["local"]) in _LATCH_VERIFIED_ROOTS.get((host_campaign_id(host), _key), ()):
                 # REVIEW FINDING 1 (2026-10-22): this exact copy was VERIFIED by an earlier accepted
                 # record in this process. A record that now advertises something else for a coordinate
@@ -5204,6 +5266,108 @@ def _latch_reseed_one(host, lane, man, campaign, coord_key, idx, want_root, log=
     return out
 
 
+# SEED REFOLD (3.9.3) shares D1's memo dict and cooldown, under its own key family
+# ("seed-refold", campaign, coord_key, advertised_root), so it is attempted AT MOST ONCE per advertised
+# root for a content verdict, and at most once per LATCH_RESEED_RETRY_S for anything transient.
+_SEED_REFOLD_TERMINAL = ("no-seed-event", "seed-not-older", "malformed", "bad-chunk", "root-mismatch",
+                         "refold-root-differs", "refold-rejected")
+
+
+def _seed_refold_one(host, lane, man, campaign, coord_key, idx, want_root, event, pre_image, refold,
+                     log=None):
+    """SEED REFOLD (3.9.3): repair a never-verified resident coordinate K that the record at `event`
+    MOVES, by folding that record onto THIS campaign's seed snapshot instead of the factory copy.
+
+    `host` is the fold's copy-on-write shim; every write below goes through it, so the caller's single
+    rollback undoes all of it. Returns "ok" only when ALL of these held, a refusal string otherwise:
+      1. a campaign is bound and an advertised root exists ("refused-no-campaign");
+      2. this campaign's seed manifest is readable ("unreadable"/"timeout": retried after the cooldown)
+         and carries an integer `event` ("no-seed-event", terminal: a manifest that does not say which
+         event it froze cannot prove the record is AFTER it);
+      3. the record's event is strictly later than the seed's ("seed-not-older", terminal: a record at or
+         before the seed event is already inside the seed, so folding it again would double-apply it);
+      4. the manifest has an entry for K ("absent", retried) that names a root ("malformed", terminal);
+      5. K is restored to its pre-fold copy, apply_seed_snapshot pins every chunk to its sha256 cid and
+         reproduces the MANIFEST's own root for K (the boot path's trust set);
+      6. `refold()` re-applies this record's rows for K and K's root then EQUALS the advertised root
+         ("refold-root-differs" / "refold-rejected", terminal).
+    The caller adds: the fold MOVED K, and this process never verified any root for K."""
+    if not campaign or not want_root or idx is None:
+        return "refused-no-campaign"
+    mkey = ("seed-refold", str(campaign), str(coord_key), str(want_root))
+    prev = _LATCH_RESEED_TRIED.get(mkey)
+    if prev is not None:
+        if prev[0] in _SEED_REFOLD_TERMINAL:
+            return "already-refused:%s" % prev[0]
+        if _latch_now() - prev[1] < LATCH_RESEED_RETRY_S:
+            return "cooling-down:%s" % prev[0]
+
+    def _say(m):
+        if log:
+            log("[glm-contrib lineage] SEED REFOLD %s: %s" % (coord_key, m))
+    out, mani = None, None
+    try:
+        mani = lane.get_json_named(seed_manifest_name(campaign), man=man)
+    except CatchupTimeout:
+        out = "timeout"
+    except Exception as e:                                           # noqa: BLE001
+        _say("seed manifest unreadable (%s) -- will retry later" % str(e)[:80])
+        out = "unreadable"
+    if out is None:
+        try:
+            if not isinstance(mani, dict):
+                out = "absent"
+                _say("this campaign has no readable seed manifest -- staying fail-closed")
+            else:
+                try:
+                    seed_event = int(mani.get("event"))
+                except (TypeError, ValueError):
+                    seed_event = None
+                if seed_event is None:
+                    out = "no-seed-event"
+                    _say("the seed manifest does not say which event it froze -- staying fail-closed")
+                elif int(event) <= seed_event:
+                    out = "seed-not-older"
+                    _say("the record at event %s is not later than the seed event %d -- staying "
+                         "fail-closed" % (event, seed_event))
+            if out is None:
+                coords = mani.get("coords")
+                coords = coords if isinstance(coords, dict) else {}
+                entry = coords.get(coord_key)
+                if entry is None and isinstance(coord_key, str):
+                    entry = (coords.get(coord_key.replace("_", ":"))
+                             or coords.get(coord_key.replace(":", "_")))
+                if not isinstance(entry, dict):
+                    out = "absent"
+                    _say("this campaign's seed manifest has no entry for it -- staying fail-closed")
+                elif not entry.get("root"):
+                    out = "malformed"
+                    _say("the seed manifest entry names no root -- refusing")
+                else:
+                    host.write_slot(idx, {k: np.array(v, copy=True) for k, v in pre_image.items()})
+                    out = apply_seed_snapshot(host, lane, man, campaign, coord_key, idx,
+                                              str(entry["root"]), log=log, seed_mani=mani)
+                    if out != "ok":
+                        _say("seed snapshot not applied (%s) -- staying fail-closed" % out)
+                    else:
+                        out = refold()
+                        if out != "ok":
+                            _say("folded the record at event %s onto the seed, but the root still "
+                                 "differs from the advertised %.16s.. (%s) -- staying fail-closed"
+                                 % (event, str(want_root), out))
+        except CatchupTimeout:
+            out = "timeout"
+            _say("a lane read hit its deadline -- will retry after the cooldown")
+        except (KeyError, TypeError, ValueError, IndexError) as e:
+            _say("malformed seed entry (%s: %s) -- refusing" % (type(e).__name__, str(e)[:80]))
+            out = "malformed"
+        except Exception as e:                                       # noqa: BLE001
+            _say("raised %s (%s) -- will retry after the cooldown" % (type(e).__name__, str(e)[:80]))
+            out = "error"
+    _LATCH_RESEED_TRIED[mkey] = (out, _latch_now())
+    return out
+
+
 def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
                    budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None,
                    man=None):
@@ -5685,10 +5849,16 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
     campaign = host_campaign_id(host)      # CAMPAIGN SCOPE: only this campaign's accepted records
     lane = _DeadlineLane(lane, _catchup_call_timeout_s())
     _reseed = None
+    _refold = None
     if campaign and _latch_reseed_enabled():
         # D1 LATCH RE-SEED: see _fold_accepted_checked / _latch_reseed_one for every refusal.
         def _reseed(h, key, idx, want):
             return _latch_reseed_one(h, lane, man, campaign, key, idx, want, log=log)
+
+        # SEED REFOLD (3.9.3, same switch): see _fold_accepted_checked / _seed_refold_one.
+        def _refold(h, key, idx, want, event, pre, refold_fn):
+            return _seed_refold_one(h, lane, man, campaign, key, idx, want, event, pre, refold_fn,
+                                    log=log)
     for e in scan_accepted_events_bounded(man, last_applied, frontier, campaign=campaign):
         entry = man.get(accepted_name(e, campaign))
         if not entry:
@@ -5703,7 +5873,7 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             break                                            # transient fetch fail -> retry next tick
         try:
             ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot,
-                                                          log=log, reseed=_reseed)
+                                                          log=log, reseed=_reseed, seed_refold=_refold)
         except CatchupTimeout as ex:                         # a delta fetch INSIDE the fold hung
             log("[glm-contrib %s] catch-up: BLOCKED fetching a delta of accepted event %d (%s) -- "
                 "training against the current base and retrying next tick" % (miner, e, ex))

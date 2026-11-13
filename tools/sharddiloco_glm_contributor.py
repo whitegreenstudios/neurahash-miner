@@ -6291,6 +6291,35 @@ PUBLISH_BACKOFF_CAP_S = 1800.0
 # reason. 5xx, 429, 507 and transport faults are temporary and are retried indefinitely.
 PUBLISH_PERMANENT_MAX = 6
 _TEMPORARY_4XX = (408, 425, 429)
+# NAME TAKEN (3.9.2, measured 2026-11-13): a 403 "name not owned by signer" means the record NAME already
+# exists under another writer -- the 4060 restarted with publish_k=0 while the coordinator sat on one
+# base_event, and names .0-.450 had been written by an earlier unsigned client, so every publish hit one
+# and 3.9.1 exited after 6. The next name is free, so this is a collision, not a configuration fault:
+# skip to the next name after a short wait. Bounded: NAME_TAKEN_MAX in a row exits at once. Async paths
+# only: the sync path's name has no .k suffix, so a taken name stays taken there (3.9.1 rules apply).
+NAME_TAKEN_MAX = 20
+NAME_TAKEN_RETRY_S = 5.0
+_NAME_TAKEN_MARKERS = ("name not owned by signer", "name not writable with the public token")
+
+
+def fresh_publish_k(now=None):
+    """The first publish counter of a run (3.9.2). Milliseconds since the epoch, so a restarted miner
+    starts ABOVE every name an earlier run of the same miner could have used (a run publishes far less
+    than once per millisecond), instead of at 0 where it collides with them. Names are read by the
+    coordinator from the RECORD, never parsed from the suffix, so a large k is safe."""
+    return int((time.time() if now is None else float(now)) * 1000)
+
+
+def publish_failure_is_name_taken(exc, reason=None):
+    """True iff the store refused because the record NAME is owned by another writer."""
+    import urllib.error as _ue                               # noqa: PLC0415
+    if isinstance(exc, PublishRefused):
+        reason = reason if reason is not None else exc.reason
+        exc = exc.cause
+    if not (isinstance(exc, _ue.HTTPError) and int(exc.code) == 403):
+        return False
+    why = reason if reason is not None else ""
+    return any(m in why for m in _NAME_TAKEN_MARKERS)
 
 
 class PublishRefused(Exception):
@@ -6314,11 +6343,19 @@ def publish_failure_reason(exc):
     if isinstance(exc, PublishRefused):
         return exc.reason
     if isinstance(exc, _ue.HTTPError):
-        body = ""
-        try:
-            body = (exc.read() or b"")[:200].decode("utf-8", "replace").replace("\n", " ").strip()
-        except Exception:                                    # noqa: BLE001 -- diagnostics only
-            pass
+        # The body can be READ ONCE; keep it on the exception so a second classification (e.g. the
+        # name-taken check after the log line) sees the store's reason too (3.9.2).
+        body = getattr(exc, "_nh_body", None)
+        if body is None:
+            body = ""
+            try:
+                body = (exc.read() or b"")[:200].decode("utf-8", "replace").replace("\n", " ").strip()
+            except Exception:                                # noqa: BLE001 -- diagnostics only
+                pass
+            try:
+                exc._nh_body = body
+            except Exception:                                # noqa: BLE001 -- best effort
+                pass
         return "HTTP %s%s" % (exc.code, (": " + body) if body else "")
     if isinstance(exc, (_ue.URLError, _hc.HTTPException, OSError)):
         return "%s: %s" % (type(exc).__name__, str(exc)[:200])
@@ -6350,14 +6387,30 @@ class PublishBackoff:
         self.permanent_max = int(PUBLISH_PERMANENT_MAX if permanent_max is None else permanent_max)
         self.failures = 0
         self.permanent = 0           # CONSECUTIVE permanent refusals; any temporary fault resets it
+        self.name_taken = 0          # CONSECUTIVE name-taken refusals (see NAME_TAKEN_MAX)
         self.until = 0.0
 
     def blocked(self, now):
         return max(0.0, self.until - float(now))
 
-    def failed(self, now, exc=None, miner="?"):
+    def failed(self, now, exc=None, miner="?", reason=None):
         """Record one failure; returns the wait chosen for the next attempt. Raises SystemExit (with the
-        store's reason) after `permanent_max` consecutive PERMANENT refusals."""
+        store's reason) after `permanent_max` consecutive PERMANENT refusals. A name-taken refusal
+        (`reason` carries the store's text; the HTTP body can be read only once) waits only
+        NAME_TAKEN_RETRY_S and does not count, until NAME_TAKEN_MAX of them arrive in a row."""
+        if exc is not None and publish_failure_is_name_taken(exc, reason):
+            # Not counted in `failures`: a skipped name must not lengthen the backoff of a later fault.
+            self.name_taken += 1
+            if self.name_taken >= NAME_TAKEN_MAX:
+                raise SystemExit(
+                    "[glm-contrib %s] the store refused %d consecutive record NAMES as owned by another "
+                    "writer (last: %s); exiting. Either another process publishes as this miner, or the "
+                    "name is reserved by the relay: check for a duplicate miner, then update or report it."
+                    % (miner, self.name_taken, reason or publish_failure_reason(exc)))
+            self.until = float(now) + NAME_TAKEN_RETRY_S
+            return NAME_TAKEN_RETRY_S
+        if exc is not None:
+            self.name_taken = 0
         self.failures += 1
         if exc is not None and publish_failure_is_permanent(exc):
             self.permanent += 1
@@ -6376,6 +6429,7 @@ class PublishBackoff:
     def succeeded(self):
         self.failures = 0
         self.permanent = 0
+        self.name_taken = 0
         self.until = 0.0
 
 
@@ -6630,9 +6684,10 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     # trunk-free base it returns REGATE_UNAVAILABLE (fold-loudly, never silently) instead.
     regate_ce = make_regate_ce(G, model, val_ids, miner=miner, log=log)
     last_applied = 0            # events <= this are folded into our base (event 0 == the fresh base)
-    publish_k = 0               # F-Q1: per-miner monotonic publish counter -> a UNIQUE record name every
+    publish_k = fresh_publish_k()  # F-Q1: per-miner monotonic publish counter -> a UNIQUE record name every
                                 # publish, so a 2nd H-block against the same base_event never repoints (and
-                                # silently drops) the previous record. Never resets within a run.
+                                # silently drops) the previous record. Never resets within a run, and
+                                # 3.9.2: starts at the clock (ms), never 0, so a restart cannot reuse names.
     last_progress_t = time.time()
     rounds_done = 0             # OUR OWN published contributions -- this is what --max-rounds counts here
     # SHARD CLAIM: claim-and-advance state. `reject_streak` counts CONSECUTIVE events where the
@@ -6953,7 +7008,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                        _ptr_camp or "the current campaign"))
                 return RC_NO_CAMPAIGN
             # Rebound: reset every per-campaign counter to a fresh-join state and keep looping.
-            last_applied, last_pub_base_event, publish_k, reject_streak = 0, None, 0, 0
+            last_applied, last_pub_base_event, publish_k, reject_streak = 0, None, fresh_publish_k(), 0
             _pubwin.reset()
             _last_pub_t = last_progress_t = time.time()
             repair_since, last_repair_log = None, 0.0
@@ -7268,7 +7323,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                     last_pub_base_event = int(base_event)
                     pubs_since_check += 1
                     _last_pub_t = time.time()
-                _w = _pub_backoff.failed(time.time(), _pr.cause, miner)
+                _w = _pub_backoff.failed(time.time(), _pr.cause, miner, reason=_pr.reason)
                 log("[glm-contrib %s] PUBLISH REFUSED (%s) after %d of %d layer record(s); "
                     "mining continues, next publish in %.0fs (refusal #%d)."
                     % (miner, _pr.reason, _pr.n_pub, len(_lc), _w, _pub_backoff.failures))
@@ -7340,7 +7395,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             if _rec_attempted:
                 publish_k += 1                                   # a timed-out name may have landed: never reuse it
             _pubwin.keep(_slot_root_now, best_val, payload, train_flops, steps, tokens)
-            _w = _pub_backoff.failed(time.time(), _pe, miner)
+            _w = _pub_backoff.failed(time.time(), _pe, miner, reason=_why)
             log("[glm-contrib %s] PUBLISH REFUSED (%s); round kept, mining continues, next publish in "
                 "%.0fs (refusal #%d)." % (miner, _why, _w, _pub_backoff.failures))
             continue
@@ -7753,7 +7808,7 @@ def main(argv=None):
             _why = publish_failure_reason(_pe)
             if _why is None:
                 raise                                                # a bug, not a refusal: never hide it
-            _w = _sync_backoff.failed(time.time(), _pe, miner)
+            _w = _sync_backoff.failed(time.time(), _pe, miner)   # fixed name: no name-taken skip
             _flush("[glm-contrib %s] round %d PUBLISH REFUSED (%s); waiting %.0fs before retrying "
                    "(refusal #%d)." % (miner, rnd, _why, _w, _sync_backoff.failures))
             _t_end = time.time() + _w

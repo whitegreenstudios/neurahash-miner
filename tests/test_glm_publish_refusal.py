@@ -310,6 +310,7 @@ def glm(_glm, monkeypatch):
         host.write_slot(i, d)
     monkeypatch.setenv("NEURAHASH_SD_ASYNC", "1")
     monkeypatch.delenv("NEURAHASH_SHARDDILOCO_MAX_STALENESS", raising=False)
+    monkeypatch.setattr(N, "fresh_publish_k", lambda now=None: 0)   # 3.9.2: names counted from 0 here
     return G, model, host, slots, seq
 
 
@@ -366,6 +367,91 @@ class TestThroughTheMinerLoop:
         assert _run(glm, store, logs) == 0 and store.refused == 1
         assert any("PUBLISH BACKOFF" in m for m in logs)      # the blocked branch really ran
         assert _pubs(store) == ["cg/r0/tester.1"]
+
+    def test_names_owned_by_another_writer_are_skipped_not_fatal(self, glm, monkeypatch):
+        # 3.9.2 (measured 2026-11-13): 403 "name not owned by signer" on .0-.450 made 3.9.1 exit after 6.
+        monkeypatch.setattr(N, "PUBLISH_PERMANENT_MAX", 3)
+        monkeypatch.setattr(N, "NAME_TAKEN_RETRY_S", 0.0)
+        store = _RefusingStore(_http(403, TestNameTaken.TAKEN), n_refuse=10)
+        assert _run(glm, store) == 0 and store.refused == 10
+        assert _pubs(store) == ["cg/r0/tester.10"]
+
+
+class TestNameTaken:
+    """3.9.2 (measured 2026-11-13): a restarted 4060 started at publish_k=0 while the coordinator sat on
+    one base_event; names .0-.450 were owned by an earlier unsigned client, so every publish got 403
+    "name not owned by signer" and 3.9.1 exited after 6, ten times in one night."""
+
+    TAKEN = b'{"ok": false, "error": "name not owned by signer: cg/e2c4cb58fcfb41cc/r368/glm-c47c9334.4"}'
+
+    def test_fresh_publish_k_starts_at_the_clock_not_zero(self):
+        assert N.fresh_publish_k(now=1794451197.709) == 1794451197709
+        assert N.fresh_publish_k() > 10 ** 12
+
+    def test_a_restart_starts_above_every_name_the_previous_run_used(self):
+        first = N.fresh_publish_k(now=1000.0)
+        used_by_run1 = first + 10000                         # 10k publishes, far more than a real run
+        assert N.fresh_publish_k(now=1000.0 + 11.0) > used_by_run1
+
+    def test_classifies_name_taken(self):
+        e = _http(403, self.TAKEN)
+        why = N.publish_failure_reason(e)
+        assert N.publish_failure_is_name_taken(e, why) is True
+        pr = N.PublishRefused(_http(403, self.TAKEN), 1, 5, 10)
+        assert N.publish_failure_is_name_taken(pr) is True
+
+    def test_other_403s_are_not_name_taken(self):
+        e = _http(403)                                       # "name outside the public namespace"
+        assert N.publish_failure_is_name_taken(e, N.publish_failure_reason(e)) is False
+        e = _http(409, self.TAKEN)
+        assert N.publish_failure_is_name_taken(e, N.publish_failure_reason(e)) is False
+
+    def test_name_taken_is_skipped_quickly_and_never_exits_early(self):
+        b = N.PublishBackoff(base_s=60, cap_s=1800, permanent_max=3)
+        for _ in range(N.NAME_TAKEN_MAX - 1):
+            e = _http(403, self.TAKEN)
+            assert b.failed(0.0, e, "mX", reason=N.publish_failure_reason(e)) == N.NAME_TAKEN_RETRY_S
+        assert b.permanent == 0
+
+    def test_a_long_run_of_name_taken_exits_at_exactly_the_limit(self):
+        b = N.PublishBackoff(base_s=1, cap_s=10, permanent_max=3)
+        n = 0
+        with pytest.raises(SystemExit) as ei:
+            for _ in range(N.NAME_TAKEN_MAX + 5):
+                n += 1
+                e = _http(403, self.TAKEN)
+                b.failed(0.0, e, "mX", reason=N.publish_failure_reason(e))
+        assert n == N.NAME_TAKEN_MAX and "duplicate miner" in str(ei.value)
+
+    def test_name_taken_does_not_inflate_a_later_backoff(self):
+        b = N.PublishBackoff(base_s=60, cap_s=1800, permanent_max=6)
+        for _ in range(10):
+            e = _http(403, self.TAKEN)
+            b.failed(0.0, e, "mX", reason=N.publish_failure_reason(e))
+        assert b.failed(0.0, _http(503)) == 60.0             # first REAL fault: base wait, not 1800
+
+    def test_without_a_reason_name_taken_is_the_3_9_1_permanent_path(self):
+        # The sync path passes no reason (its name has no .k suffix): 3.9.1 behaviour, exit after 3.
+        b = N.PublishBackoff(base_s=1, cap_s=10, permanent_max=3)
+        e = _http(403, self.TAKEN)
+        N.publish_failure_reason(e)
+        b.failed(0.0, e, "mX"); b.failed(0.0, e, "mX")
+        with pytest.raises(SystemExit):
+            b.failed(0.0, e, "mX")
+
+    def test_the_same_error_classifies_the_same_twice(self):
+        e = _http(403, self.TAKEN)                           # the body can be read only once
+        first, second = N.publish_failure_reason(e), N.publish_failure_reason(e)
+        assert first == second and "not owned by signer" in second
+        assert N.publish_failure_is_name_taken(e, second) is True
+
+    def test_success_resets_the_name_taken_streak(self):
+        b = N.PublishBackoff(base_s=1, cap_s=10, permanent_max=3)
+        for _ in range(5):
+            e = _http(403, self.TAKEN)
+            b.failed(0.0, e, "mX", reason=N.publish_failure_reason(e))
+        b.succeeded()
+        assert b.name_taken == 0
 
 
 if __name__ == "__main__":

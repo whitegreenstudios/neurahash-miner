@@ -1,0 +1,8 @@
+# Every file in glm-node/ is checked out BYTE-FOR-BYTE on every OS.
+#
+# Why: the training runner, its P2P transport and its wire codec are identified by sha256 (the fleet
+# compares them: a node whose runner sha differs is refused as a version skew). Some of these files
+# use CRLF line endings and some LF. Without this line, Git for Windows (core.autocrlf=true, the
+# installer's default) rewrites LF files to CRLF on checkout, Linux/macOS checkouts get LF where the
+# fleet has CRLF, and in both cases the sha256 no longer matches MANIFEST.sha256.
+* -text

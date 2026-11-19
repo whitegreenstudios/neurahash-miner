@@ -246,6 +246,66 @@ def tx_root(txs):
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Mint-split commitment (settlement chains, 2026-09-24)
+# ---------------------------------------------------------------------------
+# A settlement mint block credits its reward pro-rata to a `contributors` split {address: weight} that travels
+# NEXT TO the header, not inside it. The optional BlockHeader.split_hash commits to that split exactly as tx_root
+# commits to a block's txs, and State.apply_block binds the two, so a block that carries it has WHO is paid and
+# HOW MUCH each gets covered by the coordinator signature over the header hash. The tag versions the encoding.
+MINT_SPLIT_HASH_TAG = "nrh-mint-split/v1"
+
+
+def canonical_mint_split(contributors):
+    """The canonical ASCII string a mint's contributor split is committed over (mint_split_hash hashes it):
+
+        json.dumps([MINT_SPLIT_HASH_TAG, [[address, weight_hex], ...]], separators=(",", ":"), ensure_ascii=True)
+
+    * PAIRS SORTED BY ADDRESS (Python str order = Unicode code-point order). The commitment is over the SET of
+      (address, weight) pairs, never over the order a transport serialised a JSON object in (member order is not
+      portable across JSON implementations); apply_block applies a bound split in this same sorted order, so its
+      result does not depend on that order either.
+    * ADDRESS CASE: the exact ledger key, case-sensitive and never normalised. apply_block credits the key string
+      as given, so "0xAbC.." and "0xabc.." are DIFFERENT ledger accounts; hashing a normalised form would let a
+      re-cased key verify while crediting a different account (and a lowercased key is not transfer-capable).
+    * EXACT FLOATS: weight_hex = float.hex(weight), the exact IEEE-754 double, not a decimal rendering.
+    * STRICT TYPES: the split must be an exact dict, every address an exact str and every weight a finite Python
+      float -- what settle() stores and what a JSON round trip of it yields. Anything else raises ValueError, so a
+      re-typed weight (1.0 -> 1, "1.0", true) or a non-string key can never hash equal to the signed split, and a
+      dict subclass cannot show this hash one split and apply_block's credit loop another. Every stored entry is
+      committed (a zero weight too), and an empty split has its own commitment, so no recipient can be added to a
+      bound block that minted nothing.
+    * NO JOINABLE SURROGATE PAIR: an address holding a high surrogate immediately followed by a low one (two
+      separate code points) is refused. Under ensure_ascii that pair escapes to exactly the text of the astral
+      character a JSON decoder joins it into, so admitting it let two different ledger keys share one commitment
+      (a real forgery, found in review 2026-09-24). It is the ONLY such collision: every other code point, a lone
+      surrogate included, has an escape no other string produces, and a lone surrogate round-trips through JSON
+      text unchanged -- so it stays bindable (refusing every surrogate would let a free-form identity label stall
+      every bound settle it appears in)."""
+    if type(contributors) is not dict:
+        raise ValueError(f"mint split must be a plain dict {{address: weight}} (got {type(contributors).__name__})")
+    pairs = []
+    for addr, w in contributors.items():
+        if type(addr) is not str:
+            raise ValueError(f"mint split address {addr!r} must be a str (got {type(addr).__name__})")
+        if any("\ud800" <= hi <= "\udbff" and "\udc00" <= lo <= "\udfff" for hi, lo in zip(addr, addr[1:])):
+            raise ValueError(f"mint split address {addr!r} holds a joinable surrogate pair (it would collide with "
+                             f"the astral character a JSON decoder joins it into)")
+        if type(w) is not float:
+            raise ValueError(f"mint split weight for {addr!r} must be a float (got {type(w).__name__})")
+        if not math.isfinite(w):
+            raise ValueError(f"mint split weight for {addr!r} is not finite: {w!r}")
+        pairs.append([addr, w.hex()])
+    pairs.sort(key=lambda p: p[0])
+    return json.dumps([MINT_SPLIT_HASH_TAG, pairs], separators=(",", ":"), ensure_ascii=True)
+
+
+def mint_split_hash(contributors):
+    """sha256 hex of canonical_mint_split(contributors) -- the value a bound settlement block carries in
+    BlockHeader.split_hash. Raises ValueError for a split that has no canonical form (see there)."""
+    return hashlib.sha256(canonical_mint_split(contributors).encode("ascii")).hexdigest()
+
+
 # ===========================================================================
 # Block header
 # ===========================================================================
@@ -255,7 +315,7 @@ class BlockHeader:
 
     def __init__(self, height, prev_hash, beacon, parent_checkpoint, new_checkpoint,
                  work_score, proposer, reward, tx_root, timestamp,
-                 protocol_version=GENESIS_VERSION, quorum_hash=""):
+                 protocol_version=GENESIS_VERSION, quorum_hash="", split_hash=""):
         self.height = int(height)
         self.prev_hash = prev_hash
         self.beacon = beacon                       # = sha256(prev_hash) hex (set by consensus)
@@ -272,6 +332,11 @@ class BlockHeader:
         # this binds it INTO the coordinator-signed block hash, so the quorum can no longer be
         # stripped/swapped after signing (the residual the appended-after-sig quorum field left).
         self.quorum_hash = str(quorum_hash or "")
+        # (mint-split binding, 2026-09-24) OPTIONAL mint_split_hash(contributors) of the settlement split this
+        # block mints to. Empty for every block built with the binding flag off => omitted from canonical() =>
+        # byte-identical hash and bytes. When set it is INSIDE the coordinator-signed hash and apply_block refuses
+        # any contributors that do not hash to it: the split is then signed the way tx_root signs the txs.
+        self.split_hash = str(split_hash or "")
         # the consensus-rules version this block was produced under. NOT proposer-chosen:
         # validate_block requires it to equal parent_state.child_version(height), so there is
         # exactly one valid value per height (which is also why the signed Commitment doesn't
@@ -295,6 +360,9 @@ class BlockHeader:
         }
         if self.quorum_hash:                       # only when present => byte-identical hash when absent
             d["quorum_hash"] = self.quorum_hash
+        split_hash = getattr(self, "split_hash", "")  # getattr: a header unpickled from before the field
+        if split_hash:                             # only when present => byte-identical hash when absent
+            d["split_hash"] = split_hash
         return d
 
     def hash(self):
@@ -317,6 +385,7 @@ class BlockHeader:
             reward=_finite(d["reward"]), tx_root=d["tx_root"], timestamp=d["timestamp"],
             protocol_version=int(d.get("protocol_version", GENESIS_VERSION)),
             quorum_hash=d.get("quorum_hash", ""),
+            split_hash=d.get("split_hash", ""),
         )
 
 
@@ -918,7 +987,9 @@ class State:
         `contributors`: dict[address -> weight]; weights must be >= 0. The reward is
         split pro-rata by weight (matching neurahash.chain.mint_block). If total weight is
         0 (zero-useful-work block) NO reward is minted (Sybil/zero-work blocks gain
-        nothing), and minted does not advance.
+        nothing), and minted does not advance. If the header carries split_hash (a bound
+        settlement mint), `contributors` must hash to it (mint_split_hash) or this raises,
+        and the split is applied in canonical (sorted) order.
         """
         ns = self.copy()
         h = block.header.height
@@ -928,6 +999,24 @@ class State:
         # the chain signature / block-hash checks pin, so this makes the binding load-bearing.
         if block.header.tx_root != tx_root(block.txs):
             raise ValueError("apply_block: header.tx_root != tx_root(block.txs)")
+
+        # (mint-split binding, 2026-09-24) bind the committed split_hash to the contributors actually minted to,
+        # exactly as tx_root is bound to the txs above: a settlement block whose signed header carries split_hash
+        # applies ONLY with the split that hashes to it, so a served block list cannot re-point, re-weight, add or
+        # drop a recipient without breaking the coordinator signature over the header. Every replayer runs this,
+        # whatever its own checks (chain_settlement._replay_blocks, the round-authority Candidate.accept). A bound
+        # split is applied in canonical (sorted) order, so the pro-rata float sum below cannot depend on how a
+        # transport ordered it. Empty split_hash -- every block built with the binding flag off -- skips all of
+        # this, and the loop below is then the legacy path, unchanged.
+        bound_split = getattr(block.header, "split_hash", "")
+        if bound_split:
+            try:
+                got = mint_split_hash(contributors)
+            except ValueError as e:
+                raise ValueError(f"apply_block: contributors do not match header.split_hash ({e})") from None
+            if got != bound_split:
+                raise ValueError("apply_block: contributors do not match header.split_hash "
+                                 "(the coordinator-signed mint split)")
 
         # (a0) mature any unbonding stake whose release height has been reached -> liquid.
         ns._mature_unbonding(h)
@@ -964,7 +1053,7 @@ class State:
 
         # (b) reward split by contributor weight, clamped to the live cap
         agg = {}
-        for addr, w in contributors.items():
+        for addr, w in (sorted(contributors.items()) if bound_split else contributors.items()):
             w = float(w)
             if w < 0:
                 raise ValueError("negative contributor weight")

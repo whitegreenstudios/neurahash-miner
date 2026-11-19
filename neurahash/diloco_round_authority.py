@@ -358,7 +358,16 @@ class Candidate:
             expected = elect_proposer(order, unavailable)
             if expected is None or _norm(who) != _norm(expected):
                 return False, f"out-of-turn: proposer {who} is not the elected {expected}"
-        rec = envelope.get("block") or {}
+        # A PRIVATE deep copy of the proposed block, taken before any check: the header parse, the signature,
+        # apply_block and the stored record below all see this copy only, so a caller that later mutates (or
+        # reuses) its envelope can never change the split this replica stored. It used to store dict(rec), a
+        # shallow copy sharing `contributors` with the envelope: a later edit silently re-pointed the replica's
+        # stored split (binding off) or made the replica fail its own verify() (binding on) -- MINT_SPLIT_BINDING
+        # section 6.
+        try:
+            rec = copy.deepcopy(envelope.get("block") or {})
+        except Exception as e:
+            return False, f"malformed block ({type(e).__name__})"
         try:
             hdr = BlockHeader.from_dict(rec["header"])
         except Exception as e:
@@ -385,7 +394,7 @@ class Candidate:
                 Block(header=hdr, txs=[], pouw={}), rec["contributors"])
         except Exception as e:
             return False, f"block does not apply ({type(e).__name__})"
-        self.chain.blocks.append(dict(rec))
+        self.chain.blocks.append(dict(rec))                    # rec is already this replica's private deep copy
         self.chain.head = hdr.hash()
         return True, "ok"
 

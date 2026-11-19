@@ -18,16 +18,42 @@ cap + signed blocks). It does NOT yet run the FULL PoUW consensus (validate_bloc
 validators) — folding the pool fully into neura_l1 consensus is the coordinator-decentralization (L3)
 milestone. The per-height reward AMOUNT follows the caller's schedule (the pool's reward_at); the chain
 enforces the hard cap + the signed, replayable settlement.
+
+MINT-SPLIT BINDING (2026-09-24, reader side ported to the public client 2026-11-19). A settlement mint credits its
+reward to a `contributors` split that travels NEXT TO the signed header. A block whose header carries split_hash
+(= neura_l1.block_state.mint_split_hash(contributors)) has that split covered by the coordinator signature;
+State.apply_block refuses any stored split that does not hash to it, so every replayer (verify / from_state /
+verify_public_chain here, the round-authority Candidate.accept) rejects a tampered bound block. A block without
+split_hash is LEGACY-UNBOUND: applied exactly as before (byte-identical results) and REPORTED
+(verify_public_chain_report, unbound_mints()); strict mode (require_split_binding=True) rejects it. Emission is
+DEFAULT OFF (NEURAHASH_BIND_MINT_SPLIT); verification needs no flag.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 
-from neura_l1.block_state import (State, Block, BlockHeader, tx_root,
+from neura_l1.block_state import (State, Block, BlockHeader, tx_root, mint_split_hash,
                                   GENESIS_PREV_HASH, GENESIS_VERSION, MAX_SUPPLY)
 from neura_l1.signing import (gen_account, account_from_key, sign_bytes, recover_bytes,
                               verify_only_account)
+
+
+_TRUTHY = ("1", "on", "true", "enforce", "enabled", "yes")
+
+# (mint-split binding, 2026-09-24) EMISSION flag. When ON, settle() folds mint_split_hash(contributors) into the
+# block header BEFORE signing, so the coordinator signature covers WHO is paid (BlockHeader.split_hash, bound by
+# State.apply_block). DEFAULT OFF: every block stays byte-identical to today until the owner flips it with a
+# coordinated restart. Verification needs no flag: every replayer checks a bound block whatever this says.
+BIND_MINT_SPLIT_ENV = "NEURAHASH_BIND_MINT_SPLIT"
+
+
+def _env_bind_mint_split(env=None):
+    """The env override for the mint-split binding EMISSION flag. True only for an explicit truthy value; any other
+    / absent value is False (today's unbound blocks, byte-identical)."""
+    v = (os.environ if env is None else env).get(BIND_MINT_SPLIT_ENV, "")
+    return str(v).strip().lower() in _TRUTHY
 
 
 def _beacon(prev_hash):
@@ -93,7 +119,8 @@ def _verify_block_quorum(rec, hdr, quorum_roster, quorum_m):
 
 
 def _replay_blocks(blocks, coord_address, genesis_checkpoint,
-                   *, require_quorum=False, quorum_roster=None, quorum_m=None):
+                   *, require_quorum=False, quorum_roster=None, quorum_m=None,
+                   require_split_binding=False, unbound_mints=None):
     """Replay a signed block chain from genesis into a fresh State, checking every block's
     coordinator signature against `coord_address` (a plain string -- no `Account`/private key
     required) and the prev_hash chain. Module-level free function so replay does not require a
@@ -108,7 +135,14 @@ def _replay_blocks(blocks, coord_address, genesis_checkpoint,
     without one, or whose quorum does not bind to the block's (recipient, reward, height), is
     REJECTED -- making the quorum, not the lone coordinator signature, the trust root. Default
     `require_quorum=False` => byte-identical to the single-coordinator replay above (the quorum
-    field, if present, is ignored exactly as before)."""
+    field, if present, is ignored exactly as before).
+
+    (Mint-split binding, 2026-09-24) A block whose signed header carries `split_hash` is checked
+    against its stored contributor split ALWAYS -- inside State.apply_block, so a mismatch fails as
+    "block i: does not apply (apply_block: contributors do not match header.split_hash ...)". A block
+    WITHOUT it is LEGACY-UNBOUND: applied exactly as before, and its index appended to `unbound_mints`
+    when a list is passed (meaningful only when ok is True). `require_split_binding=True` (strict,
+    default off) REJECTS an unbound block instead. Both defaults => byte-identical to the replay above."""
     st = State(model_checkpoint=genesis_checkpoint)
     head = GENESIS_PREV_HASH
     for i, rec in enumerate(blocks):
@@ -125,10 +159,18 @@ def _replay_blocks(blocks, coord_address, genesis_checkpoint,
             ok_q, reason_q = _verify_block_quorum(rec, hdr, quorum_roster, quorum_m)
             if not ok_q:
                 return st, False, f"block {i}: quorum enforce failed ({reason_q})"
+        # (mint-split binding) a header carrying split_hash is checked inside apply_block below, always. One
+        # WITHOUT it is a legacy-unbound mint: strict mode rejects it here; otherwise it applies as before and is
+        # reported after it applied.
+        if require_split_binding and not hdr.split_hash:
+            return st, False, (f"block {i}: mint split is not bound into the signed header "
+                               f"(legacy unbound mint; split binding required)")
         try:
             st = st.apply_block(Block(header=hdr, txs=[], pouw={}), rec["contributors"])
         except Exception as e:
             return st, False, f"block {i}: does not apply ({e})"
+        if unbound_mints is not None and not hdr.split_hash:
+            unbound_mints.append(i)                             # (mint-split binding) reported, never rejected
         head = hdr.hash()
     return st, True, "ok"
 
@@ -137,9 +179,15 @@ class ChainSettlement:
     """A coordinator-signed neura_l1 settlement chain for pool rewards. The neura_l1 State is the balance
     authority; balances reconstruct by replaying the signed blocks. One per coordinator."""
 
-    def __init__(self, coordinator_account=None, genesis_checkpoint="pool-genesis"):
+    def __init__(self, coordinator_account=None, genesis_checkpoint="pool-genesis", *, bind_mint_split=None):
         self.coord = coordinator_account or gen_account()
         self.genesis_checkpoint = genesis_checkpoint
+        # (mint-split binding, 2026-09-24) EMISSION flag: when ON, settle() commits the contributor split into the
+        # signed header (split_hash), so a served export cannot re-point a mint. An explicit arg wins; None falls
+        # back to NEURAHASH_BIND_MINT_SPLIT. DEFAULT OFF => every block byte-identical to today. A process setting,
+        # not a chain property (never persisted): each block says for itself whether it is bound, and every
+        # verifier checks a bound block regardless of this flag.
+        self.bind_mint_split = (_env_bind_mint_split() if bind_mint_split is None else bool(bind_mint_split))
         self.state = State(model_checkpoint=genesis_checkpoint)
         self.blocks = []                       # list of {header, contributors, sig} — the signed chain
         self.head = GENESIS_PREV_HASH          # prev_hash for the next block
@@ -166,7 +214,13 @@ class ChainSettlement:
         settlement_block_proof) for THIS mint in the block record, so a replayer can independently re-check
         WHO authorized it. DEFAULT None => the block record is BYTE-IDENTICAL to today (no 'quorum' key). The
         field is NON-AUTHORITATIVE for chain acceptance: `_replay_blocks` still governs on the single
-        coordinator signature; making the on-chain quorum load-bearing is a later B8 increment."""
+        coordinator signature; making the on-chain quorum load-bearing is a later B8 increment.
+
+        (Mint-split binding, 2026-09-24) With self.bind_mint_split ON, the canonical hash of the stored split
+        (neura_l1.block_state.mint_split_hash) is folded into the header as split_hash BEFORE signing, so the
+        coordinator signature covers WHO is paid and each weight, and every replayer refuses a stored split that
+        does not hash to it. Every address must then be a str (a JSON key); anything else raises ValueError
+        before any block is appended. OFF (the default) => byte-identical, unbound blocks, as before."""
         contributors = {a: float(w) for a, w in ex_by.items() if float(w) > 0}
         ck = self.state.model_checkpoint
         hdr = BlockHeader(
@@ -177,6 +231,8 @@ class ChainSettlement:
             tx_root=tx_root([]), timestamp=int(timestamp), protocol_version=GENESIS_VERSION)
         if quorum is not None:                                  # (B8-1) bind the quorum INTO the signed hash
             hdr.quorum_hash = _quorum_hash(quorum)             # so the signature below COVERS it (no strip/swap)
+        if self.bind_mint_split:                                # (mint-split binding) commit WHO is paid INTO the
+            hdr.split_hash = mint_split_hash(contributors)     # signed hash as well; raises (no block) on a bad key
         sig = sign_bytes(self.coord, hdr.hash().encode())       # signed receipt over the block hash (+quorum)
         before = {a: self.state.balance(a) for a in contributors}
         self.state = self.state.apply_block(Block(header=hdr, txs=[], pouw={}), contributors)
@@ -198,6 +254,23 @@ class ChainSettlement:
 
     def minted(self):
         return self.state.minted
+
+    def unbound_mints(self):
+        """(Mint-split binding) Indices of this chain's LEGACY-UNBOUND mint blocks: their signed header carries no
+        split_hash, so their contributor split is NOT covered by the coordinator signature (an export of them
+        could be re-pointed and no verifier could tell). A classification of the blocks as they are; integrity is
+        verify()'s job. A transfer block (a "txs" record with no split and a zero signed reward) mints nothing and
+        is skipped -- but ONLY when it provably mints nothing: the base replay ignores the "txs" key, so a "txs"
+        key alone must never hide a mint."""
+        out = []
+        for i, rec in enumerate(self.blocks):
+            hdr = BlockHeader.from_dict(rec["header"])
+            if hdr.split_hash:
+                continue
+            if "txs" in rec and rec.get("contributors") == {} and hdr.reward == 0.0:
+                continue                                        # a transfer block: reward 0, nothing to re-point
+            out.append(i)
+        return out
 
     def height(self):
         return self.blocks[-1]["header"]["height"] if self.blocks else 0
@@ -314,7 +387,7 @@ class ChainSettlement:
 
 
 def verify_public_chain(export, *, expected_coord_address=None,
-                        require_quorum=False, quorum_roster=None, quorum_m=None):
+                        require_quorum=False, quorum_roster=None, quorum_m=None, require_split_binding=False):
     """Verify a `public_state()` export with no private key and no live `ChainSettlement`
     instance -- the read-only verifier path (e.g. the wallet app's `chain_sync.ChainSyncClient`).
 
@@ -340,28 +413,64 @@ def verify_public_chain(export, *, expected_coord_address=None,
     alone cannot detect withholding; it only proves that everything IN the export is genuine and
     self-consistent, not that nothing was left out. Callers that need withholding/rollback
     detection must track height against an independent local ratchet themselves (see
-    `wallet_app/backend/chain_sync.py`'s height-ratchet)."""
+    `wallet_app/backend/chain_sync.py`'s height-ratchet).
+
+    (Mint-split binding, 2026-09-24) A block whose signed header carries split_hash has its stored
+    contributor split checked against it ALWAYS (a mismatch fails the whole chain). A block without it
+    is LEGACY-UNBOUND: verified exactly as before, but its split is not covered by the signature. This
+    5-tuple cannot say WHICH blocks those are without breaking every caller that unpacks five values,
+    so that list comes from `verify_public_chain_report()` (same arguments, a dict).
+    `require_split_binding=True` (strict, default off) fails the chain at its first unbound block."""
+    r = verify_public_chain_report(export, expected_coord_address=expected_coord_address,
+                                   require_quorum=require_quorum, quorum_roster=quorum_roster, quorum_m=quorum_m,
+                                   require_split_binding=require_split_binding)
+    return r["ok"], r["reason"], r["balances"], r["minted"], r["height"]
+
+
+def verify_public_chain_report(export, *, expected_coord_address=None, require_quorum=False, quorum_roster=None,
+                               quorum_m=None, require_split_binding=False):
+    """`verify_public_chain` -- same arguments, same checks, the identical ok / reason / balances / minted /
+    height -- returned as a dict that ALSO reports the chain's mint-split binding (2026-09-24):
+
+      unbound_mints  indices of the LEGACY-UNBOUND blocks: their signed header carries no split_hash, so their
+                     contributor split is NOT covered by the coordinator signature. Everything else about them
+                     verified, but whoever served the export could have re-pointed their mints undetectably.
+      n_bound_mints  how many blocks DO carry split_hash; each one's stored split was checked against it.
+      n_blocks, pinned
+
+    Classify from this report, never from the raw header dicts: a falsy "split_hash" value (null, "", 0) parses
+    as "not bound" and leaves the signed hash unchanged, so the key's presence proves nothing. On failure every
+    data field is empty/zero, as in verify_public_chain."""
+    pinned = expected_coord_address is not None
+
+    def _fail(why):
+        return {"ok": False, "reason": why, "balances": {}, "minted": 0.0, "height": 0, "pinned": pinned,
+                "n_blocks": 0, "unbound_mints": [], "n_bound_mints": 0}
+
     if not isinstance(export, dict):
-        return False, "malformed export: not a dict", {}, 0.0, 0
+        return _fail("malformed export: not a dict")
     blocks = export.get("blocks")
     if not isinstance(blocks, list):
-        return False, "malformed export: missing or non-list 'blocks'", {}, 0.0, 0
+        return _fail("malformed export: missing or non-list 'blocks'")
     genesis_checkpoint = export.get("genesis_checkpoint", "pool-genesis")
-    pinned = expected_coord_address is not None
     coord_address = expected_coord_address if pinned else export.get("coord_address")
     if not coord_address:
-        return False, "malformed export: no 'coord_address' in export and none pinned", {}, 0.0, 0
+        return _fail("malformed export: no 'coord_address' in export and none pinned")
+    unbound = []
     st, ok, reason = _replay_blocks(blocks, coord_address, genesis_checkpoint,
                                     require_quorum=require_quorum, quorum_roster=quorum_roster,
-                                    quorum_m=quorum_m)
+                                    quorum_m=quorum_m,
+                                    require_split_binding=require_split_binding, unbound_mints=unbound)
     if not ok:
-        return False, reason, {}, 0.0, 0
+        return _fail(reason)
     height = int(blocks[-1]["header"]["height"]) if blocks else 0
     if not pinned:
         reason = "ok (UNPINNED: trusted the export's own coord_address, not independently verified)"
     elif require_quorum:
         reason = "ok (quorum-enforced: every block M-of-N staked-validator authorized)"
-    return True, reason, dict(st.bal), float(st.minted), height
+    return {"ok": True, "reason": reason, "balances": dict(st.bal), "minted": float(st.minted), "height": height,
+            "pinned": pinned, "n_blocks": len(blocks), "unbound_mints": unbound,
+            "n_bound_mints": len(blocks) - len(unbound)}
 
 
 # re-export for tests/callers that want the chain's hard cap

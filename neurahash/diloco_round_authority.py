@@ -263,7 +263,13 @@ class Candidate:
     def __init__(self, identity_account, coord_account, *, genesis_checkpoint):
         self.identity = identity_account                    # distinct per candidate (commit-reveal + claim)
         self.coord = coord_account                          # SHARED coordinator role key (block signer)
-        self.chain = ChainSettlement(coordinator_account=coord_account, genesis_checkpoint=genesis_checkpoint)
+        # (B3) a candidate's replica must NOT inherit the process NEURAHASH_QUORUM_TRUST_ROOT env flag with no
+        # pinned roster -- that makes every block fail-close on replay ("enforce requires a pinned validator
+        # roster"). This local-proof harness authorizes each block via the M-of-N quorum it EMBEDS itself
+        # (_build_quorum -> propose -> accept), not the process env flag, so force the trust root OFF explicitly.
+        # Byte-identical when the env flag is unset.
+        self.chain = ChainSettlement(coordinator_account=coord_account, genesis_checkpoint=genesis_checkpoint,
+                                     quorum_trust_root=False)
         self._sealed = {}                                   # round -> sealed commit (holds the secret nonce)
         self.last_agreement = None                          # this node's independently-computed agree_round dict
 
@@ -384,7 +390,7 @@ class Candidate:
         if hdr.prev_hash != self.chain.head:
             return False, "block does not extend our head (gap/fork)"
         try:
-            signer = recover_bytes(hdr.hash().encode(), rec["sig"])
+            signer = recover_bytes(hdr.hash().encode(), rec["sig"], domain=self.chain.receipt_domain())
         except Exception as e:
             return False, f"bad coordinator signature ({type(e).__name__})"
         if _norm(signer) != _norm(self.chain.coord.address):

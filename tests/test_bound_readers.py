@@ -213,3 +213,91 @@ def test_d_a_pre_binding_reader_rejects_every_bound_chain():
     ok, reason, bal, minted, height = verify_public_chain(ex, expected_coord_address=fx["coord_address"])
     assert not ok and reason.startswith("block 0: signed by ") and reason.endswith("not the coordinator")
     assert (bal, minted, height) == ({}, 0.0, 0)
+
+
+# (e) the live GLM settlement chain is a QUORUM-TRUST-ROOT chain ----------------------------------------------------
+# Its export carries quorum_trust_root + the pinned roster, every block embeds an M-of-N proof bound by the header's
+# quorum_hash, block receipts are signed under the "settlement-block" domain and validator votes under "settle-vote"
+# (F12). Fixture: 3 bound blocks, 2 validators, made by the PRIVATE coordinator code.
+QTR = "settlement_chain_qtr_bound_private.json"
+
+
+def _qtr_verify(ex, fx, **kw):
+    kw.setdefault("require_quorum", True)
+    kw.setdefault("quorum_roster", fx["quorum_roster"])
+    return verify_public_chain_report(ex, expected_coord_address=fx["coord_address"], **kw)
+
+
+def test_e_a_private_quorum_trust_root_bound_chain_verifies_to_identical_balances():
+    fx = _load(QTR)
+    assert fx["export"]["quorum_trust_root"] is True and len(fx["quorum_roster"]) == 2
+    r = _qtr_verify(fx["export"], fx)
+    _check_against_fixture(fx, r)
+    assert r["reason"].startswith("ok (quorum-enforced") and r["n_bound_mints"] == 3
+    assert verify_public_chain_report(fx["export"], expected_coord_address=fx["coord_address"])["ok"]   # domain only
+    assert _qtr_verify(fx["export"], fx, require_split_binding=True)["ok"]
+
+
+def test_public_emission_of_a_quorum_trust_root_chain_matches_the_private_coordinator_byte_for_byte():
+    from neurahash import diloco_settlement as ds
+    fx = _load(QTR)
+    lab = lambda s: account_from_key(hashlib.sha256(("bound-readers-qfixture/" + s).encode()).hexdigest())  # noqa
+    coord, vals = lab("coord"), [lab("validator-1"), lab("validator-2")]
+    roster = {v.address: 1000.0 for v in vals}
+    a, b, c = lab("alice").address, lab("bob").address, lab("carol").address
+    cs = ChainSettlement(coord, genesis_checkpoint="glm-qtr-fixture", quorum_trust_root=True, quorum_roster=roster,
+                         bind_mint_split=True)
+    for i, (split, amount) in enumerate([({a: 1.0}, 0.05), ({a: 0.4, b: 0.6}, 0.03), ({c: 2.0, b: 1.0}, 0.02)]):
+        h, cid = i + 1, f"fixture-cid-{i + 1}"
+        rcp = next(iter(split)) if len(split) == 1 else None
+        atts = [ds.sign_settlement(v, recipient=rcp, amount=amount, height=h, delta_cid=cid) for v in vals]
+        cs.settle(h, amount, split, T0 + 60 * i, quorum=ds.settlement_block_proof(
+            recipient=rcp, amount=amount, height=h, delta_cid=cid, roster=roster, attestations=atts))
+    assert json.loads(json.dumps(cs.public_state())) == fx["export"]
+    assert cs.verify() == (True, "ok")
+    restored = ChainSettlement.from_state(json.loads(json.dumps(cs.to_state(include_key=False))))
+    assert restored.quorum_trust_root and restored.verify() == (True, "ok")
+    assert restored.minted() == fx["expected"]["minted"]
+
+
+def test_e_tampering_with_a_quorum_chain_fails():
+    fx = _load(QTR)
+    # contributors re-pointed on a bound block
+    ex = copy.deepcopy(fx["export"])
+    ex["blocks"][1]["contributors"] = {_acct("mallory").address: 1.0}
+    r = _qtr_verify(ex, fx)                     # the quorum (run first) already refuses the new recipient ...
+    assert not r["ok"] and r["reason"].startswith("block 1: quorum enforce failed")
+    r = _qtr_verify(ex, fx, require_quorum=False)   # ... and the signed split refuses it without the quorum
+    assert not r["ok"] and SPLIT_REASON in r["reason"]
+    ex["blocks"][1]["contributors"] = {_acct("alice").address: 0.4,
+                                       _acct("mallory").address: 0.6}        # multi-recipient: quorum signs None
+    r = _qtr_verify(ex, fx)
+    assert not r["ok"] and SPLIT_REASON in r["reason"]
+    # one validator attestation altered: the header-bound quorum_hash no longer matches
+    ex = copy.deepcopy(fx["export"])
+    sig = ex["blocks"][0]["quorum"]["sigs"][0]
+    sig = sig if isinstance(sig, str) else sig["sig"]
+    flipped = sig[:-4] + ("0000" if sig[-4:] != "0000" else "1111")
+    q = ex["blocks"][0]["quorum"]["sigs"]
+    q[0] = flipped if isinstance(q[0], str) else dict(q[0], sig=flipped)
+    r = _qtr_verify(ex, fx)
+    assert not r["ok"] and "quorum does not match the signed header quorum_hash" in r["reason"]
+    # quorum stripped from a block
+    ex = copy.deepcopy(fx["export"])
+    ex["blocks"][2].pop("quorum")
+    r = _qtr_verify(ex, fx)
+    assert not r["ok"] and "no quorum proof on block" in r["reason"]
+    # a shill roster pinned by the caller does not authorize the genuine votes
+    r = _qtr_verify(fx["export"], fx, quorum_roster={_acct("x").address: 1.0, _acct("y").address: 1.0})
+    assert not r["ok"] and "pinned-roster quorum not met" in r["reason"]
+    # flipping the export's trust-root flag only mismatches the receipt domain: fails safe
+    ex = copy.deepcopy(fx["export"])
+    ex["quorum_trust_root"] = False
+    r = verify_public_chain_report(ex, expected_coord_address=fx["coord_address"])
+    assert not r["ok"] and "not the coordinator" in r["reason"]
+
+
+def test_e_a_legacy_export_has_no_trust_root_fields():
+    cs = _rebuild(bind=True)
+    assert set(cs.public_state()) == {"coord_address", "genesis_checkpoint", "blocks"}
+    assert cs.receipt_domain() == "bytes"

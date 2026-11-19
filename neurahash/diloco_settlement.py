@@ -12,12 +12,15 @@ validator roster over a canonical reward-block message, and the mint is authoriz
 of that on-roster set signs the EXACT decision -- so no single key (not even the coordinator's) can mint.
 
 WHY it reuses, and what it deliberately does not:
-  * The k-of-m THRESHOLD primitive is reused unchanged -- `neurahash/guardian_halt.py:GuardianSet`
-    (`distinct_signers`:58 recovers each signature via the repo's real secp256k1 `recover_bytes_scheme`
-    and counts ONLY distinct roster members, so one key signing twice counts ONCE and an off-roster key
-    counts ZERO; `meets_threshold`:72). We do NOT reimplement multisig or secp256k1.
-  * The CRYPTO is reused unchanged -- `neura_l1.signing.sign_bytes` / `recover_bytes` (the same
-    ecrecover the block layer and the D1 committee use).
+  * The k-of-m THRESHOLD / distinct-signer semantics MIRROR `neurahash/guardian_halt.py:GuardianSet`
+    (`distinct_signers`:58) -- count ONLY distinct roster members, so one key signing twice counts ONCE
+    and an off-roster key counts ZERO -- but recovery runs under this module's OWN 'settle-vote' signature
+    domain (F12: `_distinct_settlement_signers`), so a settlement attestation can never be recovered as (or
+    replayed from) a generic 'bytes' / halt-order signature. (GuardianSet hard-wires the 'bytes' domain in
+    its internal `recover_bytes_scheme` and cannot carry a per-type label, so we keep its exact distinct /
+    on-roster counting rule and only re-domain the recovery.) We do NOT reimplement secp256k1.
+  * The CRYPTO is reused unchanged -- `neura_l1.signing.sign_bytes` / `recover_bytes_scheme` (the same
+    ecrecover the block layer and the D1 committee use), differing only by the F12 domain label.
   * The STAKED ROSTER derives from the shipped staking primitives -- `State.stake_of` (block_state.py:503)
     filtered by `MIN_STAKE` (block_state.py:49), exactly the economic Sybil deterrent `consensus.is_eligible`
     (:85) already enforces for proposer eligibility. `neura_l1.pool_sequencer.roster_root` (B12-4, :232)
@@ -52,8 +55,7 @@ coordinator is injected, so there is no circular import -- the integration phase
 import hashlib
 import json
 
-from neura_l1.signing import sign_bytes
-from neurahash.guardian_halt import GuardianSet
+from neura_l1.signing import sign_bytes, recover_bytes_scheme
 
 try:                                            # the staking floor (reused, not redefined); fall back to
     from neura_l1.block_state import MIN_STAKE  # the shipped value if the import surface ever moves.
@@ -66,6 +68,10 @@ except Exception:                               # pragma: no cover - defensive
     _roster_root = None
 
 SETTLE_TAG = "neurahash-diloco-settlement"
+# (F12) the per-type signature domain for a settlement VOTE. sign_settlement signs under it and
+# _distinct_settlement_signers recovers under it, so a settle-vote signature is cryptographically
+# distinct from a generic 'bytes' / guardian-halt / block-receipt signature (cross-type separation).
+SETTLE_VOTE_DOMAIN = "settle-vote"
 MODES = ("off", "audit", "enforce")
 
 
@@ -102,7 +108,25 @@ def sign_settlement(account, *, recipient, amount, height, delta_cid):
     payload = settlement_payload(recipient, amount, height, delta_cid)
     return {"recipient": str(recipient), "amount": round(float(amount), 12), "height": int(height),
             "delta_cid": str(delta_cid or ""), "validator_addr": account.address,
-            "sig": sign_bytes(account, payload)}
+            "sig": sign_bytes(account, payload, domain=SETTLE_VOTE_DOMAIN)}   # (F12) settle-vote domain
+
+
+def _distinct_settlement_signers(payload, sigs, members):
+    """The set of DISTINCT on-roster addresses that validly signed `payload` under the SETTLE_VOTE_DOMAIN
+    (F12). Same distinct-signer rule as `guardian_halt.GuardianSet.distinct_signers` -- count each identity
+    ONCE, drop off-roster and unrecoverable signatures -- but recovering under this module's own settle-vote
+    domain so a settlement vote can never be recovered as (or replayed from) a generic 'bytes' signature.
+    `members` are the roster addresses (matched case-insensitively, exactly as GuardianSet does)."""
+    memberset = {str(a).strip().lower() for a in members if str(a).strip()}
+    signers = set()
+    for sig in sigs or []:
+        try:
+            a = recover_bytes_scheme(payload, sig, domain=SETTLE_VOTE_DOMAIN).lower()
+        except Exception:
+            continue
+        if a in memberset:
+            signers.add(a)
+    return signers
 
 
 def _sig_of(att):
@@ -217,8 +241,10 @@ def collect_settlement_signatures(*, recipient, amount, height, delta_cid, roste
 
     payload = settlement_payload(recipient, amount, height, delta_cid)
     sigs = [s for s in (_sig_of(a) for a in (attestations or [])) if s is not None]
-    gs = GuardianSet(members, m)                               # k-of-m over the staked roster (reused)
-    signers = gs.distinct_signers(payload, sigs)               # distinct roster members over THIS decision
+    # (F12) distinct on-roster signers over THIS decision, recovered under the settle-vote domain. Same
+    # distinct/on-roster counting as GuardianSet.distinct_signers; the empty-roster + strict-majority
+    # threshold guards are already enforced above (N==0 / m*2>N), so no behavioral gate is lost here.
+    signers = _distinct_settlement_signers(payload, sigs, members)
     n_signers = len(signers)
 
     # AUTHORIZATION THRESHOLD. When the roster is a {addr: stake} mapping carrying REAL bonded stake, the

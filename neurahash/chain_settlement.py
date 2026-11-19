@@ -40,7 +40,22 @@ from neura_l1.signing import (gen_account, account_from_key, sign_bytes, recover
                               verify_only_account)
 
 
+# (F9/F10) the env override for the quorum-trust-root genesis flag (tests); an explicit constructor arg wins.
+QUORUM_TRUST_ROOT_ENV = "NEURAHASH_QUORUM_TRUST_ROOT"
+# (F12) The per-type signature domain for a settlement BLOCK RECEIPT. A quorum-trust-root chain (the fresh
+# testnet) signs receipts under this dedicated label instead of the generic "bytes", so a block-receipt
+# signature can never be cross-recovered as a settle-vote (diloco_settlement.SETTLE_VOTE_DOMAIN), a
+# guardian-halt, or any other generic-bytes signature (cross-type separation, F12). A legacy (flag-off) chain
+# keeps "bytes", so its already-signed blocks stay byte-identical and replay unchanged.
+_RECEIPT_DOMAIN = "settlement-block"
 _TRUTHY = ("1", "on", "true", "enforce", "enabled", "yes")
+
+
+def _env_quorum_trust_root(env=None):
+    """(F9/F10) The env override for the quorum-trust-root activation flag. Returns True only for an explicit
+    truthy value; ANY other / absent value fails SAFE to False (byte-identical single-coordinator settlement)."""
+    v = (os.environ if env is None else env).get(QUORUM_TRUST_ROOT_ENV, "")
+    return str(v).strip().lower() in _TRUTHY
 
 # (mint-split binding, 2026-09-24) EMISSION flag. When ON, settle() folds mint_split_hash(contributors) into the
 # block header BEFORE signing, so the coordinator signature covers WHO is paid (BlockHeader.split_hash, bound by
@@ -54,6 +69,14 @@ def _env_bind_mint_split(env=None):
     / absent value is False (today's unbound blocks, byte-identical)."""
     v = (os.environ if env is None else env).get(BIND_MINT_SPLIT_ENV, "")
     return str(v).strip().lower() in _TRUTHY
+
+
+def _receipt_domain(quorum_trust_root):
+    """(F12) The block-receipt signing/verification domain for a chain: the dedicated "settlement-block" label
+    when the quorum is the trust root, else the generic "bytes" (byte-identical to every pre-flag chain). Sign
+    and verify BOTH derive the domain from the SAME chain flag, so they always match; enforcing quorum on a
+    chain is an INDEPENDENT axis (require_quorum) from which domain its receipts were signed under."""
+    return _RECEIPT_DOMAIN if quorum_trust_root else "bytes"
 
 
 def _beacon(prev_hash):
@@ -119,7 +142,7 @@ def _verify_block_quorum(rec, hdr, quorum_roster, quorum_m):
 
 
 def _replay_blocks(blocks, coord_address, genesis_checkpoint,
-                   *, require_quorum=False, quorum_roster=None, quorum_m=None,
+                   *, require_quorum=False, quorum_roster=None, quorum_m=None, receipt_domain="bytes",
                    require_split_binding=False, unbound_mints=None):
     """Replay a signed block chain from genesis into a fresh State, checking every block's
     coordinator signature against `coord_address` (a plain string -- no `Account`/private key
@@ -142,15 +165,23 @@ def _replay_blocks(blocks, coord_address, genesis_checkpoint,
     "block i: does not apply (apply_block: contributors do not match header.split_hash ...)". A block
     WITHOUT it is LEGACY-UNBOUND: applied exactly as before, and its index appended to `unbound_mints`
     when a list is passed (meaningful only when ok is True). `require_split_binding=True` (strict,
-    default off) REJECTS an unbound block instead. Both defaults => byte-identical to the replay above."""
+    default off) REJECTS an unbound block instead. Both defaults => byte-identical to the replay above.
+
+    (F12) `receipt_domain` is the label the coordinator signed each block receipt under: "bytes" (the default,
+    every legacy chain) or "settlement-block" for a quorum-trust-root chain (see `_receipt_domain`)."""
     st = State(model_checkpoint=genesis_checkpoint)
+    # (F10) mirror the pinned {addr: stake} roster into genesis State.staked so a replayed/restored chain's
+    # on-chain stake is NON-EMPTY too (kept consistent with ChainSettlement.__init__'s live-state seed).
+    # staked does not enter the reward/balance/minted math, so this never affects replay verification.
+    if require_quorum and isinstance(quorum_roster, dict):
+        st.staked = {str(a): float(s) for a, s in quorum_roster.items()}
     head = GENESIS_PREV_HASH
     for i, rec in enumerate(blocks):
         hdr = BlockHeader.from_dict(rec["header"])
         if hdr.prev_hash != head:
             return st, False, f"block {i}: broken chain (prev_hash != head)"
         try:
-            signer = recover_bytes(hdr.hash().encode(), rec["sig"])
+            signer = recover_bytes(hdr.hash().encode(), rec["sig"], domain=receipt_domain)
         except Exception as e:
             return st, False, f"block {i}: bad signature ({e})"
         if signer.lower() != str(coord_address).lower():
@@ -179,9 +210,24 @@ class ChainSettlement:
     """A coordinator-signed neura_l1 settlement chain for pool rewards. The neura_l1 State is the balance
     authority; balances reconstruct by replaying the signed blocks. One per coordinator."""
 
-    def __init__(self, coordinator_account=None, genesis_checkpoint="pool-genesis", *, bind_mint_split=None):
+    def __init__(self, coordinator_account=None, genesis_checkpoint="pool-genesis",
+                 *, quorum_trust_root=None, quorum_roster=None, quorum_m=None, bind_mint_split=None):
         self.coord = coordinator_account or gen_account()
         self.genesis_checkpoint = genesis_checkpoint
+        # (F9/F10 activation flag) When ON, the staked M-of-N quorum is the ENFORCED trust root of THIS chain:
+        # its own verify()/from_state REQUIRE a valid M-of-N staked-validator quorum on EACH block, and its block
+        # receipts are signed under the dedicated "settlement-block" domain (F12). A GENESIS field (exported by
+        # public_state/to_state), not a per-process toggle. An explicit arg wins; None falls back to the
+        # NEURAHASH_QUORUM_TRUST_ROOT env override (tests). DEFAULT OFF => byte-identical single-coordinator
+        # settlement.
+        self.quorum_trust_root = (_env_quorum_trust_root() if quorum_trust_root is None
+                                  else bool(quorum_trust_root))
+        # PINNED validator roster the quorum is bound to. A {addr: stake} dict => STAKE-weighted authorization;
+        # a bare address list => count-weighted. None is allowed only with the flag OFF; with the flag ON, replay
+        # fail-closes on a missing roster (_verify_block_quorum).
+        self.quorum_roster = (dict(quorum_roster) if isinstance(quorum_roster, dict)
+                              else (list(quorum_roster) if quorum_roster else None))
+        self.quorum_m = int(quorum_m) if quorum_m is not None else None
         # (mint-split binding, 2026-09-24) EMISSION flag: when ON, settle() commits the contributor split into the
         # signed header (split_hash), so a served export cannot re-point a mint. An explicit arg wins; None falls
         # back to NEURAHASH_BIND_MINT_SPLIT. DEFAULT OFF => every block byte-identical to today. A process setting,
@@ -189,6 +235,9 @@ class ChainSettlement:
         # verifier checks a bound block regardless of this flag.
         self.bind_mint_split = (_env_bind_mint_split() if bind_mint_split is None else bool(bind_mint_split))
         self.state = State(model_checkpoint=genesis_checkpoint)
+        # (F10) seed the genesis bonded-stake map from the pinned roster (mirrors _replay_blocks).
+        if self.quorum_trust_root and isinstance(self.quorum_roster, dict):
+            self.state.staked = {str(a): float(s) for a, s in self.quorum_roster.items()}
         self.blocks = []                       # list of {header, contributors, sig} — the signed chain
         self.head = GENESIS_PREV_HASH          # prev_hash for the next block
         # (DiLoCo GAP2 restart-replay guard) The set of delta_cids ALREADY rewarded through this chain.
@@ -233,7 +282,7 @@ class ChainSettlement:
             hdr.quorum_hash = _quorum_hash(quorum)             # so the signature below COVERS it (no strip/swap)
         if self.bind_mint_split:                                # (mint-split binding) commit WHO is paid INTO the
             hdr.split_hash = mint_split_hash(contributors)     # signed hash as well; raises (no block) on a bad key
-        sig = sign_bytes(self.coord, hdr.hash().encode())       # signed receipt over the block hash (+quorum)
+        sig = sign_bytes(self.coord, hdr.hash().encode(), domain=self.receipt_domain())  # (F12) signed receipt over the block hash (+quorum)
         before = {a: self.state.balance(a) for a in contributors}
         self.state = self.state.apply_block(Block(header=hdr, txs=[], pouw={}), contributors)
         self.head = hdr.hash()
@@ -254,6 +303,12 @@ class ChainSettlement:
 
     def minted(self):
         return self.state.minted
+
+    def receipt_domain(self):
+        """(F12) The signing/verification domain for THIS chain's block receipts -- 'settlement-block' when the
+        quorum is the trust root, else the generic 'bytes' (byte-identical to every pre-flag chain). settle()
+        signs under it and every verify site (_replay, Candidate.accept) recovers under it, so they match."""
+        return _receipt_domain(self.quorum_trust_root)
 
     def unbound_mints(self):
         """(Mint-split binding) Indices of this chain's LEGACY-UNBOUND mint blocks: their signed header carries no
@@ -299,7 +354,9 @@ class ChainSettlement:
         replay a chain it only has the coordinator's public address for. Returns (state, ok, reason):
         ok is False (with a reason) if any block's coordinator signature fails, the prev_hash chain is
         broken, or a block does not apply cleanly."""
-        return _replay_blocks(self.blocks, self.coord.address, self.genesis_checkpoint)
+        return _replay_blocks(self.blocks, self.coord.address, self.genesis_checkpoint,
+                              require_quorum=self.quorum_trust_root, quorum_roster=self.quorum_roster,
+                              quorum_m=self.quorum_m, receipt_domain=self.receipt_domain())
 
     def verify(self):
         """Re-check the whole settlement chain: every block's coordinator signature, the prev_hash links,
@@ -325,8 +382,25 @@ class ChainSettlement:
         (private key material, to_state()-only, see the docstring there) and `paid_cids` (internal
         DiLoCo restart-replay bookkeeping -- not needed to reconstruct balances) to minimize the
         exported surface. Pair with the module-level `verify_public_chain()` on the reader side."""
-        return {"coord_address": self.coord.address, "genesis_checkpoint": self.genesis_checkpoint,
-                "blocks": [dict(b) for b in self.blocks]}
+        out = {"coord_address": self.coord.address, "genesis_checkpoint": self.genesis_checkpoint,
+               "blocks": [dict(b) for b in self.blocks]}
+        # (F9/F10) publish the trust-root genesis fields so a read-only verifier picks the right receipt domain
+        # and roster. Emitted ONLY when the flag is ON, so a legacy (flag-off) export is byte-identical to today.
+        out.update(self._quorum_genesis_fields())
+        return out
+
+    def _quorum_genesis_fields(self):
+        """(F9/F10) The trust-root genesis fields to fold into an export/checkpoint -- {} when the flag is OFF
+        (so a flag-off blob is byte-identical to today), else the flag + pinned roster (+ optional m)."""
+        if not self.quorum_trust_root:
+            return {}
+        d = {"quorum_trust_root": True}
+        if self.quorum_roster is not None:
+            d["quorum_roster"] = (dict(self.quorum_roster) if isinstance(self.quorum_roster, dict)
+                                  else list(self.quorum_roster))
+        if self.quorum_m is not None:
+            d["quorum_m"] = int(self.quorum_m)
+        return d
 
     # ----------------------------- persistence (coordinator resume) -----------------------------
     def to_state(self, include_key=True):
@@ -344,6 +418,7 @@ class ChainSettlement:
              else {"coord_address": self.coord.address})
         d.update({"genesis_checkpoint": self.genesis_checkpoint,
                   "blocks": [dict(b) for b in self.blocks]})
+        d.update(self._quorum_genesis_fields())    # (F9/F10) baked-in trust-root flag+roster; {} when flag OFF (byte-identical)
         # (DiLoCo GAP2) Persist the paid-cid index ONLY when non-empty so a coordinator running with the
         # DiLoCo reward off/audit (paid_cids always empty) serializes a blob BYTE-IDENTICAL to today.
         # from_state() defaults an absent field to an empty set (back-compat with pre-guard checkpoints).
@@ -375,7 +450,10 @@ class ChainSettlement:
                 raise ValueError("scrubbed settlement chain has neither an embedded coord_key nor a "
                                  "coord_address and no key was supplied; cannot restore")
             account = verify_only_account(addr, sign_disabled_reason)
-        cs = cls(account, genesis_checkpoint=state.get("genesis_checkpoint", "pool-genesis"))
+        # (F9/F10) restore the baked-in trust-root genesis fields; absent => flag OFF (legacy, byte-identical).
+        cs = cls(account, genesis_checkpoint=state.get("genesis_checkpoint", "pool-genesis"),
+                 quorum_trust_root=bool(state.get("quorum_trust_root", False)),
+                 quorum_roster=state.get("quorum_roster"), quorum_m=state.get("quorum_m"))
         cs.blocks = [dict(b) for b in state["blocks"]]
         st, ok, reason = cs._replay()
         if not ok:
@@ -456,10 +534,15 @@ def verify_public_chain_report(export, *, expected_coord_address=None, require_q
     coord_address = expected_coord_address if pinned else export.get("coord_address")
     if not coord_address:
         return _fail("malformed export: no 'coord_address' in export and none pinned")
+    # (F12) a flag-on export's blocks were signed under the dedicated "settlement-block" receipt domain; derive
+    # it from the export's own genesis field so recovery matches. This only selects a domain (never the trust
+    # decision): require_quorum + the pinned roster stay CALLER-controlled, so an attacker flipping this field
+    # cannot relax enforcement -- at worst it mismatches the domain and the chain fails to verify (fail-safe).
+    receipt_domain = _receipt_domain(bool(export.get("quorum_trust_root")))
     unbound = []
     st, ok, reason = _replay_blocks(blocks, coord_address, genesis_checkpoint,
                                     require_quorum=require_quorum, quorum_roster=quorum_roster,
-                                    quorum_m=quorum_m,
+                                    quorum_m=quorum_m, receipt_domain=receipt_domain,
                                     require_split_binding=require_split_binding, unbound_mints=unbound)
     if not ok:
         return _fail(reason)

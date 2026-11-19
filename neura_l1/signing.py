@@ -132,33 +132,42 @@ def sign_tx(tx, account):
     return tx
 
 
-def sign_bytes(account, data):
+def sign_bytes(account, data, *, domain="bytes"):
     """Sign arbitrary bytes with `account`; return the 0x-hex signature. Used to make the
     persisted chain.json tamper-evident (the miner signs it; load/view verify) and to sign
-    finality votes. Domain+chain prefixed."""
-    msg = encode_defunct(primitive=_domain_bytes("bytes", data))
+    finality votes. Domain+chain prefixed.
+
+    `domain` selects the per-type label folded into the signed bytes (see `_domain_bytes` and the
+    domain-separation note above). It DEFAULTS to the generic "bytes", so every existing caller is
+    byte-identical. A caller that wants its OWN cross-type separation (e.g. a settlement vote) passes
+    a distinct label; the matching `recover_bytes`/`recover_bytes_scheme` MUST pass the SAME label, or
+    recovery yields a different address and fails the expected-signer check (the point of the label)."""
+    msg = encode_defunct(primitive=_domain_bytes(domain, data))
     sig = Account.sign_message(msg, account.key).signature
     return sig.hex() if isinstance(sig, (bytes, bytearray)) else str(sig)
 
 
-def recover_bytes(data, sig):
-    """Recover the address that signed `data` with signature `sig` (hex)."""
+def recover_bytes(data, sig, *, domain="bytes"):
+    """Recover the address that signed `data` with signature `sig` (hex). `domain` MUST match the label
+    the signer used in `sign_bytes` (default "bytes"); a mismatched label recovers a DIFFERENT address, so
+    a signature made under one type-label can never satisfy a verify under another (cross-type separation)."""
     if isinstance(sig, str) and not sig.startswith("0x"):
         sig = "0x" + sig
-    return Account.recover_message(encode_defunct(primitive=_domain_bytes("bytes", data)),
+    return Account.recover_message(encode_defunct(primitive=_domain_bytes(domain, data)),
                                    signature=sig)
 
 
-def recover_bytes_scheme(data, sig, scheme=None):
+def recover_bytes_scheme(data, sig, scheme=None, *, domain="bytes"):
     """Scheme-dispatched recovery (#35 crypto-agility). The single point where a signed
     record's declared signature SCHEME selects the verifier, so a post-quantum scheme is a
     branch here, not a protocol rewrite. `scheme` None/"" -> the legacy default (secp256k1),
     so pre-agility records stay valid; an UNKNOWN/not-yet-implemented scheme raises
     UnsupportedSchemeError (fail-closed — never silently accepted). Returns the recovered
-    secp256k1 address for the secp256k1 scheme."""
+    secp256k1 address for the secp256k1 scheme. `domain` is forwarded to `recover_bytes` and MUST
+    match the label the signer used (default "bytes" -> byte-identical to every existing caller)."""
     s = sig_scheme.require_supported(scheme)          # fail-closed; absence -> secp256k1
     if s == SCHEME_SECP256K1:
-        return recover_bytes(data, sig)
+        return recover_bytes(data, sig, domain=domain)
     # A supported but NON-recoverable scheme (ml-dsa, like every lattice signature) can't yield a signer
     # from the signature alone — the caller must verify against a SUPPLIED pubkey via verify_bytes_scheme.
     raise UnsupportedSchemeError(

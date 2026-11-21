@@ -1,5 +1,5 @@
 """UPDATE CAP (owner-approved 2026-10-23) -- the contributor scales what it PUBLISHES so that every expert
-matrix's |D|_F/|W|_F <= NEURAHASH_GLM_UPDATE_CAP, direction preserved. Default OFF.
+matrix's |D|_F/|W|_F <= NEURAHASH_GLM_UPDATE_CAP, direction preserved. Default ON (0.01) since 3.9.4; =off disables.
 
 Why: offline gate replays (scratchpad/GATE_REPLAY_2026-10-22.md sec. 8) measured rejected deltas at
 0.7*|D|/|W| ~42% median of the expert weight norm; the two ever-accepted deltas were 5% and 8%.
@@ -66,9 +66,12 @@ def _cos(a, b):
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def test_env_default_is_off_and_malformed_fails_fast():
-    assert N.update_cap_from_env({}) is None
-    assert N.update_cap_from_env({N.UPDATE_CAP_ENV: "  "}) is None
+def test_env_default_is_on_and_malformed_fails_fast():
+    # 3.9.4: unset/empty -> the default cap (ON); an explicit off-word -> None (the old uncapped publish)
+    assert N.update_cap_from_env({}) == pytest.approx(N.UPDATE_CAP_DEFAULT) == pytest.approx(0.01)
+    assert N.update_cap_from_env({N.UPDATE_CAP_ENV: "  "}) == pytest.approx(0.01)
+    for off in ("off", "OFF", "none", "disabled"):
+        assert N.update_cap_from_env({N.UPDATE_CAP_ENV: off}) is None
     assert N.update_cap_from_env({N.UPDATE_CAP_ENV: "0.114"}) == pytest.approx(0.114)
     for bad in ("abc", "0", "-1", "nan", "inf"):
         with pytest.raises(ValueError):

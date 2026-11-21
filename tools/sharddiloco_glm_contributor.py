@@ -6607,9 +6607,14 @@ class PublishBackoff:
 # Offline gate replays (scratchpad/GATE_REPLAY_2026-10-22.md sec. 8) measured the rejected miner deltas
 # as HARMFUL at the coordinator's outer scale 0.7: the applied update 0.7*|D|/|W| was ~42% of the expert
 # weight norm at the median, while the only two deltas ever accepted were 5% and 8%. The cap bounds what
-# a miner PUBLISHES so that 0.7*|D|/|W| <= ~0.08, i.e. |D|/|W| <= 0.114 per expert matrix. DEFAULT OFF:
-# with NEURAHASH_GLM_UPDATE_CAP unset nothing below runs and the publish is byte-identical to before.
+# a miner PUBLISHES so that 0.7*|D|/|W| <= ~0.08, i.e. |D|/|W| <= 0.114 per expert matrix.
+# DEFAULT ON since 3.9.4 (owner 2026-11-21): the live coordinator's drift cap (0.02 from the pristine base)
+# vetoed EVERY uncapped delta from a default public miner (measured on 2 RunPod miners, z 11-15, all
+# rolled back), so a stranger on defaults could never be paid. Unset = UPDATE_CAP_DEFAULT (0.01, the value
+# the paid RunPod/5090/4060 miners ran with); NEURAHASH_GLM_UPDATE_CAP=off restores the old uncapped publish.
 UPDATE_CAP_ENV = "NEURAHASH_GLM_UPDATE_CAP"
+UPDATE_CAP_DEFAULT = 0.01
+UPDATE_CAP_OFF_VALUES = ("off", "none", "disabled")
 UPDATE_CAP_KEYS = ("gate", "up", "down")
 
 
@@ -6618,10 +6623,13 @@ class UpdateCapRefused(Exception):
 
 
 def update_cap_from_env(env=None):
-    """The configured cap (ratio |D|/|W| per matrix) or None when unset/empty (= OFF). A value that is
-    not a finite positive number raises ValueError: a typo must not silently publish uncapped."""
+    """The configured cap (ratio |D|/|W| per matrix). Unset/empty -> UPDATE_CAP_DEFAULT (ON); one of
+    UPDATE_CAP_OFF_VALUES -> None (OFF, the old uncapped publish). Any other value that is not a finite
+    positive number raises ValueError: a typo must not silently publish uncapped."""
     raw = str((os.environ if env is None else env).get(UPDATE_CAP_ENV, "") or "").strip()
     if not raw:
+        return UPDATE_CAP_DEFAULT
+    if raw.lower() in UPDATE_CAP_OFF_VALUES:
         return None
     v = float(raw)
     if not (math.isfinite(v) and v > 0.0):
@@ -6894,14 +6902,14 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     _last_pub_t = time.time()
     _pubwin = _PublishWindow()
     _pub_backoff = PublishBackoff()          # PUBLISH REFUSALS: a refused PUT backs off, never exits
-    # UPDATE CAP (default OFF): read once, fail fast on a malformed value rather than publish uncapped.
+    # UPDATE CAP (default ON since 3.9.4): read once, fail fast on a malformed value rather than publish uncapped.
     _update_cap = update_cap_from_env()
     if _update_cap is not None:
         if layer_claim_enabled():
             # The layer-claim path publishes per-coordinate records through its own put_delta and is
             # NOT capped; refuse rather than let the startup line below be false.
             raise SystemExit("[glm-contrib %s] %s is set but layer claims are enabled; the layer-claim "
-                             "publish path is not capped. Unset one of them." % (miner, UPDATE_CAP_ENV))
+                             "publish path is not capped. Set %s=off or disable layer claims." % (miner, UPDATE_CAP_ENV, UPDATE_CAP_ENV))
         log("[glm-contrib %s] UPDATE-CAP ON: every published delta is scaled so |D|/|W| <= %.4f per "
             "expert matrix (%s)" % (miner, _update_cap, UPDATE_CAP_ENV))
     _cap_refusals = 0
@@ -7955,7 +7963,7 @@ def main(argv=None):
             continue
 
         # ---- publish the fp16 content-addressed delta + a signed record (D1/D2), trunk FROZEN ----
-        # UPDATE CAP (default OFF; same helper as the async path, applied BEFORE the cid is computed).
+        # UPDATE CAP (default ON since 3.9.4; same helper as the async path, applied BEFORE the cid is computed).
         _sync_cap = update_cap_from_env()
         if _sync_cap is not None and not args.garbage:
             payload, _sync_cap_refusals = cap_for_publish(

@@ -5368,6 +5368,98 @@ def _seed_refold_one(host, lane, man, campaign, coord_key, idx, want_root, event
     return out
 
 
+# ============================================================ resume -> in-order catch-up hand-off
+# WHAT WENT WRONG (measured live 2026-11-23, campaign 508ed8c1ec9a2f9a, the 4060 on (L1,E50)). At boot
+# resume_to_root folds ONLY the accepted records that name our coordinate, out of global order, up to
+# the newest one (events 24..155 for 1_50 -> root 054d4cae). last_applied stays 0, so the in-order
+# catch-up then walks events 1, 2, ... and at event 24 meets a record that advertises 1_50's root AS
+# IT WAS THEN (9512eecc). Our copy is already past it, replica_root_ok says "off-lineage", the frontier
+# is held at 23 forever, and every contribution goes out as base_event=23 with base root 054d4cae --
+# a pair the coordinator can never accept (at event 23 it expects 9512eecc): LINEAGE-DROP
+# wrong-lineage-slot-root, terminally, every round. The coordinator is right; the miner mixed two
+# points in time.
+#
+# THE FIX. resume_to_root records, per coordinate, the newest event it folded on the way to the
+# coordinator's root. When the in-order catch-up later reaches a record at or below that event whose
+# every resident advertised coordinate is such a coordinate, the record is ALREADY IN our copy: it is
+# skipped (never re-folded -- re-folding event 155's delta onto a copy that already holds it would
+# corrupt the expert) and the frontier moves past it. Anything else folds and is verified exactly as
+# before; the lineage guard itself is unchanged.
+def _resume_map(host):
+    """host._resume_folded_through: {(campaign, "L_E"): event}, or None for a host without __dict__."""
+    try:
+        return host.__dict__.setdefault("_resume_folded_through", {})
+    except AttributeError:                       # a host without __dict__: the skip simply never fires
+        return None
+
+
+def _note_resume_folded(host, key, event):
+    """Remember that resume_to_root folded coordinate `key` out of order through accepted `event`, in the
+    host's CURRENT campaign (a rebind starts a new map entry; review 2026-11-23 finding 2). Stored as is,
+    not max()ed: the newest successful resume is the truth about our copy."""
+    m = _resume_map(host)
+    if m is None or key is None or event is None:
+        return
+    m[(host_campaign_id(host), str(key))] = int(event)
+
+
+def _resume_entry(host, key):
+    m = getattr(host, "_resume_folded_through", None)
+    if not isinstance(m, dict) or key is None:
+        return None
+    return m.get((host_campaign_id(host), str(key)))
+
+
+def _restore_resume_entry(host, key, prior):
+    """Unreachable-resume rollback: the slots go back to the snapshot taken at the call's start, so the
+    map entry goes back to what it was then too (review finding 3: popping it lost a still-valid one)."""
+    m = _resume_map(host)
+    if m is None or key is None:
+        return
+    k = (host_campaign_id(host), str(key))
+    if prior is None:
+        m.pop(k, None)
+    else:
+        m[k] = int(prior)
+
+
+def already_folded_by_resume(host, rec, event, frontier=None):
+    """The resident coordinates `rec` advertises, IF every one of them was already folded past `event`
+    by resume_to_root in this campaign; else None (fold and verify normally). Pure apart from
+    host.index_of.
+
+    `frontier` (the coordinator's head as the caller reads it): an entry recorded ABOVE it cannot have
+    come from a genuine record -- the coordinator has not reached that event -- so it is distrusted and
+    nothing is skipped for that coordinate (review finding 1: a forged far-future record, folded by the
+    resume, would otherwise make every genuine record for the coordinate skip silently; distrusted, the
+    normal fold refuses it visibly with LINEAGE-SKIP, exactly as before this change)."""
+    m = getattr(host, "_resume_folded_through", None)
+    if not isinstance(m, dict) or not m:
+        return None
+    sr = rec.get("slot_roots") if isinstance(rec, dict) else None
+    if not isinstance(sr, dict) or not sr:
+        return None                              # legacy/global-only record: never skipped
+    camp = host_campaign_id(host)
+    resident = []
+    for key in sr:
+        L, _, E = str(key).partition("_")
+        try:
+            idx = host.index_of(int(L), int(E))
+        except (ValueError, TypeError):
+            continue
+        if idx is not None:
+            resident.append(str(key))
+    if not resident:
+        return None                              # nothing of ours: the normal fold handles it
+    for key in resident:
+        through = m.get((camp, key))
+        if through is None or int(event) > int(through):
+            return None
+        if frontier is not None and int(through) > int(frontier):
+            return None
+    return resident
+
+
 def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=None,
                    budget_s=None, call_timeout_s=None, stall_s=None, now=None, outcome=None,
                    man=None):
@@ -5518,6 +5610,8 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
     # fold -- see the V0.2 note in the docstring. Starts AFTER the manifest, not before.
     t_loop = last_progress_t = _now()
     coord_want, coord_hit = None, False       # newest advertised root for own_coord + did we reproduce it
+    coord_event = None                        # the accepted event of that newest advertisement
+    prior_entry = _resume_entry(host, coord_key)  # restored as is if this call rolls back
     for e in events[:int(max_records)]:
         if _now() - t0 > budget:
             aborted = "budget"
@@ -5590,11 +5684,14 @@ def resume_to_root(host, lane, target_root, log, max_records=200000, own_coord=N
             continue                                             # legacy record: no advertisement
         coord_want = str(adv)
         coord_hit = (slot_root(host, own_idx) == coord_want)
+        coord_event = e
     if coord_key is not None and coord_hit and aborted is None:
         log("[glm-contrib] resume: reached the coordinator's root for coordinate %s (%s..) after %d "
             "record(s) in %.1fs; the global root is not comparable on a shard-claim network"
             % (coord_key, coord_want[:12], applied, _now() - t0))
+        _note_resume_folded(host, coord_key, coord_event)
         return _done("ok", applied, True)
+    _restore_resume_entry(host, coord_key, prior_entry)
     for j, d in enumerate(snap):                                 # UNREACHABLE -> full rollback
         host.write_slot(j, d)
     if aborted is not None:
@@ -5846,6 +5943,7 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
     against the current base, retry next tick), so the failure SEMANTICS are unchanged."""
     applied_any = False
     skipped_at = None
+    resume_skipped = None                                    # [first, last, count, coords] of resume skips
     campaign = host_campaign_id(host)      # CAMPAIGN SCOPE: only this campaign's accepted records
     lane = _DeadlineLane(lane, _catchup_call_timeout_s())
     _reseed = None
@@ -5871,6 +5969,16 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             break
         except Exception:                                    # noqa: BLE001
             break                                            # transient fetch fail -> retry next tick
+        done_keys = already_folded_by_resume(host, rec, e, frontier=frontier)
+        if done_keys:                                        # already in our copy (see _note_resume_folded)
+            if resume_skipped is None:
+                resume_skipped = [e, e, 0, set()]
+            resume_skipped[1] = e
+            resume_skipped[2] += 1
+            resume_skipped[3].update(done_keys)
+            last_applied = e
+            applied_any = True
+            continue
         try:
             ok, reason, rejected = _fold_accepted_checked(host, lane, rec, regate_ce, own_slot,
                                                           log=log, reseed=_reseed, seed_refold=_refold)
@@ -5896,6 +6004,11 @@ def catch_up_accepted(host, lane, man, last_applied, frontier, regate_ce, own_sl
             # and decide whether its expert has plateaued. Appending rather than changing the return
             # arity keeps every existing caller and test working.
             folded.append(rec)
+    if resume_skipped is not None:
+        log("[glm-contrib %s] RESUME-SKIP: %d accepted record(s) in events %d..%d touch only "
+            "coordinate(s) %s, which the boot resume already folded past; not re-applied, frontier "
+            "now at event %d" % (miner, resume_skipped[2], resume_skipped[0], resume_skipped[1],
+                                 ",".join(sorted(resume_skipped[3])), last_applied))
     if skipped_at is not None:
         log("[glm-contrib %s] LINEAGE-SKIP: accepted record at event %d does not extend our latched "
             "lineage (for at least one coordinate we HOLD, our root != the root that record "

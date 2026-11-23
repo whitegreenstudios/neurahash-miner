@@ -6312,15 +6312,83 @@ def heartbeat_miner_card(lane, miner, address=None, coord=None, mode=None, extra
 # only (no rollback), 6h rate limit persisted in a dotfile stamped BEFORE the attempt (a broken
 # release cannot re-exec loop), opt-out NEURAHASH_AUTOUPDATE=off. On a verified forward release it
 # RE-EXECS this process with its original argv -- the lane treats that as normal miner churn.
-def _maybe_self_update(log=_flush, _check=None):
+class _ReexecAfterRelease(BaseException):
+    """Raised (Windows only) in place of the updater's re-exec when the model may be resident.
+
+    WHY (measured 2026-11-22 on the 4060 reference miner, v3.9.3 -> v3.9.4): on Windows the
+    updater's re-exec cannot replace the process (see self_update._default_reexec), so it runs the
+    new miner as a CHILD with subprocess.run and the parent waits for it. The parent was still
+    inside the mining loop, holding the loaded model and its CUDA allocations. WDDM paged the idle
+    parent out, so the child's VRAM guard first saw 6.84 GiB free and loaded fine, and then
+    mem_get_info settled at 0.00 GiB free against a 0.17 GiB bar: "STILL PAUSED on VRAM after 4020
+    checks (~60300s)". Nearly 17 hours, zero contributions, and the process looked healthy.
+
+    A BaseException so no `except Exception` on the way out swallows it (the handlers that catch
+    BaseException roll back and re-raise). It unwinds the whole mining loop, so every local that
+    references the model is gone by the time _entry() releases CUDA and re-execs."""
+
+    def __init__(self, argv):
+        super().__init__("re-exec requested after releasing the GPU")
+        self.argv = list(argv)
+
+
+def _deferred_reexec(argv):
+    """reexec_fn for a loop-time update: on Windows unwind first (see _ReexecAfterRelease); on POSIX
+    os.execv replaces the process image, so the kernel frees the GPU and nothing needs deferring."""
+    if os.name == "nt":
+        raise _ReexecAfterRelease(argv)
+    from self_update import _default_reexec
+    _default_reexec(argv)
+
+
+def _release_cuda_before_reexec(log=_flush):
+    """Free this process's GPU memory once the mining loop has unwound. Never raises.
+    Returns (allocated_gib, reserved_gib) after the release, or None without torch/CUDA."""
+    import gc
+    # The opt-in VramManager loop (NEURAHASH_VRAM_MANAGER) would keep re-capping and logging from this
+    # idle parent for the child's whole lifetime, reading the child's usage as pressure. Stop it.
+    try:
+        stop = getattr(_VRAM_MGR, "_loop_stop", None)
+        if stop is not None:
+            stop.set()
+    except Exception:                                            # noqa: BLE001
+        pass
+    gc.collect()
+    torch = sys.modules.get("torch")
+    try:
+        if torch is None or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            return None
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        alloc = torch.cuda.memory_allocated() / 2 ** 30
+        resv = torch.cuda.memory_reserved() / 2 ** 30
+        log("[auto-update] released this process's GPU memory before re-exec: allocated %.2f GiB, "
+            "reserved %.2f GiB remain%s" % (alloc, resv, "" if max(alloc, resv) < 0.25 else
+                                            " -- something still references a CUDA tensor; the new "
+                                            "miner may see less free VRAM than the card has"))
+        return alloc, resv
+    except Exception as e:                                       # noqa: BLE001 -- never block an update
+        log("[auto-update] GPU release before re-exec failed (%r); re-exec'ing anyway" % (e,))
+        return None
+
+
+def _maybe_self_update(log=_flush, _check=None, defer_reexec=True):
     """One rate-limited signed-update check; never raises Exception into the mining loop (SystemExit
     from the updater's own re-exec/exit path is deliberately NOT swallowed -- swallowing it would
-    cancel the update). Returns the UpdateResult, or None when the check itself failed."""
+    cancel the update). Returns the UpdateResult, or None when the check itself failed.
+
+    defer_reexec (default True): on Windows the re-exec is raised as _ReexecAfterRelease, so it
+    happens only after main() has unwound and the GPU has been released -- see that class for the
+    17-hour stall it prevents. At startup nothing is resident yet, so deferring costs nothing there
+    either. Requires running through _entry() (the __main__ path), which catches it."""
     try:
         if _check is None:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from self_update import check_and_update as _check
-        r = _check()
+            from self_update import check_and_update
+            r = check_and_update(reexec_fn=_deferred_reexec) if defer_reexec else check_and_update()
+        else:
+            r = _check()                     # injected test double: called exactly as before
         act = getattr(r, "action", None)
         # THE SILENCE GATE THIS REPLACES. The old condition suppressed ALL output for
         # ("rate-limited", "disabled", "no-op-not-forward", None) -- and `None` is precisely what
@@ -7058,7 +7126,8 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     while rounds_done < args.max_rounds:
         # -- (0a) v3.2.1 signed auto-update: same SAFE between-rounds boundary as the resync below;
         # internally 6h rate-limited via dotfile, so this is one cheap file-stat on all but ~4
-        # checks/day. A verified forward release re-execs us here -- never mid-train.
+        # checks/day. A verified forward release re-execs us here -- never mid-train. On Windows the
+        # re-exec waits until this loop has unwound and the GPU is released (_ReexecAfterRelease).
         _maybe_self_update(log)
         # -- (0b) identity-card heartbeat. Debounced to CARD_REPUBLISH_INTERVAL_S internally, so this
         # is a dict lookup on all but ~1 tick in 120 s. Without it `published_ts` is frozen at process
@@ -8029,5 +8098,19 @@ def main(argv=None):
     return 0
 
 
+def _entry(argv=None):
+    """main(), plus the deferred Windows re-exec (_ReexecAfterRelease). The exception is only noted
+    inside the except block and acted on after it: its traceback holds every frame of the mining
+    loop, and with it the model, until the block exits."""
+    argv_next = None
+    try:
+        return main(argv)
+    except _ReexecAfterRelease as rq:
+        argv_next = rq.argv
+    _release_cuda_before_reexec(_flush)
+    from self_update import _default_reexec
+    _default_reexec(argv_next)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())

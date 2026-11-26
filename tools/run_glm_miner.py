@@ -56,6 +56,12 @@ def _child_env(vram_cap_gb):
     env.setdefault("TRANSFORMERS_NO_TF", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    # RELAY SIGNED WRITES + SIGNED POINTER (3.9.7, default ON): the contributor signs its PUTs in the store-bound
+    # nh-store-put/2 form (keeping X-Auth; shadow fallback to the 3.9.6 request) and checks the coordinator's
+    # pointer signature in report mode. An explicit value in the caller's env wins; =0 restores 3.9.6 exactly.
+    env.setdefault("NEURAHASH_RELAY_SIGNED_WRITES", "1")
+    env.setdefault("NEURAHASH_RELAY_SIGNED_POINTER", "1")
+    env.setdefault("NEURAHASH_RELAY_STORE_ID", "neurahash-relay-sg1")
     if vram_cap_gb is not None:
         # Hard per-process GPU ceiling, set BEFORE the child's first CUDA call. Leave headroom for
         # anything else on a shared GPU; the miner pauses (not crashes) when memory is tight.

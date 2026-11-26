@@ -4099,6 +4099,158 @@ def _sign_contrib(key, wallet, cid, base_round, name):
     return sign_bytes(wallet, msg)
 
 
+# ==================================================================== relay signed writes + signed pointer (3.9.7)
+# Design: RELAY_SIGNED_WRITES_DESIGN_2026-11-26 (private repo docs/research). Two env switches, both DEFAULT ON
+# (unset or empty = on; tools/run_glm_miner.py also sets them explicitly) and both real OFF-switches:
+#   NEURAHASH_RELAY_SIGNED_WRITES=0  -> the lane is exactly 3.9.6's (keyless: v1 X-Sig-*, keyed: token only);
+#   NEURAHASH_RELAY_SIGNED_POINTER=0 -> no pointer check is installed (read_pointer is 3.9.6).
+# WRITES on: the lane signs nh-store-put/2 bound to NEURAHASH_RELAY_STORE_ID (default neurahash-relay-sg1) with
+# the miner wallet -- keyless: the identity wallet; keyed: the wallet file IF one exists (never created here).
+# X-Auth is still sent. SHADOW: if the relay refuses the signed form (401/403/409, or 413/429 because a signed
+# writer is capped per address), the SAME PUT is re-sent as the 3.9.6 request, so signing can never cost a
+# publish; three refusals in a row switch the lane to the 3.9.6 request for 30 min (no doubled uploads).
+# POINTER on: every pointer read is checked against the PINNED coordinator address (NEURAHASH_RELAY_COORD_ADDR,
+# comma-separated; default RELAY_COORD_ADDR_DEFAULT below -- no pinned value existed in the public tree, and the
+# signed-release config allowlist is not applied on the GLM launch path) with anti-rollback
+# (signed_put.PointerGuard). A missing / bad / rolled-back psig is LOGGED LOUDLY and the pointer is used anyway
+# (report mode, this rollout), unless NEURAHASH_RELAY_POINTER_STRICT=1, which refuses it (read_pointer -> None,
+# the same as "no pointer yet": the miner waits).
+RELAY_SIGNED_WRITES_ENV = "NEURAHASH_RELAY_SIGNED_WRITES"
+RELAY_SIGNED_POINTER_ENV = "NEURAHASH_RELAY_SIGNED_POINTER"
+RELAY_POINTER_STRICT_ENV = "NEURAHASH_RELAY_POINTER_STRICT"
+RELAY_STORE_ID_ENV = "NEURAHASH_RELAY_STORE_ID"
+RELAY_COORD_ADDR_ENV = "NEURAHASH_RELAY_COORD_ADDR"
+RELAY_STORE_ID_DEFAULT = "neurahash-relay-sg1"
+RELAY_COORD_ADDR_DEFAULT = "0x2165534Ae1C161B6A8523f37F39cE4cf45bF7B86"
+RELAY_SIGN_FALLBACK_CODES = (401, 403, 409, 413, 429)
+RELAY_SIGN_BACKOFF_S = 1800.0
+RELAY_POINTER_LOG_EVERY_S = 600.0
+_RELAY_FALSEY = ("0", "false", "no", "off", "n")
+_RELAY_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _relay_flag(env, name, default):
+    v = (env.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v not in _RELAY_FALSEY
+
+
+def relay_sign_settings(env=None):
+    """The relay signing switches as one dict. Pure (reads `env`, default os.environ). Unset/empty -> default.
+    A malformed coordinator address is dropped (logged by the caller via `bad_coord`); none left -> default."""
+    env = os.environ if env is None else env
+    coords, bad = [], []
+    for a in (env.get(RELAY_COORD_ADDR_ENV) or "").split(","):
+        a = a.strip()
+        if a:
+            (coords if _RELAY_ADDR_RE.match(a) else bad).append(a)
+    return {
+        "writes": _relay_flag(env, RELAY_SIGNED_WRITES_ENV, True),
+        "pointer": _relay_flag(env, RELAY_SIGNED_POINTER_ENV, True),
+        "strict": _relay_flag(env, RELAY_POINTER_STRICT_ENV, False),
+        "store_id": (env.get(RELAY_STORE_ID_ENV) or "").strip() or RELAY_STORE_ID_DEFAULT,
+        "coord": coords or [RELAY_COORD_ADDR_DEFAULT],
+        "bad_coord": bad,
+    }
+
+
+def configure_relay_signing(lane, wallet, args, log=None, env=None):
+    """Turn the lane's signed-write path on when NEURAHASH_RELAY_SIGNED_WRITES is on. Returns the signing
+    account, or None when the lane was left exactly as 3.9.6 built it (flag off, or keyed with no wallet file).
+    `wallet` is the keyless identity (None in keyed mode); `lane.account` already equals it (3.9.6)."""
+    st = relay_sign_settings(env)
+    if not st["writes"]:
+        return None
+    acct = wallet
+    if acct is None:                                         # keyed: sign only with a wallet the operator has
+        try:
+            path = _default_wallet_path(args)
+            if os.path.exists(path):
+                from neura_l1.signing import account_from_key
+                with open(path, "r", encoding="utf-8") as f:
+                    acct = account_from_key(f.read().strip())
+        except Exception as e:                               # noqa: BLE001 -- a bad key file: stay on 3.9.6
+            if log:
+                log("[relay-signed] keyed miner: wallet file unreadable (%s) -- writes stay token-only"
+                    % type(e).__name__)
+            acct = None
+    if acct is None:
+        if log:
+            log("[relay-signed] keyed miner without a wallet file -- writes stay token-only (3.9.6)")
+        return None
+    lane.sign_fallback_account = wallet                      # keyless: v1 (its 3.9.6 request); keyed: token
+    lane.account = acct
+    lane.store_id = st["store_id"]
+    lane.sign_fallback_codes = RELAY_SIGN_FALLBACK_CODES
+    lane.sign_backoff_s = RELAY_SIGN_BACKOFF_S
+    if log:
+        lane.sign_log = log
+        log("[relay-signed] writes signed nh-store-put/2 store=%s as %s (%s; X-Auth kept; shadow fallback to the "
+            "3.9.6 request; %s=0 turns this off)" % (st["store_id"], acct.address,
+                                                     "keyless" if wallet is not None else "keyed", RELAY_SIGNED_WRITES_ENV))
+    lane.sign_shadow = True
+    return acct
+
+
+class RelayPointerCheck(object):
+    """Checks every pointer the lane's read_pointer returns (report mode unless strict). Logging is loud but
+    bounded: the first occurrence of each outcome kind, then at most once per RELAY_POINTER_LOG_EVERY_S."""
+
+    def __init__(self, coords, store_id, strict=False, log=None, clock=None):
+        from neurahash import signed_put as SP
+        self.guard = SP.PointerGuard(coords, store_id)
+        self.strict, self.log, self.clock = bool(strict), log, (clock or time.time)
+        self.counts = {}
+        self._said = {}
+
+    def _loud(self, kind, msg):
+        n = self.counts[kind] = self.counts.get(kind, 0) + 1
+        now = self.clock()
+        last = self._said.get(kind)
+        if last is not None and now - last < RELAY_POINTER_LOG_EVERY_S:
+            return
+        self._said[kind] = now
+        if self.log:
+            self.log("[relay-pointer] !!! %s (x%d so far) -- %s" % (
+                msg, n, "REFUSED (NEURAHASH_RELAY_POINTER_STRICT=1)" if self.strict
+                else "using it anyway (report mode; NEURAHASH_RELAY_POINTER_STRICT=1 refuses)"))
+
+    def check(self, ptr):
+        if ptr is None:
+            return None
+        ok, info = self.guard.offer(ptr)
+        if ok:
+            if "ok" not in self.counts and self.log:
+                self.log("[relay-pointer] signed pointer VERIFIED: coordinator %s, campaign %s, event %s"
+                         % (info.get("signer"), info.get("campaign"), info.get("event")))
+            self.counts["ok"] = self.counts.get("ok", 0) + 1
+            return ptr
+        reason = str(info)
+        kind = ("unsigned" if reason == "unsigned pointer" else
+                "rollback" if reason.startswith(("rollback", "campaign switch")) else "bad")
+        self._loud(kind, "pointer psig check FAILED: %s" % reason)
+        return None if self.strict else ptr
+
+    def install(self, lane):
+        lane.pointer_check = self                            # read by ContentLane.read_pointer
+        return self
+
+
+def install_relay_pointer_check(lane, log=None, env=None):
+    """NEURAHASH_RELAY_SIGNED_POINTER on -> install the check on the lane; off -> the lane is untouched (None)."""
+    st = relay_sign_settings(env)
+    if not st["pointer"]:
+        return None
+    if st["bad_coord"] and log:
+        log("[relay-pointer] WARNING: ignoring malformed %s entries %r" % (RELAY_COORD_ADDR_ENV, st["bad_coord"]))
+    chk = RelayPointerCheck(st["coord"], st["store_id"], strict=st["strict"], log=log).install(lane)
+    if log:
+        log("[relay-pointer] checking pointer signatures against %s (store %s, %s)" % (
+            ",".join(st["coord"]), st["store_id"], "STRICT" if st["strict"] else "report mode"))
+    return chk
+
+
 # ==================================================================== alpha 2.0 non-blocking cadence (#146)
 # The truly-decoupled lane (docs/ALPHA2_PLAN.md sec 1-3). These four helpers are the PURE decisions the
 # async cadence makes -- factored out so they are unit-testable with NO socket / GPU / model. The sync
@@ -7899,6 +8051,10 @@ def main(argv=None):
     # extra X-Sig-* headers are ignored and the v1 path stays byte-identical. Keyed mode: wallet is
     # None -> ContentLane behaves exactly as before.
     lane = H.ContentLane(args.url, args.token, account=wallet)
+    # RELAY SIGNED WRITES + SIGNED POINTER (3.9.7; block above configure_relay_signing). Both default ON;
+    # NEURAHASH_RELAY_SIGNED_WRITES=0 / NEURAHASH_RELAY_SIGNED_POINTER=0 leave this lane exactly as 3.9.6.
+    configure_relay_signing(lane, wallet, args, log=_flush)
+    install_relay_pointer_check(lane, log=_flush)
     _flush("[glm-contrib %s] UP claims GLM (L%d,E%d) via %s | local_slot=%d domain_slot=%d | "
            "identity=%s mode=%s lane=%s (all-outbound)"
            % (miner, L, E, _claim_src, i, coord_data_slot(L, E),

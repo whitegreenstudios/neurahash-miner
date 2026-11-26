@@ -310,6 +310,8 @@ class ContentLane:
 
     def put_blob(self, body, name=None):
         cid = cid_of(body)
+        if self.account is not None and getattr(self, "sign_shadow", False):
+            return self._signed_put_shadow(cid, body, name)      # NEURAHASH_RELAY_SIGNED_WRITES lane only
         req = urllib.request.Request(self.base + "/o/" + cid, data=body, method="PUT")
         if _miner_id is not None:
             _miner_id.attach(req)
@@ -325,6 +327,112 @@ class ContentLane:
         if name:
             req.add_header("X-Name", name)
         json.loads(self._request(req).decode())   # 201 body; raises on non-2xx
+        return cid
+
+    # ---- RELAY SIGNED WRITES (release 3.9.7; design RELAY_SIGNED_WRITES_DESIGN_2026-11-26, rollout step 4/5).
+    # Active ONLY on a lane whose owner set `sign_shadow = True` (the coordinator / payout verifier under
+    # NEURAHASH_RELAY_SIGNED_WRITES=1, and from 3.9.7 the GLM contributor's own lane: see
+    # sharddiloco_glm_contributor.configure_relay_signing); every other lane takes the
+    # unchanged path above. Two differences from that path:
+    #   * per-name STRICTLY increasing X-Sig-Ts (ts = max(now, last_ts_for_name + 1)): a relay enforcing the
+    #     policy refuses an update of a protected name whose ts does not move (409);
+    #   * SHADOW: a signing error, or a 401/403/409 answered to the SIGNED request, logs once per kind and
+    #     re-sends the same PUT token-only (today's request), so signing can never stop a commit or a mint.
+    #     Against a relay ENFORCING the policy that token-only retry is refused as well, and the error is raised
+    #     exactly as an unsigned lane would see it.
+
+    def _sig_ts_for(self, name):
+        now = int(time.time())
+        if not name:
+            return now
+        tsm = self.__dict__.setdefault("_name_sig_ts", {})
+        ts = max(now, int(tsm.get(name, 0)) + 1)
+        tsm[name] = ts
+        if len(tsm) > 65536:                     # bounded: drop the oldest-inserted names
+            for k in list(tsm)[:8192]:
+                if k != name:
+                    tsm.pop(k, None)
+        return ts
+
+    def _sign_note(self, key, msg):
+        said = self.__dict__.setdefault("_sign_said", set())
+        if key in said:
+            return
+        said.add(key)
+        log = getattr(self, "sign_log", None)
+        try:
+            (log or (lambda m: print(m, file=sys.stderr, flush=True)))(msg)
+        except Exception:                        # noqa: BLE001 -- logging never breaks a write
+            pass
+
+    def _build_put(self, cid, body, name, sig_headers):
+        req = urllib.request.Request(self.base + "/o/" + cid, data=body, method="PUT")
+        if _miner_id is not None:
+            _miner_id.attach(req)
+        if self.token:
+            req.add_header("X-Auth", self.token)
+        for _k, _v in (sig_headers or {}).items():
+            if _k != "X-Name":
+                req.add_header(_k, _v)
+        if name:
+            req.add_header("X-Name", name)
+        return req
+
+    def _fallback_headers(self, cid, name):
+        """The request a shadow fallback re-sends. Default: token-only (the coordinator / verifier lanes).
+        A miner lane sets `sign_fallback_account` to its wallet when its 3.9.6 request was the v1-signed
+        one (keyless), so the fallback IS that request byte for byte (store_auth.sign_put, no store id)."""
+        acct = getattr(self, "sign_fallback_account", None)
+        if acct is None:
+            return None
+        from neurahash import store_auth
+        return store_auth.sign_put(acct, cid, name=name, store_id=None)
+
+    def _signed_put_shadow(self, cid, body, name):
+        # Miner-lane knobs (release 3.9.7; all default to the coordinator-lane behaviour above):
+        #   sign_fallback_codes   HTTP codes answered to the SIGNED request that trigger the fallback
+        #                         (default 401/403/409; the contributor adds 413/429, because a signed
+        #                         writer is capped per address where its 3.9.6 token write was not);
+        #   sign_fallback_account see _fallback_headers;
+        #   sign_backoff_s        > 0: after 3 refusals in a row, send the fallback request directly for
+        #                         this many seconds, so a relay that keeps refusing the signed form does
+        #                         not double every upload (a delta is MBs on a home uplink).
+        codes = getattr(self, "sign_fallback_codes", (401, 403, 409))
+        backoff = float(getattr(self, "sign_backoff_s", 0) or 0)
+        if backoff > 0 and time.time() < float(self.__dict__.get("_sign_off_until", 0)):
+            json.loads(self._request(self._build_put(cid, body, name, self._fallback_headers(cid, name))).decode())
+            return cid
+        sig = None
+        try:
+            from neurahash import store_auth
+            sig = store_auth.sign_put(self.account, cid, name=name, ts=self._sig_ts_for(name),
+                                      store_id=self.store_id)
+        except Exception as e:                   # noqa: BLE001 -- shadow: fall back to the token write
+            self._sign_note("signerr:" + type(e).__name__,
+                            "[relay-signed] WARNING: signing a PUT failed (%s) -- sending it %s"
+                            % (type(e).__name__, "the legacy way" if backoff > 0 else "token-only"))
+        if sig is not None:
+            try:
+                json.loads(self._request(self._build_put(cid, body, name, sig)).decode())
+                self.__dict__["_sign_refusals"] = 0
+                return cid
+            except urllib.error.HTTPError as e:
+                if e.code not in codes:
+                    raise
+                self._sign_note("refused:%d" % e.code,
+                                "[relay-signed] WARNING: the relay refused a SIGNED PUT (HTTP %d, name %s) -- "
+                                "re-sending it %s (shadow fallback)"
+                                % (e.code, str(name)[:80], "the legacy way" if backoff > 0 else "token-only"))
+                if backoff > 0:
+                    n = int(self.__dict__.get("_sign_refusals", 0)) + 1
+                    self.__dict__["_sign_refusals"] = n
+                    if n >= 3:
+                        self.__dict__["_sign_off_until"] = time.time() + backoff
+                        self.__dict__["_sign_refusals"] = 0
+                        self._sign_note("backoff:%d" % int(time.time() // backoff),
+                                        "[relay-signed] WARNING: %d signed PUTs in a row were refused -- sending "
+                                        "the legacy request directly for %ds" % (n, int(backoff)))
+        json.loads(self._request(self._build_put(cid, body, name, self._fallback_headers(cid, name))).decode())
         return cid
 
     # ---- typed helpers ----
@@ -399,7 +507,11 @@ class ContentLane:
             man = self.manifest()
         if POINTER_NAME not in man:
             return None
-        return self.get_json(man[POINTER_NAME]["sha256"])
+        ptr = self.get_json(man[POINTER_NAME]["sha256"])
+        # 3.9.7: an owner-installed signed-pointer check (sharddiloco_glm_contributor.RelayPointerCheck). An
+        # attribute, not a wrapped method, so a copy.copy'd lane (the catch-up's _DeadlineLane) keeps it.
+        chk = getattr(self, "pointer_check", None)
+        return ptr if chk is None else chk.check(ptr)
 
 
 def contrib_name(rnd, miner):

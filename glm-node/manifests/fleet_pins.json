@@ -1,0 +1,58 @@
+{
+ "files": {
+  "lib/lmbwd_core.py": {
+   "sha256": "02c1da6d799e341757287efadfba9849a30827f83d5c045e57de0e8c5c3ecdf3",
+   "source": "<private repo>/scratchpad/lmbwd_core.py"
+  },
+  "lib/runner/bin/p2psidecar.exe": {
+   "sha256": "be38da9aac4f64a1857c38b37e1f163a70ed9282c4ae9753ca08363e2730c39b",
+   "source": "glm-node/sidecar/src, built with go1.27.1 -trimpath -buildvcs=false"
+  },
+  "lib/runner/diloco_golden_check.py": {
+   "sha256": "be4b161f706ff999849a110d8cc8641cc7239f7f1ff621e7f615882b256bfd6c",
+   "source": "<private repo>/scratchpad/runner_n3_stage0_2026-10-16/diloco_golden_check.py"
+  },
+  "lib/runner/glm47_h1x_chain.py": {
+   "sha256": "a2b2158a64c2638eebd2e45d267c198746247ec26d78d2b3eaf45d7f5333ebaa",
+   "source": "<private repo>/scratchpad/runner_n3_stage0_2026-10-16/glm47_h1x_chain.py"
+  },
+  "lib/runner/h1_wire_delta.py": {
+   "sha256": "25360f0d8b58bf7ad86bff9692d09a8dd10888166d71e58d003a6f12a1c2ab92",
+   "source": "<private repo>/scratchpad/runner_n3_stage0_2026-10-16/h1_wire_delta.py"
+  },
+  "lib/runner/p2p_transport.py": {
+   "sha256": "eca89c4d0f0493caec38d6ae253ff949a221dce32ebb0118292767259b5a81dd",
+   "source": "<private repo>/scratchpad/runner_n3_stage0_2026-10-16/p2p_transport.py"
+  },
+  "lib/wan_gradient_chain_ckpt.py": {
+   "note": "PUBLIC variant of the fleet's a379cc50: lines 3132-3134 (DP2 ssh / vps_store_root) read NEURAHASH_ANCHOR_SSH / NEURAHASH_ANCHOR_STORE_ROOT (unset = ssh off); built by make_public_wg.py, every other byte identical",
+   "sha256": "e5b993b42f7893f838ec7837ec54d8d566f44c9fc690db0f2a5ef48bffce35c8",
+   "source": "<private repo>/scratchpad/glmnode_publish_1015/public_wg/wan_gradient_chain_ckpt.py"
+  },
+  "tools/glm_arc_eval.py": {
+   "sha256": "6ce813f8521a1b2a5c96cb537a99b9e3f477419c6017429a7d71f1e92e243a3e",
+   "source": "<private repo>/scratchpad/packcodec_0924/tools/glm_arc_eval.py"
+  },
+  "tools/glm_capture_layer_major.py": {
+   "sha256": "8165656803ea4d93fbf040b6d58c6077e789039409f2d3f62b8d2c7069b09491",
+   "source": "<private repo>/tools/glm_capture_layer_major.py"
+  },
+  "tools/nhz_codec.py": {
+   "sha256": "f3b07a462e7cdc369e2af6e05866cf5b9bcfc5f8fae5fd616fb87e4033d1e393",
+   "source": "<private repo>/scratchpad/packcodec_0924/nhz_codec.py"
+  },
+  "tools/no_toy_models.py": {
+   "sha256": "ebbb18fd7a33aaef4a79d82d231383662c9db1bd8e290364a93a1b105778b66c",
+   "source": "<private repo>/tools/no_toy_models.py"
+  },
+  "tools/piece_loader.py": {
+   "sha256": "a1f84f41b5d933052de0274362ae1d8d69862e360868fa3c92c3b5846ffb4c2b",
+   "source": "<private repo>/tools/piece_loader.py"
+  },
+  "tools/sharddiloco_glm_expert.py": {
+   "sha256": "3f858a90e2f94024f82dba01e607fc6da933a065f22f43db59187d27f8d25296",
+   "source": "<private repo>/tools/sharddiloco_glm_expert.py"
+  }
+ },
+ "runner_set": "Stage-0 2026-10-16 (runner a2b2158a = 87b73d0c + two self-test fixture fixes, build_runner_fix2.py; evidence logs_fix_1016)"
+}

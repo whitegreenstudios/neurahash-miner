@@ -1,0 +1,21 @@
+# glm-node: Python packages, pinned to the versions our own nodes run (measured on both of our
+# training PCs: torch 2.9.1+cu128, transformers 5.8.1, peft 0.18.0, numpy 2.2.6).
+#
+# Install torch FIRST, from the CUDA 12.8 wheel index (the default PyPI wheel may be CPU-only on Windows):
+#   python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+# then the rest:
+#   python -m pip install -r glm-node/requirements-node.txt
+#
+# Python 3.10, 3.11, 3.12 or 3.13 (our nodes run 3.10.8 and 3.13.4 and produce identical golden digests).
+torch==2.9.1
+transformers==5.8.1          # >= 5.8 is REQUIRED: GLM-4.7-Flash is transformers.models.glm4_moe_lite
+peft==0.18.0
+numpy==2.2.6
+safetensors==0.7.0
+accelerate==1.8.1
+tokenizers==0.22.1
+huggingface_hub==1.10.2      # build_packs.py downloads the public model with it
+psutil==7.0.0
+cryptography==46.0.3         # Ed25519 signed P2P signalling (p2p_transport.py)
+pyarrow==22.0.0              # fetch_corpus.py --rebuild reads the datasets' parquet files
+pytest==9.0.3                # only for `python -m pytest glm-node/tests` (verifying this folder)

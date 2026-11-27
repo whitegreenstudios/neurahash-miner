@@ -76,6 +76,20 @@ pip install numpy eth-account
 
 No torch, no CUDA.
 
+**Optional: use uv instead.** [uv](https://docs.astral.sh/uv/) installs packages much faster and can
+download Python for you, so you do not need Python installed first. It does not make the validator
+itself run faster. Install uv by following its official instructions
+(https://docs.astral.sh/uv/getting-started/installation/), then:
+
+```
+uv venv --python 3.12          # creates .venv; downloads Python 3.12 if you do not have it
+. .venv/bin/activate           # Windows PowerShell: .venv\Scripts\Activate.ps1
+uv pip install numpy eth-account
+```
+
+With the environment activated, every later command in this guide works unchanged. In the systemd
+unit below, use `.venv/bin/python` instead of `venv/bin/python`.
+
 ### 3. Create your validator key
 
 Your key identifies you. It never leaves your machine and nobody from the project will ever ask

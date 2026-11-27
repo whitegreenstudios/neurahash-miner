@@ -88,6 +88,7 @@ SHIPPED_ENTRY_POINTS = {
     "tools/glm_rollout_worker.py": "miner, G1 train-role: README",
     "tools/glm_pipe_stage.py": "miner, G1 pipeline stage: README",
     "tools/sign_release.py": "operator: README + SIGNING.md",
+    "tools/glm_s1_attester.py": "validator: docs/RUN_A_VALIDATOR.md, light mode",
 }
 
 # Modules this tree does not ship ON PURPOSE, and the ONLY sites allowed to import them:
@@ -97,6 +98,39 @@ SHIPPED_ENTRY_POINTS = {
 # test_absent_by_design_has_no_stale_entries fails when a listed site stops importing its module,
 # so this cannot rot into a blanket.
 ABSENT_BY_DESIGN = {
+    "sharddiloco_glm_coordinator": {
+        ("tools/glm_s1_attester.py", "build_full_core"):
+            "UNGUARDED: the private coordinator stack for the S1 validator's FULL mode (CE re-score); glm_s1_attester.main refuses --mode full when it is not importable, so the public light mode never reaches it",
+        ("tools/glm_s1_attester.py", "LightCore.__init__"):
+            "UNGUARDED: light-mode omission candidates (--omission-window > 0) recover contribution signatures "
+            "with the private coordinator; glm_s1_attester.main refuses that switch when it is not importable",
+        ("tools/glm_verifier_shadow.py", "main"):
+            "UNGUARDED: glm_verifier_shadow.py's own CLI (the private live verifier), not a shipped entry point; the light validator imports the module only for its relay/record helpers",
+    },
+    "glm_expert_drift": {
+        ("tools/glm_s1_attester.py", "build_full_core"):
+            "UNGUARDED: the private coordinator stack for the S1 validator's FULL mode (CE re-score); glm_s1_attester.main refuses --mode full when it is not importable, so the public light mode never reaches it",
+        ("tools/glm_verifier_shadow.py", "main"):
+            "UNGUARDED: glm_verifier_shadow.py's own CLI (the private live verifier), not a shipped entry point; the light validator imports the module only for its relay/record helpers",
+    },
+    "glm_verifier_eval": {
+        ("tools/glm_verifier_shadow.py", "ShadowCore.rescore"):
+            "UNGUARDED: the private coordinator stack for the S1 validator's FULL mode (CE re-score); glm_s1_attester.main refuses --mode full when it is not importable, so the public light mode never reaches it",
+        ("tools/glm_verifier_shadow.py", "build_real"):
+            "UNGUARDED: the private coordinator stack for the S1 validator's FULL mode (CE re-score); glm_s1_attester.main refuses --mode full when it is not importable, so the public light mode never reaches it",
+        ("tools/glm_verifier_checks.py", "make_ce_fn"):
+            "UNGUARDED: the private coordinator stack for the S1 validator's FULL mode (CE re-score); glm_s1_attester.main refuses --mode full when it is not importable, so the public light mode never reaches it",
+    },
+    "neura_l1.pouw_gate": {
+        ("neura_l1/pool_sequencer.py", "<module>"):
+            "UNGUARDED in pool_sequencer, but its only importer on a shipped path is neurahash/diloco_settlement.py's "
+            "module-level try/except Exception, which falls back to _roster_root = None (an optional audit field)",
+    },
+    "neura_l1.consensus": {
+        ("neura_l1/pool_sequencer.py", "elect_proposer"):
+            "UNGUARDED: unreachable on a shipped path -- pool_sequencer itself fails to import here (pouw_gate above), "
+            "and diloco_settlement catches that",
+    },
     "model_registry": {
         ("neurahash_torch/pool_model.py", "_resolve_base"):
             "guarded: the private-repo alias table for the retired Qwen dense-base path; without it "

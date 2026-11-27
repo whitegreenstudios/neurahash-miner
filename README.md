@@ -34,6 +34,22 @@ else runs (or that you run from the full node package).
 
 ---
 
+## Alpha 3.9.8 (2026-11-27) — run a validator: the stage-S1 light validator ships here
+
+**Run a validator: see [docs/RUN_A_VALIDATOR.md](docs/RUN_A_VALIDATOR.md).** The project is removing
+its single trusted coordinator, and stage S1 needs validators that are not on the project's own PCs.
+`tools/glm_s1_attester.py --mode light` runs from a fresh clone of this repository with no model, no
+torch and no GPU (about 90 MB of RAM, `pip install numpy eth-account`). For every coordinator event it
+re-checks the coordinator's signed publish audit and its hash chain, the signed gate decision, the
+model-root link, rewritten or removed records, and publishes one verdict signed by your own key.
+Nothing is enforced yet: S1 only records whether independent validators agree.
+
+This repository ships **light mode only**. `--mode full` re-scores contributions and needs the
+private coordinator code; here it refuses with a message and exits. The client-half note below
+still holds for the coordinator, the ledger and the reward economics.
+
+---
+
 ## ⚠️ Honest status — read this before you rely on it
 
 - **This is the MINER CLIENT only.** It trains its assigned expert slot and publishes signed

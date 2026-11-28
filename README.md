@@ -40,9 +40,9 @@ else runs (or that you run from the full node package).
 "lane looks dead" guard used to pause training — which also stopped it retrying the upload, so the
 lane could not recover until every miner was restarted by hand (this happened on 2026-11-27, when the
 relay's name pool filled up and every upload got HTTP 507). Now, while your own latest upload stands
-refused, the miner treats the relay as alive: it keeps training, keeps its best round and retries the
-upload with backoff, and prints "THE RELAY IS REFUSING YOUR UPLOADS" with the relay's reason. It
-resumes by itself once the relay accepts again. A lane that is quiet with no refusal still pauses as
+refused (or times out), the miner keeps its best round and re-sends it with backoff instead of going
+silent; it trains no new round meanwhile, so your GPU idles, and it prints "YOUR UPLOADS ARE BEING
+REFUSED" with the relay's reason. It resumes by itself once the relay accepts again. A lane that is quiet with no refusal still pauses as
 before.
 
 **Validator.** The light validator now also checks the coordinator's signed held-out numbers against

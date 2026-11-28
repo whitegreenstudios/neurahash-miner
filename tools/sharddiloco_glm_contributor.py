@@ -6376,11 +6376,12 @@ class LaneLiveness:
         why = str(reason or "unknown")
         why = "".join(c if 32 <= ord(c) < 127 else "?" for c in why)[:160]
         return [bar,
-                "!! NEURAHASH: THE RELAY IS REFUSING YOUR UPLOADS -- your work cannot reach the coordinator.",
-                "!! The coordinator's event counter has not moved for %d min, but the relay is answering," % mins,
-                "!! so the lane is not treated as dead: training goes on and the kept round is retried",
-                "!! with backoff (%d refusal(s) so far). Last refusal: %s" % (int(failures), why),
-                "!! The miner resumes publishing BY ITSELF once the relay accepts again -- do NOT restart it.",
+                "!! NEURAHASH: YOUR UPLOADS ARE BEING REFUSED -- your work cannot reach the coordinator.",
+                "!! The coordinator's event counter has not moved for %d min, and the relay is refusing" % mins,
+                "!! (or timing out on) your uploads, so the quiet may be the relay, not a dead coordinator.",
+                "!! Training is PAUSED; your best round is kept and re-sent with backoff",
+                "!! (%d refusal(s) so far). Last refusal: %s" % (int(failures), why),
+                "!! The miner resumes BY ITSELF once the relay accepts again -- do NOT restart it.",
                 "!! If it persists for hours, report it: it is a relay-side limit, not your setup.",
                 bar]
 
@@ -6390,11 +6391,12 @@ def stale_action(lane_state, refusing):
     publish stands refused (PublishBackoff.refusing). Pure.
 
         "pause"   -- the lane looks dead and nothing contradicts it: skip training, poll slowly.
-        "refused" -- the lane looks dead ONLY because our uploads are refused: the store answered, so it
-                     is alive, and pausing would also stop the publish retries -- the deadlock measured on
-                     2026-11-27/28 (relay full -> every upload 507 -> no events -> miners paused -> no
-                     retries -> the lane could never move again without a restart). Keep the normal loop
-                     (train, keep the best round, retry the publish under PublishBackoff).
+        "refused" -- the lane looks dead but our own uploads are being refused (or timing out), so the
+                     quiet may be the relay's fault, and a plain pause would also stop the publish
+                     retries -- the deadlock measured on 2026-11-27/28 (relay full -> every upload 507 ->
+                     no events -> miners paused -> no retries -> the lane could never move again without a
+                     restart). Keep retrying the KEPT round under PublishBackoff, but train no new round
+                     while one is kept (RETRY-ONLY in the loop), so a truly dead lane costs no GPU.
         "run"     -- not stale."""
     if lane_state != "stale":
         return "run"
@@ -6755,6 +6757,14 @@ class _PublishWindow:
         if cur is None or _ce_key(best_val) < _ce_key(cur["best_val"]):
             self._best = dict(best_val=best_val, payload=payload, train_flops=train_flops,
                               steps=int(steps), tokens=int(tokens))
+
+    def peek(self, slot_root):
+        """The kept (best_val, payload, train_flops, steps, tokens) if one is held for `slot_root`, else
+        None. Does not consume the buffer and never resets it (a different root just answers None)."""
+        held = self._best
+        if held is None or self._slot_root != slot_root:
+            return None
+        return (held["best_val"], held["payload"], held["train_flops"], held["steps"], held["tokens"])
 
     def take_or_current(self, slot_root, best_val, payload, train_flops, steps, tokens):
         """Consume the buffer and return the (best_val, payload, train_flops, steps, tokens) to
@@ -7274,6 +7284,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
     _credit_wait_s = _env_num(CREDIT_WAIT_ENV, CREDIT_WAIT_S_DEFAULT, float)
     _last_pub_t = time.time()
     _pubwin = _PublishWindow()
+    _prev_stale_do, _refused_mode, _last_retry_t = "run", False, 0.0     # stale-lane x refused uploads
     _pub_backoff = PublishBackoff()          # PUBLISH REFUSALS: a refused PUT backs off, never exits
     # UPDATE CAP (default ON since 3.9.4): read once, fail fast on a malformed value rather than publish uncapped.
     _update_cap = update_cap_from_env()
@@ -7585,9 +7596,15 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
             log("[glm-contrib %s] LANE RECOVERED: the coordinator moved again (event=%s); resuming "
                 "training." % (miner, dec.get("event")))
         _stale_do = stale_action(_lane_state, _pub_backoff.refusing)
+        if _stale_do != _prev_stale_do and "run" not in (_stale_do, _prev_stale_do):
+            lane_health._last_shout_t = None        # refused <-> pause: shout the new banner at once
+        _prev_stale_do = _stale_do
+        _refused_mode = _stale_do == "refused"
         if _stale_do == "refused":
             # The lane only LOOKS dead because our own uploads are refused (see stale_action): fall
-            # through to the normal loop so the kept round keeps being retried under PublishBackoff.
+            # through so the KEPT round keeps being retried under PublishBackoff. Training is skipped
+            # while a kept round exists (see RETRY-ONLY below), so a dead coordinator behind a refusing
+            # relay costs a publish attempt per backoff step, not a GPU running flat out.
             _now = time.time()
             if lane_health.should_shout(_now):
                 for _ln in lane_health.refused_banner(_now, _pub_backoff.failures, _pub_backoff.last_reason):
@@ -7803,9 +7820,26 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
                     "paused until the store accepts again." % (miner, _wait, _pub_backoff.failures))
                 time.sleep(min(_wait, 30.0))
                 continue
+        # RETRY-ONLY (stale lane + our uploads refused): with a round already kept for this slot, do not
+        # train another one -- wait out the backoff (at most one attempt per STALE_LANE_POLL_S) and then
+        # re-send the kept round through the normal publish path below. The layer path keeps no round and
+        # already sleeps through its backoff above.
+        _kept = (_pubwin.peek(slot_root(host, i))
+                 if _refused_mode and not args.garbage and not layer_claim_enabled() else None)
+        if _kept is not None:
+            _now = time.time()
+            _w = max(_pub_backoff.blocked(_now), _last_retry_t + STALE_LANE_POLL_S - _now)
+            if _w > 0:
+                time.sleep(min(_w, STALE_LANE_POLL_S))
+                continue
+            _last_retry_t = _now
+            log("[glm-contrib %s] RETRY-ONLY: lane stale and uploads refused; re-sending the kept round "
+                "for slot %d (L%d,E%d) without training a new one." % (miner, i, L, E))
         t_tr = time.time()
         try:
-            if args.garbage:
+            if _kept is not None:
+                best_val, payload, train_flops, steps, tokens = _kept
+            elif args.garbage:
                 delta = G.garbage_delta(host.read_slot(i), scale=3.0, seed=1234 + rounds_done)
                 train_flops, best_val, steps, tokens = 1.0, float("nan"), 0, 0
                 payload = delta                    # adversarial control stays dense: it has no factors

@@ -6,10 +6,11 @@ stopped; 3 h later every miner's stale-lane detector fired and PAUSED -- and a p
 publish path, so it stopped retrying the very upload that would have moved the lane. The lane could
 not restart by itself even after the relay was fixed: both miners had to be restarted by hand.
 
-THE RULE. A store that answers with a refusal is alive, so "my latest upload stands refused" is
-evidence AGAINST a dead lane. stale_action() returns "refused" then, and the loop keeps its normal
-train / keep-best-round / retry-under-backoff path, printing a banner that names the refusal instead
-of "THIS LANE LOOKS DEAD". A genuinely dead lane (no refusal pending) still pauses exactly as before.
+THE RULE. While our latest upload stands refused (or timed out), the quiet may be the relay's fault.
+stale_action() returns "refused" then: the loop trains NO new round while one is kept (RETRY-ONLY) but
+keeps re-sending the kept round under backoff (at most once per STALE_LANE_POLL_S), with a banner naming
+the refusal. So the lane recovers by itself once the relay accepts, and a coordinator that is truly dead
+behind a refusing relay costs no GPU. A dead lane with no refusal pending still pauses exactly as before.
 
 Torch-free, no network, no GPU.
 Run: C:/Python313/python.exe -m pytest tests/test_refused_upload_not_dead_lane.py -q
@@ -95,7 +96,7 @@ def test_refused_banner_is_ascii_names_the_refusal_and_never_says_dead():
     lines = lh.refused_banner(200.0, 7, "HTTP 507: name index full \u2013 x")
     text = "\n".join(lines)
     assert all(ord(c) < 128 for c in text)                    # cp1252 console safe
-    assert "REFUSING YOUR UPLOADS" in text and "name index full" in text and "7 refusal" in text
+    assert "UPLOADS ARE BEING REFUSED" in text and "PAUSED" in text and "name index full" in text and "7 refusal" in text
     assert "LOOKS DEAD" not in text
 
 
@@ -103,9 +104,43 @@ def test_the_loop_uses_stale_action_and_does_not_skip_publishing_on_refusal():
     """Source pin: the async loop decides through stale_action, and only the 'pause' branch continues."""
     src = open(os.path.join(_TOOLS, "sharddiloco_glm_contributor.py"), encoding="utf-8").read()
     i = src.index("_stale_do = stale_action(_lane_state, _pub_backoff.refusing)")
-    block = src[i:i + 1500]
+    block = src[i:i + 3000]
     refused = block[block.index('if _stale_do == "refused":'):block.index('elif _stale_do == "pause":')]
     paused = block[block.index('elif _stale_do == "pause":'):]
     assert "continue" not in refused
     assert re.search(r"\n\s+continue\b", paused)
     assert 'if _lane_state == "stale":' not in src            # the old unconditional pause is gone
+
+
+def test_peek_returns_the_kept_round_without_consuming_it():
+    w = N._PublishWindow()
+    assert w.peek("rootA") is None
+    w.keep("rootA", 6.9, {"p": 1}, 1.0, 900, 100)
+    assert w.peek("rootA") == (6.9, {"p": 1}, 1.0, 900, 100)
+    assert w.peek("rootA") is not None                        # not consumed
+    assert w.peek("rootB") is None                            # other slot root: nothing, and no reset
+    assert w.peek("rootA") is not None
+    assert w.take_or_current("rootA", 9.9, {"p": 2}, 1.0, 1, 1)[0] == 6.9
+
+
+def test_retry_only_skips_training_and_is_rate_limited():
+    """Source pin: in refused mode with a kept round the loop sleeps out the backoff (bounded by
+    STALE_LANE_POLL_S), then publishes the kept round instead of training."""
+    src = open(os.path.join(_TOOLS, "sharddiloco_glm_contributor.py"), encoding="utf-8").read()
+    i = src.index("_kept = (_pubwin.peek(slot_root(host, i))")
+    blk = src[i:i + 2200]
+    assert "if _refused_mode and not args.garbage and not layer_claim_enabled() else None" in blk
+    assert "_last_retry_t + STALE_LANE_POLL_S - _now" in blk
+    assert "time.sleep(min(_w, STALE_LANE_POLL_S))" in blk
+    t = blk.index("try:")
+    assert blk.index("if _kept is not None:", t) < blk.index("elif args.garbage:", t)
+    assert blk.index("best_val, payload, train_flops, steps, tokens = _kept", t) < blk.index(
+        "G.train_glm_expert_contribution", t)
+
+
+def test_banner_timer_resets_when_switching_between_refused_and_pause():
+    src = open(os.path.join(_TOOLS, "sharddiloco_glm_contributor.py"), encoding="utf-8").read()
+    i = src.index("_stale_do = stale_action(_lane_state, _pub_backoff.refusing)")
+    blk = src[i:i + 400]
+    assert 'if _stale_do != _prev_stale_do and "run" not in (_stale_do, _prev_stale_do):' in blk
+    assert "lane_health._last_shout_t = None" in blk

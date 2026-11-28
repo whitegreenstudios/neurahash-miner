@@ -34,6 +34,11 @@ THE TOLERANCE RULE (design 2.2, rule 2, adapted to S1 where the live coordinator
   additionally abstain("z_outside_tau") if |z_a - z_p| > tau_z. Decisions differ -> near also when
   |z_p - z_min| <= tau_z. Held-out tol / canary / judge vetoes abstain, never disagree (owner 2026-11-26).
   check_signed_gate() checks the proposer's own numbers for internal consistency (light mode).
+  HELD-OUT RULE (2026-11-27, owner "add the held-out tolerance recheck to the validator"): check_signed_heldout()
+  applies the coordinator's #145 rule (rollback iff ce_candidate > ce_floor + merge_tol) to the SIGNED held-out
+  numbers (model-free; a held-out-tol veto with all four numbers is no longer a blanket abstain). In full mode with
+  --heldout-recheck, check_heldout_recheck() re-applies it with the attester's OWN measured candidate CE, after the
+  positive control (own ce_before == signed ce_before within tau_ce; else abstain heldout_rows_unmatched).
 
 DEFAULTS, derived from a measurement (E:/rsft_runs/cpu_determinism_1126/runs_summary.json, 2026-11-26; partial,
 the 6-thread run was still finishing; the same gate replayed on the 5090-host CPU vs the 4060-host coordinator,
@@ -200,7 +205,8 @@ def signed_gate(rec):
             "margin_accepted": r.get("margin_accepted"), "gain": _num(r.get("gain")),
             "base_val": _num(r.get("base_val")), "merged_val": _num(r.get("merged_val")),
             "ce_before": _num(h.get("ce_before")), "ce_candidate": _num(h.get("ce_candidate")),
-            "ce_after": _num(h.get("ce_after")), "merge_tol": _num(h.get("merge_tol"))}
+            "ce_after": _num(h.get("ce_after")), "merge_tol": _num(h.get("merge_tol")),
+            "ce_floor": _num(h.get("ce_floor"))}
 
 
 def with_signed_gate(row, sg):
@@ -243,11 +249,87 @@ def check_signed_gate(sg, judged_accepted, tol):
             out.append(("signed_gate", DISAGREE, "signed_z_contradicts_decision"))
     elif d == "z_veto" and sg["z_mode"] != "veto":
         out.append(("signed_gate", DISAGREE, "z_veto_without_z_gate"))
-    if d in NOT_RECHECKABLE:
+    hc = check_signed_heldout(sg, tol)
+    if hc is not None:
+        out.append(hc)
+    elif d in NOT_RECHECKABLE:
         out.append(("signed_gate", ABSTAIN, NOT_RECHECKABLE[d]))
     if not out:
         out.append(("signed_gate", AGREE, "signed_gate_consistent"))
     return out
+
+
+# ------------------------------------------------------------------------------------------------- held-out rule
+# Owner 2026-11-27: "add the held-out tolerance recheck to the validator". The coordinator's #145 rule
+# (sharddiloco_glm_coordinator.merge_rollback_needed): roll back iff ce_candidate > ce_floor + merge_tol (strict),
+# ce_floor = min(prev, best) <= ce_before; a rollback restores the pre-merge state, so ce_after == ce_before; an
+# accept keeps the candidate, so ce_after == ce_candidate. The signed gate (v1) carries all five numbers.
+HELDOUT_RULE_DECISIONS = ("heldout_tol", "accept")
+
+
+def _heldout_fields(sg):
+    """(ce_before, ce_candidate, ce_after, ce_floor, merge_tol) or None when the rule cannot be applied."""
+    if sg is None or sg.get("decision") not in HELDOUT_RULE_DECISIONS:
+        return None
+    cb, cc, ca, fl, mt = (sg.get(k) for k in ("ce_before", "ce_candidate", "ce_after", "ce_floor", "merge_tol"))
+    if cb is None or cc is None or fl is None or mt is None:
+        return None                                          # missing fields: no extra check, never a disagree
+    return cb, cc, ca, fl, mt
+
+
+def check_signed_heldout(sg, tol):
+    """The signed held-out rule on the proposer's OWN numbers (model-free, light and full) -> (kind, verdict,
+    reason) or None (not applicable / fields missing). A contradiction is a signed self-contradiction (disagree);
+    a candidate within tau_ce of the threshold abstains (float rounding of floor + tol)."""
+    f = _heldout_fields(sg)
+    if f is None:
+        return None
+    cb, cc, ca, fl, mt = f
+    d, thr = sg["decision"], fl + mt
+    if fl > cb + tol.tau_ce:
+        return "signed_gate", DISAGREE, "signed_heldout_floor_above_before"
+    if d == "heldout_tol":
+        if ca is not None and abs(ca - cb) > tol.tau_ce:
+            return "signed_gate", DISAGREE, "signed_heldout_rollback_ce_after_moved"
+    elif ca is not None and abs(ca - cc) > tol.tau_ce:
+        return "signed_gate", DISAGREE, "signed_heldout_accept_ce_after_not_candidate"
+    if abs(cc - thr) <= tol.tau_ce:
+        return "signed_gate", ABSTAIN, "signed_heldout_near_threshold"
+    if (cc > thr) != (d == "heldout_tol"):
+        return "signed_gate", DISAGREE, ("signed_heldout_veto_within_tolerance" if d == "heldout_tol"
+                                         else "signed_heldout_accept_past_tolerance")
+    return "signed_gate", AGREE, "signed_heldout_rule_consistent"
+
+
+def check_heldout_recheck(sg, hr, tol):
+    """Full mode, --heldout-recheck: classify the attester's OWN held-out measurement `hr` (a ShadowCore row's
+    "heldout_recheck": {status, ce_before, ce_candidate, ...}) against the signed decision -> (verdict, reason) or
+    None (no measurement / rule not applicable). The positive control comes first: the attester's ce_before must
+    match the signed ce_before within tau_ce, else it scored other rows (abstain, never disagree). Then the rule
+    is applied with the attester's ce_candidate against the SIGNED ce_floor (best_ce is not re-derivable)."""
+    if not isinstance(hr, dict):
+        return None
+    st = hr.get("status")
+    if st == "rows_unavailable":
+        return ABSTAIN, "heldout_rows_unavailable"
+    if st == "error":
+        return ABSTAIN, "heldout_recheck_error"
+    f = _heldout_fields(sg)
+    if f is None:
+        return None
+    cb, cc, _ca, fl, mt = f
+    vb, vc = _num(hr.get("ce_before")), _num(hr.get("ce_candidate"))
+    if st == "rows_unmatched" or vb is None or abs(vb - cb) > tol.tau_ce:
+        return ABSTAIN, "heldout_rows_unmatched"
+    if vc is None:
+        return ABSTAIN, "heldout_candidate_not_measured"
+    thr = fl + mt
+    roll_p, roll_a = sg["decision"] == "heldout_tol", vc > thr
+    if roll_p == roll_a:
+        return (AGREE, "heldout_recheck_within_tau") if abs(vc - cc) <= tol.tau_ce else             (ABSTAIN, "heldout_candidate_outside_tau")
+    if min(abs(vc - thr), abs(cc - thr)) <= tol.tau_ce:
+        return ABSTAIN, "heldout_near_threshold"
+    return DISAGREE, "heldout_rule_flip_far_from_threshold"
 
 
 _CLASS_MAP = {                                               # non-gate ShadowCore rows (already classified there)

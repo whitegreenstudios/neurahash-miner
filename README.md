@@ -34,6 +34,24 @@ else runs (or that you run from the full node package).
 
 ---
 
+## Alpha 3.9.9 (2026-11-28) — a refused upload no longer pauses the miner; validators check the held-out rule
+
+**Miner.** When the relay refuses every upload, the coordinator stops moving, and after 3 h the miner's
+"lane looks dead" guard used to pause training — which also stopped it retrying the upload, so the
+lane could not recover until every miner was restarted by hand (this happened on 2026-11-27, when the
+relay's name pool filled up and every upload got HTTP 507). Now, while your own latest upload stands
+refused, the miner treats the relay as alive: it keeps training, keeps its best round and retries the
+upload with backoff, and prints "THE RELAY IS REFUSING YOUR UPLOADS" with the relay's reason. It
+resumes by itself once the relay accepts again. A lane that is quiet with no refusal still pauses as
+before.
+
+**Validator.** The light validator now also checks the coordinator's signed held-out numbers against
+its own rule: a held-out veto needs the candidate's held-out loss above the floor plus the tolerance,
+and an accept needs it at or below. Its attestation carries those numbers (as integers). Records
+without them attest byte-identically to 3.9.8.
+
+---
+
 ## Alpha 3.9.8 (2026-11-27) — run a validator: the stage-S1 light validator ships here
 
 **Run a validator: see [docs/RUN_A_VALIDATOR.md](docs/RUN_A_VALIDATOR.md).** The project is removing

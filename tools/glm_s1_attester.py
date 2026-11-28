@@ -17,6 +17,9 @@ MODES
                 omission CANDIDATES (OmissionTracker; signatures recovered model-free, lineage from PUBLISHED slot
                 roots). The gain / z decision is "abstain (light)". Payout arithmetic of settled blocks is NOT
                 re-checked here: the separate phase-A payout verifier (tools/glm_miner_payout_verify.py) does that.
+  --heldout-recheck  (full only, default OFF) re-measures held-out CE (pre-merge state + candidate) on events whose
+                signed gate is heldout_tol, or accept with a candidate, on the epoch's rows (public reveal, else the
+                local coordinator reserve) and re-applies the #145 rule. Off: no forward, no GET, bytes unchanged.
 
 THE ATTESTATION (one per coordinator event, float-free, signed by the validator's own secp256k1 key with
 neura_l1.signing.sign_bytes over glm_round_authority.canonical(body), domain "glm-s1-attest"):
@@ -283,9 +286,15 @@ def _signature_verified(extra_checks):
     return any(c[0] == "audit" and c[2] in _SIG_OK_REASONS for c in extra_checks)
 
 
-def _gate_check(row, tol):
-    v, r = A.classify_gate(row, tol)
+def _gate_check(row, tol, heldout=None):
+    """`heldout` = A.check_heldout_recheck(...) (full mode --heldout-recheck, signed gate verified) or None. When
+    the coordinator vetoed on the held-out tolerance and THIS attester's own probe gate accepted, the only gap left
+    is the held-out rule: the gate row reports the held-out recheck instead of the old abstain."""
     sdec = (row.get("coordinator") or {}).get("signed_decision")
+    if (heldout is not None and sdec == "heldout_tol" and "error" not in row and not row.get("agree")
+            and (row.get("verifier") or {}).get("decision") == "accept"):
+        return heldout                                            # class "disagree" or "coord_only_veto" alike
+    v, r = A.classify_gate(row, tol)
     if v == DISAGREE and sdec in A.NOT_RECHECKABLE:              # owner 2026-11-26: abstain, never disagree
         return ABSTAIN, A.NOT_RECHECKABLE[sdec]
     if v == DISAGREE:
@@ -308,6 +317,18 @@ def _measured(row):
             "probe_mode": row.get("probe_mode"), "gate_s": row.get("gate_s")})
 
 
+def _measured_heldout(hr, sg):
+    """Float-free record of the --heldout-recheck measurement (CE numbers only, never rows)."""
+    out = {"status": hr.get("status"), "epoch": hr.get("epoch"), "source": hr.get("source"),
+           "ce_before_pico": A.pico(hr.get("ce_before")), "ce_candidate_pico": A.pico(hr.get("ce_candidate")),
+           "ce_s": hr.get("ce_s")}
+    if sg is not None:
+        out.update(signed_ce_before_pico=A.pico(sg.get("ce_before")),
+                   signed_ce_candidate_pico=A.pico(sg.get("ce_candidate")),
+                   signed_ce_floor_pico=A.pico(sg.get("ce_floor")), merge_tol_pico=A.pico(sg.get("merge_tol")))
+    return out
+
+
 def build_attestation(acct, campaign, event, rec, rows, extra_checks, mode, tol, commit, late=(), now=None):
     """Signed attestation for one event. `rows` = the ShadowCore rows of this event (full; [] in light),
     `extra_checks` = [(kind, verdict, reason)] from the model-free checks."""
@@ -317,11 +338,19 @@ def build_attestation(acct, campaign, event, rec, rows, extra_checks, mode, tol,
     sg = A.signed_gate(rec) if isinstance(rec, dict) else None   # coordinator NEURAHASH_SD_SIGN_GATE (else None)
     sg_ok = sg is not None and _signature_verified(extra_checks)
     gate_rows = [r for r in rows if A.row_kind(r) == "gate"]
+    hr_checks, hr_measured = [], None
     for r in rows:
         kind = A.row_kind(r)
         if kind == "gate":
             r = A.with_signed_gate(r, sg if sg_ok else None)    # compare against the SIGNED z only when verified
-            checks.append(("gate",) + _gate_check(r, tol))
+            hr = r.get("heldout_recheck")                         # present only with --heldout-recheck (full)
+            hc = None
+            if isinstance(hr, dict) and sg is not None:          # ShadowCore measures only signed events
+                hr_measured = _measured_heldout(hr, sg if sg_ok else None)
+                hc = A.check_heldout_recheck(sg, hr, tol) if sg_ok else (ABSTAIN, "signed_gate_unverified")
+                if hc is not None:
+                    hr_checks.append(("heldout",) + hc)
+            checks.append(("gate",) + _gate_check(r, tol, hc if sg_ok else None))
             if "error" not in r:
                 measured = _measured(r)
         else:
@@ -340,6 +369,7 @@ def build_attestation(acct, campaign, event, rec, rows, extra_checks, mode, tol,
         checks.append(("signed_gate", ABSTAIN, "signed_gate_unverified"))
     elif sg_ok:
         checks += A.check_signed_gate(sg, (rec.get("judged") or {}).get("accepted"), tol)
+    checks += hr_checks
     checks += list(extra_checks)
     dis = [c for c in checks if c[1] == DISAGREE]
     gate = [c for c in checks if c[0] == "gate"]
@@ -370,8 +400,14 @@ def build_attestation(acct, campaign, event, rec, rows, extra_checks, mode, tol,
                                         "gain_pico": A.pico(sg["gain"]), "margin_pico": A.pico(sg["margin"]),
                                         "base_val_pico": A.pico(sg["base_val"]),
                                         "merged_val_pico": A.pico(sg["merged_val"])}
+        if A.check_signed_heldout(sg, tol) is not None:          # the signed held-out numbers the rule used
+            body["coord"]["signed_gate"]["heldout"] = {k + "_pico": A.pico(sg[k]) for k in
+                                                       ("ce_before", "ce_candidate", "ce_after", "ce_floor",
+                                                        "merge_tol")}
     if measured is not None:
         body["measured"] = measured
+    if hr_measured is not None:
+        body.setdefault("measured", {})["heldout_recheck"] = hr_measured
     if late:
         body["late"] = list(late)[:16]
     att = sign_body(acct, body)
@@ -572,6 +608,16 @@ def build_full_core(a, relay, collector, log):
     if a.omission_window > 0:
         extra.update(sig_ok=K.make_sig_ok(C, N), lineage_ok=K.make_lineage_ok(C),
                      omission_max_stale=dm.max_staleness(), omission_delta_ok=K.make_delta_ok(C, G, relay, host))
+    if getattr(a, "heldout_recheck", False):                      # default OFF: no key, no forward, no GET
+        import glob
+        rdir = a.heldout_reserve_dir or os.path.join(a.coord_data_dir, "heldout_ext")
+        files = sorted(glob.glob(os.path.join(rdir, "ids_*_heldout_ext.npy")))
+        rows_src = S.HeldoutEpochRows(a.campaign, relay, a.coord_address, reserve_files=files)
+        extra["heldout_recheck"] = S.HeldoutRecheck(K.make_ce_fn(C, G, a.ce_eval_chunk,
+                                                                 layer_major=bool(a.layer_major)),
+                                                    rows_src, tau_ce=A.Tolerance.from_env().tau_ce)
+        log("[s1] heldout recheck ON: rows = epoch reveals on the relay%s (%d reserve file(s)); CE numbers only"
+            % (" + local reserve" if files else "", len(files)))
     core = S.ShadowCore(ev, relay, probe, a.campaign, a.out, outer=a.outer, margin=a.margin, paired_z=a.paired_z,
                         drift=drift, slot_root=N.slot_root, rescore_from=a.rescore_from, log=log, memguard=guard,
                         attester=collector, **extra)
@@ -800,6 +846,14 @@ def parse_args(argv=None):
     ap.add_argument("--layer-major", action="store_true")
     ap.add_argument("--check-root", action="store_true")
     ap.add_argument("--chain-check", action="store_true")
+    ap.add_argument("--heldout-recheck", action="store_true",
+                    help="full: re-measure held-out CE (pre-merge + candidate) on held-out-tol vetoes and on accepts "
+                         "with a signed candidate, and re-apply the #145 rule (default off)")
+    ap.add_argument("--heldout-reserve-dir", default=None,
+                    help="coordinator reserve dir for OPEN epochs (default <coord-data-dir>/heldout_ext; "
+                         "retired epochs come from their public reveal)")
+    ap.add_argument("--ce-eval-chunk", type=int, default=int(os.environ.get("NEURAHASH_GLM_EVAL_CHUNK", "64")),
+                    help="the coordinator's --eval-chunk (held-out recheck only)")
     a = ap.parse_args(argv)
     if a.mode == "full":
         if not a.out or not a.probe_full_pool:

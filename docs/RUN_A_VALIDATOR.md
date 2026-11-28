@@ -40,7 +40,9 @@ For every coordinator event it checks, with no model and no GPU:
 1. **Signature and chain.** The record is signed by the pinned coordinator address
    `0x2165534Ae1C161B6A8523f37F39cE4cf45bF7B86`, and links to the previous record's hash.
 2. **Signed gate numbers.** The coordinator's signed decision (z, threshold, gain, margin, losses)
-   is internally consistent with what it decided.
+   is internally consistent with what it decided, including its held-out rule (release 3.9.9 or
+   later): a held-out veto needs the candidate's held-out loss above the floor plus the tolerance,
+   an accept needs it at or below.
 3. **Model-root link.** A rejected contribution must leave the model unchanged; an accepted one
    must change it.
 4. **Rewrites and omissions.** No published record was later rewritten or removed, and signed

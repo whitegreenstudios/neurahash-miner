@@ -8002,6 +8002,7 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         log("[glm-contrib %s] async round %d: %s slot %d (L%d,E%d) in %.1fs, best_val_ce=%.5f, "
             "base_event=%d published as %s expert_cid=%s.. delta=%dB base_root=%s.. steps=%d tokens=%d"
             % (miner, rounds_done, "GARBAGE (adversarial control)" if args.garbage else
+               "RE-SENT the kept round (no training this tick) for" if _kept is not None else
                "trained %d LoRA steps on" % args.inner, i, L, E, time.time() - t_tr, best_val,
                base_event, pub_name, ecid[:12], delta_bytes, root[:12], steps, tokens))
         # (5) loop IMMEDIATELY: scan -> train -> publish -> scan. No barrier, no re-advertise wait.

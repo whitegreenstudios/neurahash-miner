@@ -6369,6 +6369,37 @@ class LaneLiveness:
                 % (STALE_LANE_ENV,),
                 bar]
 
+    def refused_banner(self, now, failures, reason):
+        """Printed instead of stale_banner while OUR uploads are being refused (pure ASCII)."""
+        mins = int(self.seconds_since_move(now) // 60)
+        bar = "!" * 78
+        why = str(reason or "unknown")
+        why = "".join(c if 32 <= ord(c) < 127 else "?" for c in why)[:160]
+        return [bar,
+                "!! NEURAHASH: THE RELAY IS REFUSING YOUR UPLOADS -- your work cannot reach the coordinator.",
+                "!! The coordinator's event counter has not moved for %d min, but the relay is answering," % mins,
+                "!! so the lane is not treated as dead: training goes on and the kept round is retried",
+                "!! with backoff (%d refusal(s) so far). Last refusal: %s" % (int(failures), why),
+                "!! The miner resumes publishing BY ITSELF once the relay accepts again -- do NOT restart it.",
+                "!! If it persists for hours, report it: it is a relay-side limit, not your setup.",
+                bar]
+
+
+def stale_action(lane_state, refusing):
+    """What the miner loop does this tick, given LaneLiveness.observe's state and whether our own latest
+    publish stands refused (PublishBackoff.refusing). Pure.
+
+        "pause"   -- the lane looks dead and nothing contradicts it: skip training, poll slowly.
+        "refused" -- the lane looks dead ONLY because our uploads are refused: the store answered, so it
+                     is alive, and pausing would also stop the publish retries -- the deadlock measured on
+                     2026-11-27/28 (relay full -> every upload 507 -> no events -> miners paused -> no
+                     retries -> the lane could never move again without a restart). Keep the normal loop
+                     (train, keep the best round, retry the publish under PublishBackoff).
+        "run"     -- not stale."""
+    if lane_state != "stale":
+        return "run"
+    return "refused" if refusing else "pause"
+
 
 def build_async_contrib_record(miner, i, L, E, base_event, base_root, expert_cid, sig, train_flops,
                                delta_bytes, steps, tokens, address=None, base_slot_root=None):
@@ -6892,6 +6923,7 @@ class PublishBackoff:
         self.permanent = 0           # CONSECUTIVE permanent refusals; any temporary fault resets it
         self.name_taken = 0          # CONSECUTIVE name-taken refusals (see NAME_TAKEN_MAX)
         self.until = 0.0
+        self.last_reason = None      # the store's text for the latest counted refusal (stale-lane banner)
 
     def blocked(self, now):
         return max(0.0, self.until - float(now))
@@ -6915,6 +6947,7 @@ class PublishBackoff:
         if exc is not None:
             self.name_taken = 0
         self.failures += 1
+        self.last_reason = reason or (publish_failure_reason(exc) if exc is not None else None)
         if exc is not None and publish_failure_is_permanent(exc):
             self.permanent += 1
             if self.permanent >= self.permanent_max:
@@ -6934,6 +6967,13 @@ class PublishBackoff:
         self.permanent = 0
         self.name_taken = 0
         self.until = 0.0
+        self.last_reason = None
+
+    @property
+    def refusing(self):
+        """True while our latest counted publish was refused and none has succeeded since. A store that
+        answers with a refusal is ALIVE, so this is evidence the lane is not dead (see stale_action)."""
+        return self.failures > 0
 
 
 # --- UPDATE CAP (owner-approved 2026-10-23, "approve D4 with probe size 512 and the update cap") ---
@@ -7544,7 +7584,15 @@ def _run_async(args, lane, host, model, cfg, G, key, i, L, E, miner, train_ids, 
         if _lane_state == "recovered":
             log("[glm-contrib %s] LANE RECOVERED: the coordinator moved again (event=%s); resuming "
                 "training." % (miner, dec.get("event")))
-        if _lane_state == "stale":
+        _stale_do = stale_action(_lane_state, _pub_backoff.refusing)
+        if _stale_do == "refused":
+            # The lane only LOOKS dead because our own uploads are refused (see stale_action): fall
+            # through to the normal loop so the kept round keeps being retried under PublishBackoff.
+            _now = time.time()
+            if lane_health.should_shout(_now):
+                for _ln in lane_health.refused_banner(_now, _pub_backoff.failures, _pub_backoff.last_reason):
+                    log("[glm-contrib %s] %s" % (miner, _ln))
+        elif _stale_do == "pause":
             _now = time.time()
             if lane_health.should_shout(_now):
                 for _ln in lane_health.stale_banner(_now):
